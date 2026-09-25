@@ -1079,11 +1079,13 @@ pub async fn open_renamer_window(app: AppHandle, state: State<'_, AppState>) -> 
 
     // Same chrome as the main window: the toolbar hosts the traffic lights on
     // macOS; Windows is undecorated and draws its own caption buttons.
+    // tao keeps the buttons' own offset (~9pt on macOS 26), so y = 28 centres
+    // them on the 52pt toolbar.
     #[cfg(target_os = "macos")]
     let builder = builder
         .title_bar_style(tauri::TitleBarStyle::Overlay)
         .hidden_title(true)
-        .traffic_light_position(tauri::LogicalPosition::new(16.0, 18.0));
+        .traffic_light_position(tauri::LogicalPosition::new(16.0, 28.0));
     #[cfg(target_os = "windows")]
     let builder = builder.decorations(false);
 
@@ -1139,13 +1141,13 @@ fn open_settings(app: &AppHandle, locale: &str) -> Result<(), String> {
     .maximizable(false)
     .center();
 
-    // macOS overlay title bar with the lights centred in the 38px title row;
-    // Windows undecorated like the main window.
+    // macOS overlay title bar with the lights centred in the 38pt title row
+    // (see open_renamer_window for the offset); Windows undecorated.
     #[cfg(target_os = "macos")]
     let builder = builder
         .title_bar_style(tauri::TitleBarStyle::Overlay)
         .hidden_title(true)
-        .traffic_light_position(tauri::LogicalPosition::new(14.0, 12.0));
+        .traffic_light_position(tauri::LogicalPosition::new(14.0, 21.0));
     #[cfg(target_os = "windows")]
     let builder = builder.decorations(false);
 

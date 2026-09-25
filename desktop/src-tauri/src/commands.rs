@@ -9,6 +9,7 @@ use crate::task_queue::TaskSnapshot;
 use sula_core::batch_rename::RenamerOutcome;
 use sula_core::files::DirectoryEntryDto;
 use sula_core::media::{MediaDetailDto, MediaListPayload};
+use sula_core::CoreError;
 
 async fn ui_locale(state: &AppState) -> String {
     state.config().await.ui_locale
@@ -38,22 +39,22 @@ impl Events for UiEvents {
 }
 
 #[tauri::command]
-pub async fn app_status(state: State<'_, AppState>) -> Result<AppStatusDto, String> {
+pub async fn app_status(state: State<'_, AppState>) -> Result<AppStatusDto, CoreError> {
     state.status().await
 }
 
 #[tauri::command]
-pub async fn get_config(state: State<'_, AppState>) -> Result<AppConfig, String> {
+pub async fn get_config(state: State<'_, AppState>) -> Result<AppConfig, CoreError> {
     Ok(state.config().await)
 }
 
 #[tauri::command]
-pub async fn save_config(state: State<'_, AppState>, config: AppConfig) -> Result<AppConfig, String> {
+pub async fn save_config(state: State<'_, AppState>, config: AppConfig) -> Result<AppConfig, CoreError> {
     state.save_config(config).await
 }
 
 #[tauri::command]
-pub async fn list_libraries(state: State<'_, AppState>) -> Result<Vec<Library>, String> {
+pub async fn list_libraries(state: State<'_, AppState>) -> Result<Vec<Library>, CoreError> {
     state.libraries().await
 }
 
@@ -63,42 +64,42 @@ pub async fn add_library(
     name: String,
     root_path: String,
     media_type: MediaType,
-) -> Result<Library, String> {
+) -> Result<Library, CoreError> {
     state.add_library(name, root_path, media_type).await
 }
 
 #[tauri::command]
-pub async fn rename_library(state: State<'_, AppState>, id: String, name: String) -> Result<Library, String> {
+pub async fn rename_library(state: State<'_, AppState>, id: String, name: String) -> Result<Library, CoreError> {
     state.rename_library(id, name).await
 }
 
 #[tauri::command]
-pub async fn delete_library(state: State<'_, AppState>, id: String) -> Result<(), String> {
+pub async fn delete_library(state: State<'_, AppState>, id: String) -> Result<(), CoreError> {
     state.delete_library(id).await
 }
 
 #[tauri::command]
-pub async fn rebind_library(state: State<'_, AppState>, id: String, root_path: String) -> Result<Library, String> {
+pub async fn rebind_library(state: State<'_, AppState>, id: String, root_path: String) -> Result<Library, CoreError> {
     state.rebind_library(id, root_path).await
 }
 
 #[tauri::command]
-pub async fn path_is_dir(path: String) -> Result<bool, String> {
+pub async fn path_is_dir(path: String) -> Result<bool, CoreError> {
     sula_core::files::path_is_dir(path).await
 }
 
 #[tauri::command]
-pub async fn list_directory(path: String) -> Result<Vec<DirectoryEntryDto>, String> {
+pub async fn list_directory(path: String) -> Result<Vec<DirectoryEntryDto>, CoreError> {
     sula_core::files::list_directory(path).await
 }
 
 #[tauri::command]
-pub async fn clear_thumbnail_cache(state: State<'_, AppState>) -> Result<usize, String> {
+pub async fn clear_thumbnail_cache(state: State<'_, AppState>) -> Result<usize, CoreError> {
     state.clear_image_caches().await
 }
 
 #[tauri::command]
-pub async fn resolve_actor_avatar(state: State<'_, AppState>, url: String) -> Result<Option<String>, String> {
+pub async fn resolve_actor_avatar(state: State<'_, AppState>, url: String) -> Result<Option<String>, CoreError> {
     Ok(state.actor_avatar(url).await?.map(|path| path.display().to_string()))
 }
 
@@ -110,26 +111,26 @@ pub async fn resolve_poster_thumbnail(
     width: Option<u32>,
     height: Option<u32>,
     allow_fallbacks: Option<bool>,
-) -> Result<Option<String>, String> {
+) -> Result<Option<String>, CoreError> {
     // A cache file path; the frontend loads it through convertFileSrc.
     let path = state.poster_thumbnail(folder_path, poster_path, width, height, allow_fallbacks).await?;
     Ok(path.map(|path| path.display().to_string()))
 }
 
 #[tauri::command]
-pub async fn list_media_items(state: State<'_, AppState>, library_id: String) -> Result<Vec<MediaItem>, String> {
+pub async fn list_media_items(state: State<'_, AppState>, library_id: String) -> Result<Vec<MediaItem>, CoreError> {
     state.media_items(library_id).await
 }
 
 #[tauri::command]
 pub async fn list_media_page(
     state: State<'_, AppState>, library_id: String, offset: Option<u32>, limit: Option<u32>,
-) -> Result<MediaListPayload, String> {
+) -> Result<MediaListPayload, CoreError> {
     state.media_page(library_id, offset, limit).await
 }
 
 #[tauri::command]
-pub async fn get_media_detail(state: State<'_, AppState>, id: String) -> Result<MediaDetailDto, String> {
+pub async fn get_media_detail(state: State<'_, AppState>, id: String) -> Result<MediaDetailDto, CoreError> {
     state.media_detail(id).await
 }
 
@@ -138,52 +139,52 @@ pub async fn plan_show_merges(
     state: State<'_, AppState>,
     library_id: Option<String>,
     item_ids: Option<Vec<String>>,
-) -> Result<Vec<ShowMergePlanDto>, String> {
+) -> Result<Vec<ShowMergePlanDto>, CoreError> {
     state.plan_show_merges(library_id, item_ids).await
 }
 
 #[tauri::command]
-pub async fn merge_planned_shows(state: State<'_, AppState>, pairs: Vec<ShowMergePair>) -> Result<u32, String> {
+pub async fn merge_planned_shows(state: State<'_, AppState>, pairs: Vec<ShowMergePair>) -> Result<u32, CoreError> {
     state.merge_planned_shows(pairs).await
 }
 
 #[tauri::command]
-pub async fn list_tasks(state: State<'_, AppState>) -> Result<Vec<TaskSnapshot>, String> {
+pub async fn list_tasks(state: State<'_, AppState>) -> Result<Vec<TaskSnapshot>, CoreError> {
     Ok(state.tasks().await)
 }
 
 #[tauri::command]
-pub async fn enqueue_smoke_task(state: State<'_, AppState>, title: Option<String>) -> Result<TaskSnapshot, String> {
+pub async fn enqueue_smoke_task(state: State<'_, AppState>, title: Option<String>) -> Result<TaskSnapshot, CoreError> {
     Ok(state.enqueue_smoke_task(title).await)
 }
 
 #[tauri::command]
-pub async fn cancel_task(state: State<'_, AppState>, id: String) -> Result<bool, String> {
+pub async fn cancel_task(state: State<'_, AppState>, id: String) -> Result<bool, CoreError> {
     Ok(state.cancel_task(id).await)
 }
 
 #[tauri::command]
-pub async fn refresh_library(state: State<'_, AppState>, library_id: String) -> Result<TaskSnapshot, String> {
+pub async fn refresh_library(state: State<'_, AppState>, library_id: String) -> Result<TaskSnapshot, CoreError> {
     state.refresh_library(library_id).await
 }
 
 #[tauri::command]
-pub async fn refresh_media_items(state: State<'_, AppState>, item_ids: Vec<String>) -> Result<TaskSnapshot, String> {
+pub async fn refresh_media_items(state: State<'_, AppState>, item_ids: Vec<String>) -> Result<TaskSnapshot, CoreError> {
     state.refresh_items(item_ids).await
 }
 
 #[tauri::command]
-pub async fn scrape_library(state: State<'_, AppState>, library_id: String) -> Result<TaskSnapshot, String> {
+pub async fn scrape_library(state: State<'_, AppState>, library_id: String) -> Result<TaskSnapshot, CoreError> {
     state.scrape_library(library_id).await
 }
 
 #[tauri::command]
-pub async fn scrape_items(state: State<'_, AppState>, item_ids: Vec<String>) -> Result<TaskSnapshot, String> {
+pub async fn scrape_items(state: State<'_, AppState>, item_ids: Vec<String>) -> Result<TaskSnapshot, CoreError> {
     state.scrape_items(item_ids).await
 }
 
 #[tauri::command]
-pub async fn rescrape_items(state: State<'_, AppState>, item_ids: Vec<String>) -> Result<TaskSnapshot, String> {
+pub async fn rescrape_items(state: State<'_, AppState>, item_ids: Vec<String>) -> Result<TaskSnapshot, CoreError> {
     state.rescrape_items(item_ids).await
 }
 
@@ -192,7 +193,7 @@ pub async fn scrape_season(
     state: State<'_, AppState>,
     media_item_id: String,
     season_number: i32,
-) -> Result<TaskSnapshot, String> {
+) -> Result<TaskSnapshot, CoreError> {
     state.scrape_season(media_item_id, season_number).await
 }
 
@@ -201,22 +202,22 @@ pub async fn search_match_candidates(
     state: State<'_, AppState>,
     query: String,
     media_type: MediaType,
-) -> Result<Vec<scraper_kit::SearchResult>, String> {
+) -> Result<Vec<scraper_kit::SearchResult>, CoreError> {
     state.search_match_candidates(query, media_type).await
 }
 
 #[tauri::command]
-pub async fn apply_manual_match(state: State<'_, AppState>, item_id: String, source_id: String) -> Result<TaskSnapshot, String> {
+pub async fn apply_manual_match(state: State<'_, AppState>, item_id: String, source_id: String) -> Result<TaskSnapshot, CoreError> {
     state.apply_manual_match(item_id, source_id).await
 }
 
 #[tauri::command]
-pub async fn apply_rename_templates(state: State<'_, AppState>, item_ids: Vec<String>) -> Result<TaskSnapshot, String> {
+pub async fn apply_rename_templates(state: State<'_, AppState>, item_ids: Vec<String>) -> Result<TaskSnapshot, CoreError> {
     state.apply_rename_templates(item_ids).await
 }
 
 #[tauri::command]
-pub async fn organize_season_folders(state: State<'_, AppState>, item_ids: Vec<String>) -> Result<TaskSnapshot, String> {
+pub async fn organize_season_folders(state: State<'_, AppState>, item_ids: Vec<String>) -> Result<TaskSnapshot, CoreError> {
     state.organize_season_folders(item_ids).await
 }
 
@@ -224,17 +225,17 @@ pub async fn organize_season_folders(state: State<'_, AppState>, item_ids: Vec<S
 pub async fn scan_media_residuals(
     state: State<'_, AppState>,
     item_ids: Vec<String>,
-) -> Result<Vec<media_core::ResidualCandidate>, String> {
+) -> Result<Vec<media_core::ResidualCandidate>, CoreError> {
     state.scan_residuals(item_ids).await
 }
 
 #[tauri::command]
-pub async fn cleanup_media_residuals(state: State<'_, AppState>, paths: Vec<String>) -> Result<TaskSnapshot, String> {
+pub async fn cleanup_media_residuals(state: State<'_, AppState>, paths: Vec<String>) -> Result<TaskSnapshot, CoreError> {
     state.cleanup_residuals(paths).await
 }
 
 #[tauri::command]
-pub async fn delete_media_items(state: State<'_, AppState>, item_ids: Vec<String>, also_trash: bool) -> Result<usize, String> {
+pub async fn delete_media_items(state: State<'_, AppState>, item_ids: Vec<String>, also_trash: bool) -> Result<usize, CoreError> {
     state.delete_media_items(item_ids, also_trash).await
 }
 
@@ -338,7 +339,7 @@ fn open_settings(app: &AppHandle, locale: &str) -> Result<(), String> {
 }
 
 #[tauri::command]
-pub async fn renamer_collect_files(paths: Vec<String>) -> Result<Vec<renamer::FileEntry>, String> {
+pub async fn renamer_collect_files(paths: Vec<String>) -> Result<Vec<renamer::FileEntry>, CoreError> {
     sula_core::batch_rename::collect_files(paths).await
 }
 
@@ -346,7 +347,7 @@ pub async fn renamer_collect_files(paths: Vec<String>) -> Result<Vec<renamer::Fi
 pub async fn renamer_preview(
     files: Vec<renamer::FileEntry>,
     pipeline: renamer::RulePipeline,
-) -> Result<Vec<renamer::PreviewResult>, String> {
+) -> Result<Vec<renamer::PreviewResult>, CoreError> {
     Ok(sula_core::batch_rename::preview(&files, &pipeline))
 }
 
@@ -355,22 +356,22 @@ pub async fn renamer_execute(
     state: State<'_, AppState>,
     files: Vec<renamer::FileEntry>,
     pipeline: renamer::RulePipeline,
-) -> Result<RenamerOutcome, String> {
+) -> Result<RenamerOutcome, CoreError> {
     state.rename_files(files, pipeline).await
 }
 
 #[tauri::command]
-pub async fn renamer_undo_last(state: State<'_, AppState>) -> Result<RenamerOutcome, String> {
+pub async fn renamer_undo_last(state: State<'_, AppState>) -> Result<RenamerOutcome, CoreError> {
     state.undo_last_rename().await
 }
 
 #[tauri::command]
-pub async fn renamer_snapshot_count(state: State<'_, AppState>) -> Result<usize, String> {
+pub async fn renamer_snapshot_count(state: State<'_, AppState>) -> Result<usize, CoreError> {
     state.rename_snapshot_count().await
 }
 
 #[tauri::command]
-pub async fn renamer_list_presets(state: State<'_, AppState>) -> Result<Vec<String>, String> {
+pub async fn renamer_list_presets(state: State<'_, AppState>) -> Result<Vec<String>, CoreError> {
     state.rename_presets().await
 }
 
@@ -379,27 +380,27 @@ pub async fn renamer_save_preset(
     state: State<'_, AppState>,
     name: String,
     pipeline: renamer::RulePipeline,
-) -> Result<(), String> {
+) -> Result<(), CoreError> {
     state.save_rename_preset(name, pipeline).await
 }
 
 #[tauri::command]
-pub async fn renamer_load_preset(state: State<'_, AppState>, name: String) -> Result<Option<renamer::RulePipeline>, String> {
+pub async fn renamer_load_preset(state: State<'_, AppState>, name: String) -> Result<Option<renamer::RulePipeline>, CoreError> {
     state.load_rename_preset(name).await
 }
 
 #[tauri::command]
-pub async fn renamer_delete_preset(state: State<'_, AppState>, name: String) -> Result<(), String> {
+pub async fn renamer_delete_preset(state: State<'_, AppState>, name: String) -> Result<(), CoreError> {
     state.delete_rename_preset(name).await
 }
 
 #[tauri::command]
-pub async fn renamer_auto_save_pipeline(state: State<'_, AppState>, pipeline: renamer::RulePipeline) -> Result<(), String> {
+pub async fn renamer_auto_save_pipeline(state: State<'_, AppState>, pipeline: renamer::RulePipeline) -> Result<(), CoreError> {
     state.save_last_rename_pipeline(pipeline).await
 }
 
 #[tauri::command]
-pub async fn renamer_auto_load_pipeline(state: State<'_, AppState>) -> Result<Option<renamer::RulePipeline>, String> {
+pub async fn renamer_auto_load_pipeline(state: State<'_, AppState>) -> Result<Option<renamer::RulePipeline>, CoreError> {
     state.last_rename_pipeline().await
 }
 

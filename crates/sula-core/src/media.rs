@@ -5,7 +5,7 @@ use std::sync::Arc;
 use media_core::{MediaItem, MediaMetaSummary, MediaMetadata, MediaType, ShowListStats, TvEpisode, TvSeason};
 use serde::Serialize;
 
-use crate::app::{blocking, err_string};
+use crate::error::{blocking, failed, CoreError, CoreResult};
 use crate::state::{AppState, AppStatusDto, CratesDto};
 
 #[derive(Debug, Serialize)]
@@ -27,8 +27,8 @@ pub struct MediaDetailDto {
 }
 
 impl AppState {
-    pub async fn status(&self) -> Result<AppStatusDto, String> {
-        let library_count = self.db.library_count().map_err(err_string)?;
+    pub async fn status(&self) -> CoreResult<AppStatusDto> {
+        let library_count = self.db.library_count().map_err(failed)?;
         let config = self.config.lock().await.config.clone();
         Ok(AppStatusDto {
             app_name: "Sula".into(),
@@ -45,21 +45,21 @@ impl AppState {
         })
     }
 
-    pub async fn media_items(&self, library_id: String) -> Result<Vec<MediaItem>, String> {
+    pub async fn media_items(&self, library_id: String) -> CoreResult<Vec<MediaItem>> {
         let db = Arc::clone(&self.db);
-        blocking(move || db.list_media_items(&library_id).map_err(err_string)).await
+        blocking(move || db.list_media_items(&library_id).map_err(failed)).await
     }
 
     /// One page of a library with the metadata and show stats its rows need.
-    pub async fn media_page(&self, library_id: String, offset: Option<u32>, limit: Option<u32>) -> Result<MediaListPayload, String> {
+    pub async fn media_page(&self, library_id: String, offset: Option<u32>, limit: Option<u32>) -> CoreResult<MediaListPayload> {
         let db = Arc::clone(&self.db);
         blocking(move || {
             let offset = offset.unwrap_or(0);
             let limit = limit.unwrap_or(256).clamp(1, 512);
-            let items = db.list_media_items_page(&library_id, offset, limit).map_err(err_string)?;
-            let ids = serde_json::to_string(&items.iter().map(|i| &i.id).collect::<Vec<_>>()).map_err(err_string)?;
-            let metadata = db.list_metadata_summaries_for_ids(&ids).map_err(err_string)?;
-            let show_stats = db.list_show_stats_for_ids(&ids).map_err(err_string)?;
+            let items = db.list_media_items_page(&library_id, offset, limit).map_err(failed)?;
+            let ids = serde_json::to_string(&items.iter().map(|i| &i.id).collect::<Vec<_>>()).map_err(failed)?;
+            let metadata = db.list_metadata_summaries_for_ids(&ids).map_err(failed)?;
+            let show_stats = db.list_show_stats_for_ids(&ids).map_err(failed)?;
             let next_offset = if items.len() == limit as usize { offset.checked_add(limit) } else { None };
             Ok(MediaListPayload { items, metadata, show_stats, next_offset })
         })
@@ -67,19 +67,19 @@ impl AppState {
     }
 
     /// An item with its metadata and, for shows, every season and episode.
-    pub async fn media_detail(&self, id: String) -> Result<MediaDetailDto, String> {
+    pub async fn media_detail(&self, id: String) -> CoreResult<MediaDetailDto> {
         let db = Arc::clone(&self.db);
         blocking(move || {
             let item = db
                 .get_media_item(&id)
-                .map_err(err_string)?
-                .ok_or_else(|| format!("media item not found: {id}"))?;
-            let metadata = db.fetch_metadata(&id).map_err(err_string)?;
+                .map_err(failed)?
+                .ok_or_else(|| CoreError::not_found("media item", &id))?;
+            let metadata = db.fetch_metadata(&id).map_err(failed)?;
             let (seasons, episodes) = if matches!(item.media_type, MediaType::TvShow | MediaType::Anime) {
-                let seasons = db.fetch_seasons(&id).map_err(err_string)?;
+                let seasons = db.fetch_seasons(&id).map_err(failed)?;
                 let mut episodes = Vec::new();
                 for season in &seasons {
-                    episodes.extend(db.fetch_episodes(&season.id).map_err(err_string)?);
+                    episodes.extend(db.fetch_episodes(&season.id).map_err(failed)?);
                 }
                 (seasons, episodes)
             } else {

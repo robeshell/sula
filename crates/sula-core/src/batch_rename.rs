@@ -4,20 +4,20 @@
 use std::sync::Arc;
 
 use crate::app::locks::LockScope;
-use crate::app::{blocking, err_string};
+use crate::error::{blocking, failed, CoreError, CoreResult};
 use crate::state::AppState;
 
 const MAX_RENAMER_FILES: usize = 5_000;
 
 /// Every file under the given files and folders (hidden entries skipped).
-pub async fn collect_files(paths: Vec<String>) -> Result<Vec<renamer::FileEntry>, String> {
+pub async fn collect_files(paths: Vec<String>) -> CoreResult<Vec<renamer::FileEntry>> {
     blocking(move || {
         let mut out = Vec::new();
         for raw in paths {
             let path = std::path::PathBuf::from(&raw);
-            collect_paths_into(&path, &mut out).map_err(err_string)?;
+            collect_paths_into(&path, &mut out).map_err(failed)?;
             if out.len() > MAX_RENAMER_FILES {
-                return Err(format!("too many files (max {MAX_RENAMER_FILES})"));
+                return Err(CoreError::Invalid(format!("too many files (max {MAX_RENAMER_FILES})")));
             }
         }
         Ok(out)
@@ -45,7 +45,7 @@ pub struct RenamerOutcome {
 impl AppState {
     /// Previews are recomputed here from the same inputs as `preview`, so a stale
     /// or forged preview from the UI can never choose the destination.
-    pub async fn rename_files(&self, files: Vec<renamer::FileEntry>, pipeline: renamer::RulePipeline) -> Result<RenamerOutcome, String> {
+    pub async fn rename_files(&self, files: Vec<renamer::FileEntry>, pipeline: renamer::RulePipeline) -> CoreResult<RenamerOutcome> {
         let mutation_guard = self.tasks.locks().lock(&LockScope::Global).await?;
         let (db, undo, events) = (Arc::clone(&self.db), Arc::clone(&self.rename_undo), Arc::clone(&self.events));
         blocking(move || {
@@ -61,7 +61,7 @@ impl AppState {
         .await
     }
 
-    pub async fn undo_last_rename(&self) -> Result<RenamerOutcome, String> {
+    pub async fn undo_last_rename(&self) -> CoreResult<RenamerOutcome> {
         let mutation_guard = self.tasks.locks().lock(&LockScope::Global).await?;
         let (db, undo, events) = (Arc::clone(&self.db), Arc::clone(&self.rename_undo), Arc::clone(&self.events));
         blocking(move || {
@@ -77,33 +77,33 @@ impl AppState {
         .await
     }
 
-    pub async fn rename_snapshot_count(&self) -> Result<usize, String> {
-        Ok(self.rename_undo.snapshots().map_err(err_string)?.len())
+    pub async fn rename_snapshot_count(&self) -> CoreResult<usize> {
+        Ok(self.rename_undo.snapshots().map_err(failed)?.len())
     }
 
-    pub async fn rename_presets(&self) -> Result<Vec<String>, String> {
-        self.rename_presets.list_presets().map_err(err_string)
+    pub async fn rename_presets(&self) -> CoreResult<Vec<String>> {
+        self.rename_presets.list_presets().map_err(failed)
     }
 
-    pub async fn save_rename_preset(&self, name: String, pipeline: renamer::RulePipeline) -> Result<(), String> {
-        self.rename_presets.save(&name, &pipeline).map_err(err_string)
+    pub async fn save_rename_preset(&self, name: String, pipeline: renamer::RulePipeline) -> CoreResult<()> {
+        self.rename_presets.save(&name, &pipeline).map_err(failed)
     }
 
-    pub async fn load_rename_preset(&self, name: String) -> Result<Option<renamer::RulePipeline>, String> {
-        self.rename_presets.load(&name).map_err(err_string)
+    pub async fn load_rename_preset(&self, name: String) -> CoreResult<Option<renamer::RulePipeline>> {
+        self.rename_presets.load(&name).map_err(failed)
     }
 
-    pub async fn delete_rename_preset(&self, name: String) -> Result<(), String> {
-        self.rename_presets.delete(&name).map_err(err_string)
+    pub async fn delete_rename_preset(&self, name: String) -> CoreResult<()> {
+        self.rename_presets.delete(&name).map_err(failed)
     }
 
     /// The rules the window had open last time, restored when it reopens.
-    pub async fn save_last_rename_pipeline(&self, pipeline: renamer::RulePipeline) -> Result<(), String> {
-        self.rename_presets.auto_save(&pipeline).map_err(err_string)
+    pub async fn save_last_rename_pipeline(&self, pipeline: renamer::RulePipeline) -> CoreResult<()> {
+        self.rename_presets.auto_save(&pipeline).map_err(failed)
     }
 
-    pub async fn last_rename_pipeline(&self) -> Result<Option<renamer::RulePipeline>, String> {
-        self.rename_presets.auto_load().map_err(err_string)
+    pub async fn last_rename_pipeline(&self) -> CoreResult<Option<renamer::RulePipeline>> {
+        self.rename_presets.auto_load().map_err(failed)
     }
 }
 
@@ -137,15 +137,15 @@ fn finish_batch(
     events: &dyn crate::app::Events,
     mut outcome: RenamerOutcome,
     result: Result<(), renamer::ExecuteError>,
-) -> Result<RenamerOutcome, String> {
+) -> CoreResult<RenamerOutcome> {
     if !outcome.renames.is_empty() {
         events.library_updated();
     }
     match result {
         Ok(()) => Ok(outcome),
-        Err(error) if outcome.renames.is_empty() => Err(err_string(error)),
+        Err(error) if outcome.renames.is_empty() => Err(failed(error)),
         Err(error) => {
-            outcome.error = Some(err_string(error));
+            outcome.error = Some(error.to_string());
             Ok(outcome)
         }
     }

@@ -3,7 +3,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use crate::app::{blocking, err_string};
+use crate::error::{blocking, failed, CoreResult};
 use crate::state::AppState;
 
 const MAX_AVATAR_BYTES: usize = 10 * 1024 * 1024;
@@ -18,7 +18,7 @@ impl AppState {
         width: Option<u32>,
         height: Option<u32>,
         allow_fallbacks: Option<bool>,
-    ) -> Result<Option<PathBuf>, String> {
+    ) -> CoreResult<Option<PathBuf>> {
         let width = width.unwrap_or(media_core::POSTER_THUMB_WIDTH);
         let height = height.unwrap_or(media_core::POSTER_THUMB_HEIGHT);
         let allow_fallbacks = allow_fallbacks.unwrap_or(true);
@@ -33,7 +33,7 @@ impl AppState {
             };
             // Thumbnails land in a UI-readable cache: only images inside a library.
             let canonical = media_core::scanner::canonicalize_lossy(std::path::Path::new(&source));
-            let inside_library = db.list_libraries().map_err(err_string)?.iter().any(|library| {
+            let inside_library = db.list_libraries().map_err(failed)?.iter().any(|library| {
                 let root = media_core::scanner::canonicalize_lossy(std::path::Path::new(&library.root_path));
                 media_core::db::path_rooted_under(&canonical, &root)
             });
@@ -43,14 +43,14 @@ impl AppState {
             match thumbs.ensure(&source, width, height) {
                 Ok(path) => Ok(Some(path)),
                 Err(media_core::ThumbnailError::Missing(_)) => Ok(None),
-                Err(err) => Err(err.to_string()),
+                Err(err) => Err(failed(err)),
             }
         })
         .await
     }
 
     /// A cached copy of an actor photo, downloading it on first use.
-    pub async fn actor_avatar(&self, url: String) -> Result<Option<PathBuf>, String> {
+    pub async fn actor_avatar(&self, url: String) -> CoreResult<Option<PathBuf>> {
         let url = url.trim().to_string();
         if url.is_empty() {
             return Ok(None);
@@ -60,7 +60,7 @@ impl AppState {
         }
         // The URL comes from scraped metadata: only fetch public http(s) hosts, also
         // after redirects, and cap the body so a hostile source can't fill the disk.
-        let parsed = reqwest::Url::parse(&url).map_err(err_string)?;
+        let parsed = reqwest::Url::parse(&url).map_err(failed)?;
         if !is_public_http_url(&parsed) {
             return Ok(None);
         }
@@ -74,7 +74,7 @@ impl AppState {
                 }
             }))
             .build()
-            .map_err(err_string)?;
+            .map_err(failed)?;
         let mut response = client.get(parsed).send().await.map_err(|e| e.without_url().to_string())?;
         if !response.status().is_success() {
             return Ok(None);
@@ -87,15 +87,15 @@ impl AppState {
             bytes.extend_from_slice(&chunk);
         }
         let avatars = Arc::clone(&self.avatars);
-        blocking(move || avatars.store(&url, &bytes).map_err(err_string)).await.map(Some)
+        blocking(move || avatars.store(&url, &bytes).map_err(failed)).await.map(Some)
     }
 
     /// Empties the poster thumbnail and avatar caches; returns the files removed.
-    pub async fn clear_image_caches(&self) -> Result<usize, String> {
+    pub async fn clear_image_caches(&self) -> CoreResult<usize> {
         let (thumbs, avatars) = (Arc::clone(&self.thumbs), Arc::clone(&self.avatars));
         blocking(move || {
-            let thumbs = thumbs.clear_all().map_err(err_string)?;
-            let avatars = avatars.clear().map_err(err_string)?;
+            let thumbs = thumbs.clear_all().map_err(failed)?;
+            let avatars = avatars.clear().map_err(failed)?;
             Ok(thumbs + avatars)
         })
         .await

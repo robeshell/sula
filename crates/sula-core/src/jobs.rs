@@ -9,7 +9,7 @@ use crate::app::library::RefreshService;
 use crate::app::locks::LockScope;
 use crate::app::organize::OrganizeService;
 use crate::app::scrape::{localized_error, ScrapeService, ScrapeSettings};
-use crate::app::{blocking, err_string};
+use crate::error::{blocking, failed, CoreError, CoreResult};
 use crate::config::AppConfig;
 use crate::state::AppState;
 use crate::task_queue::{TaskKind, TaskSnapshot};
@@ -30,7 +30,7 @@ impl AppState {
     }
 
     /// Rescans a library; a refresh already queued or running is returned instead.
-    pub async fn refresh_library(&self, library_id: String) -> Result<TaskSnapshot, String> {
+    pub async fn refresh_library(&self, library_id: String) -> CoreResult<TaskSnapshot> {
         if let Some(existing) = self.tasks.find_active(TaskKind::Refresh, &library_id).await {
             self.events.task_updated(&existing);
             return Ok(existing);
@@ -39,8 +39,8 @@ impl AppState {
         let library = self
             .db
             .get_library(&library_id)
-            .map_err(err_string)?
-            .ok_or_else(|| format!("library not found: {library_id}"))?;
+            .map_err(failed)?
+            .ok_or_else(|| CoreError::not_found("library", &library_id))?;
         let locale = self.ui_locale().await;
         let config_store = Arc::clone(&self.config);
         let db = Arc::clone(&self.db);
@@ -68,9 +68,9 @@ impl AppState {
     }
 
     /// Re-reads the given items from disk.
-    pub async fn refresh_items(&self, item_ids: Vec<String>) -> Result<TaskSnapshot, String> {
+    pub async fn refresh_items(&self, item_ids: Vec<String>) -> CoreResult<TaskSnapshot> {
         if item_ids.is_empty() {
-            return Err("no items selected".into());
+            return Err(CoreError::invalid("no items selected"));
         }
         let locale = self.ui_locale().await;
         let title = if item_ids.len() == 1 {
@@ -95,12 +95,12 @@ impl AppState {
     }
 
     /// Scrapes every item of a library that still needs metadata.
-    pub async fn scrape_library(&self, library_id: String) -> Result<TaskSnapshot, String> {
+    pub async fn scrape_library(&self, library_id: String) -> CoreResult<TaskSnapshot> {
         let library = self
             .db
             .get_library(&library_id)
-            .map_err(err_string)?
-            .ok_or_else(|| format!("library not found: {library_id}"))?;
+            .map_err(failed)?
+            .ok_or_else(|| CoreError::not_found("library", &library_id))?;
         let config = self.config().await;
         let title = ui_i18n::tf(&config.ui_locale, "task.scrapeAll", &[("name", &library.name)]);
         let target_id = Some(library_id.clone());
@@ -121,9 +121,9 @@ impl AppState {
         Ok(snapshot)
     }
 
-    pub async fn scrape_items(&self, item_ids: Vec<String>) -> Result<TaskSnapshot, String> {
+    pub async fn scrape_items(&self, item_ids: Vec<String>) -> CoreResult<TaskSnapshot> {
         if item_ids.is_empty() {
-            return Err("no items selected".into());
+            return Err(CoreError::invalid("no items selected"));
         }
         let config = self.config().await;
         let title = ui_i18n::tf(&config.ui_locale, "task.scrapeN", &[("n", &item_ids.len().to_string())]);
@@ -138,23 +138,23 @@ impl AppState {
     }
 
     /// Scrapes again the selected items that already have metadata.
-    pub async fn rescrape_items(&self, item_ids: Vec<String>) -> Result<TaskSnapshot, String> {
+    pub async fn rescrape_items(&self, item_ids: Vec<String>) -> CoreResult<TaskSnapshot> {
         if item_ids.is_empty() {
-            return Err("no items selected".into());
+            return Err(CoreError::invalid("no items selected"));
         }
         let mut scraped_ids = Vec::new();
         for id in &item_ids {
             let item = self
                 .db
                 .get_media_item(id)
-                .map_err(err_string)?
-                .ok_or_else(|| format!("media item not found: {id}"))?;
+                .map_err(failed)?
+                .ok_or_else(|| CoreError::not_found("media item", id))?;
             if item.status == ScrapedStatus::Scraped {
                 scraped_ids.push(id.clone());
             }
         }
         if scraped_ids.is_empty() {
-            return Err("no scraped items selected".into());
+            return Err(CoreError::invalid("no scraped items selected"));
         }
 
         let config = self.config().await;
@@ -174,7 +174,7 @@ impl AppState {
         Ok(snapshot)
     }
 
-    pub async fn scrape_season(&self, media_item_id: String, season_number: i32) -> Result<TaskSnapshot, String> {
+    pub async fn scrape_season(&self, media_item_id: String, season_number: i32) -> CoreResult<TaskSnapshot> {
         let config = self.config().await;
         let service = self.scrape_service(&config);
         let snapshot = self.tasks.enqueue_scoped(format!("Season {season_number}"), TaskKind::Scrape,
@@ -184,23 +184,23 @@ impl AppState {
     }
 
     /// Searches the configured sources for the manual-match dialog.
-    pub async fn search_match_candidates(&self, query: String, media_type: MediaType) -> Result<Vec<scraper_kit::SearchResult>, String> {
+    pub async fn search_match_candidates(&self, query: String, media_type: MediaType) -> CoreResult<Vec<scraper_kit::SearchResult>> {
         let config = self.config().await;
         let locale = config.ui_locale.clone();
         let coordinator = scraper_kit::ScraperCoordinator::new(scraper_keys(&config));
         coordinator
             .search_manual(&query, media_type, &config.metadata_language)
             .await
-            .map_err(|e| localized_error(&locale, e))
+            .map_err(|e| CoreError::Failed(localized_error(&locale, e)))
     }
 
-    pub async fn apply_manual_match(&self, item_id: String, source_id: String) -> Result<TaskSnapshot, String> {
+    pub async fn apply_manual_match(&self, item_id: String, source_id: String) -> CoreResult<TaskSnapshot> {
         let config = self.config().await;
         let item = self
             .db
             .get_media_item(&item_id)
-            .map_err(err_string)?
-            .ok_or_else(|| format!("media item not found: {item_id}"))?;
+            .map_err(failed)?
+            .ok_or_else(|| CoreError::not_found("media item", &item_id))?;
         let title = ui_i18n::tf(&config.ui_locale, "task.manualMatch", &[("title", &item.title)]);
         let target_id = Some(item_id.clone());
         let service = self.scrape_service(&config);
@@ -215,9 +215,9 @@ impl AppState {
     }
 
     /// Renames the items' folders and files with the configured templates.
-    pub async fn apply_rename_templates(&self, item_ids: Vec<String>) -> Result<TaskSnapshot, String> {
+    pub async fn apply_rename_templates(&self, item_ids: Vec<String>) -> CoreResult<TaskSnapshot> {
         if item_ids.is_empty() {
-            return Err("no items selected".into());
+            return Err(CoreError::invalid("no items selected"));
         }
         let config = self.config().await;
         let title = ui_i18n::tf(&config.ui_locale, "task.renameN", &[("n", &item_ids.len().to_string())]);
@@ -233,23 +233,23 @@ impl AppState {
     }
 
     /// Moves episodes of the selected scraped shows into season folders.
-    pub async fn organize_season_folders(&self, item_ids: Vec<String>) -> Result<TaskSnapshot, String> {
+    pub async fn organize_season_folders(&self, item_ids: Vec<String>) -> CoreResult<TaskSnapshot> {
         if item_ids.is_empty() {
-            return Err("no items selected".into());
+            return Err(CoreError::invalid("no items selected"));
         }
         let mut targets = Vec::new();
         for id in &item_ids {
             let item = self
                 .db
                 .get_media_item(id)
-                .map_err(err_string)?
-                .ok_or_else(|| format!("media item not found: {id}"))?;
+                .map_err(failed)?
+                .ok_or_else(|| CoreError::not_found("media item", id))?;
             if item.status == ScrapedStatus::Scraped && matches!(item.media_type, MediaType::TvShow | MediaType::Anime) {
                 targets.push(id.clone());
             }
         }
         if targets.is_empty() {
-            return Err("no scraped tv/anime items selected".into());
+            return Err(CoreError::invalid("no scraped tv/anime items selected"));
         }
 
         let config = self.config().await;
@@ -271,9 +271,9 @@ impl AppState {
     }
 
     /// The lock scope covering the libraries the given items belong to.
-    pub(crate) async fn items_scope(&self, item_ids: &[String]) -> Result<LockScope, String> {
+    pub(crate) async fn items_scope(&self, item_ids: &[String]) -> CoreResult<LockScope> {
         let (db, ids) = (Arc::clone(&self.db), item_ids.to_vec());
-        blocking(move || LockScope::for_items(&db, &ids)).await
+        blocking(move || LockScope::for_items(&db, &ids).map_err(CoreError::from)).await
     }
 
     fn scrape_service(&self, config: &AppConfig) -> ScrapeService<scraper_kit::ScrapeClient> {

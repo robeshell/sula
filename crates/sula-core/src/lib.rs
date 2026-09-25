@@ -6,6 +6,7 @@ pub mod app;
 pub mod batch_rename;
 pub mod config;
 pub mod credentials;
+pub mod error;
 pub mod files;
 pub mod images;
 pub mod items;
@@ -17,3 +18,5 @@ pub mod settings;
 pub mod state;
 pub mod task_queue;
 pub mod ui_i18n;
+
+pub use error::{CoreError, CoreResult};

@@ -4,7 +4,7 @@ use std::path::PathBuf;
 
 use serde::Serialize;
 
-use crate::app::{blocking, err_string};
+use crate::error::{blocking, failed, CoreError, CoreResult};
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -16,22 +16,22 @@ pub struct DirectoryEntryDto {
     pub modified_at: Option<String>,
 }
 
-pub async fn path_is_dir(path: String) -> Result<bool, String> {
+pub async fn path_is_dir(path: String) -> CoreResult<bool> {
     blocking(move || Ok(std::path::Path::new(path.trim()).is_dir())).await
 }
 
 /// Visible entries of a folder, folders first, then by name (case-insensitive).
-pub async fn list_directory(path: String) -> Result<Vec<DirectoryEntryDto>, String> {
+pub async fn list_directory(path: String) -> CoreResult<Vec<DirectoryEntryDto>> {
     blocking(move || list_directory_sync(PathBuf::from(path))).await
 }
 
-fn list_directory_sync(root: PathBuf) -> Result<Vec<DirectoryEntryDto>, String> {
+fn list_directory_sync(root: PathBuf) -> CoreResult<Vec<DirectoryEntryDto>> {
     if !root.is_dir() {
-        return Err("path is not a directory".into());
+        return Err(CoreError::invalid("path is not a directory"));
     }
     let mut out = Vec::new();
-    for entry in std::fs::read_dir(&root).map_err(err_string)? {
-        let entry = entry.map_err(err_string)?;
+    for entry in std::fs::read_dir(&root).map_err(failed)? {
+        let entry = entry.map_err(failed)?;
         let name = entry.file_name().to_string_lossy().into_owned();
         if name.starts_with('.') {
             continue;

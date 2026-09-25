@@ -101,7 +101,7 @@ impl AppState {
             .get_library(&library_id)
             .map_err(failed)?
             .ok_or_else(|| CoreError::not_found("library", &library_id))?;
-        let config = self.config().await;
+        let config = self.config_with_keys().await;
         let title = ui_i18n::tf(&config.ui_locale, "task.scrapeAll", &[("name", &library.name)]);
         let target_id = Some(library_id.clone());
 
@@ -125,7 +125,7 @@ impl AppState {
         if item_ids.is_empty() {
             return Err(CoreError::invalid("no items selected"));
         }
-        let config = self.config().await;
+        let config = self.config_with_keys().await;
         let title = ui_i18n::tf(&config.ui_locale, "task.scrapeN", &[("n", &item_ids.len().to_string())]);
         let service = self.scrape_service(&config);
         let snapshot = self
@@ -157,7 +157,7 @@ impl AppState {
             return Err(CoreError::invalid("no scraped items selected"));
         }
 
-        let config = self.config().await;
+        let config = self.config_with_keys().await;
         let title = ui_i18n::tf(&config.ui_locale, "task.rescrapeN", &[("n", &scraped_ids.len().to_string())]);
         let service = self.scrape_service(&config);
         let snapshot = self
@@ -175,7 +175,7 @@ impl AppState {
     }
 
     pub async fn scrape_season(&self, media_item_id: String, season_number: i32) -> CoreResult<TaskSnapshot> {
-        let config = self.config().await;
+        let config = self.config_with_keys().await;
         let service = self.scrape_service(&config);
         let snapshot = self.tasks.enqueue_scoped(format!("Season {season_number}"), TaskKind::Scrape,
             Some(media_item_id.clone()), task_scope("season", &[media_item_id.clone(), season_number.to_string()]), None,
@@ -185,7 +185,7 @@ impl AppState {
 
     /// Searches the configured sources for the manual-match dialog.
     pub async fn search_match_candidates(&self, query: String, media_type: MediaType) -> CoreResult<Vec<scraper_kit::SearchResult>> {
-        let config = self.config().await;
+        let config = self.config_with_keys().await;
         let locale = config.ui_locale.clone();
         let coordinator = scraper_kit::ScraperCoordinator::new(scraper_keys(&config));
         coordinator
@@ -195,7 +195,7 @@ impl AppState {
     }
 
     pub async fn apply_manual_match(&self, item_id: String, source_id: String) -> CoreResult<TaskSnapshot> {
-        let config = self.config().await;
+        let config = self.config_with_keys().await;
         let item = self
             .db
             .get_media_item(&item_id)

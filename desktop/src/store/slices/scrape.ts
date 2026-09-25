@@ -13,6 +13,8 @@ import type {
 async function ensureScrapeKeys(get: StoreGet): Promise<boolean> {
   try {
     const config = await invoke<AppConfig>("get_config");
+    // The core waits for keys still loading from the keychain before scraping.
+    if (config.apiKeysLoading) return true;
     const hasKey =
       Boolean(config.apiKeys.tmdb.trim()) ||
       Boolean(config.apiKeys.bangumi.trim()) ||

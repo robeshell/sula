@@ -400,5 +400,6 @@
   "renamer.summaryConflicts": "{{count}} with problems",
   "renamer.summaryUnchanged": "{{count}} unchanged",
   "renamer.undoLast": "Undo last rename",
-  "renamer.executeN": "Rename {{count}} files"
+  "renamer.executeN": "Rename {{count}} files",
+  "settings.api.keysLoading": "Reading saved API keys from the system keychain…"
 }

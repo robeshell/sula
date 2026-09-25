@@ -29,7 +29,7 @@ pub struct MediaDetailDto {
 impl AppState {
     pub async fn status(&self) -> CoreResult<AppStatusDto> {
         let library_count = self.db.library_count().map_err(failed)?;
-        let config = self.config.lock().await.config.clone();
+        let config = self.config().await;
         Ok(AppStatusDto {
             app_name: "Sula".into(),
             version: env!("CARGO_PKG_VERSION").into(),

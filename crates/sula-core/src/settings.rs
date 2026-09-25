@@ -9,7 +9,24 @@ use crate::state::AppState;
 
 impl AppState {
     pub async fn config(&self) -> AppConfig {
-        self.config.lock().await.config.clone()
+        self.config.lock().await.snapshot()
+    }
+
+    /// The settings once saved API keys have been read, for work that talks to
+    /// the metadata sources. Waits while the keychain read is still running.
+    pub(crate) async fn config_with_keys(&self) -> AppConfig {
+        loop {
+            let loaded = self.keys_loaded.notified();
+            tokio::pin!(loaded);
+            loaded.as_mut().enable();
+            {
+                let store = self.config.lock().await;
+                if !store.keys_loading() {
+                    return store.snapshot();
+                }
+            }
+            loaded.await;
+        }
     }
 
     pub(crate) async fn ui_locale(&self) -> String {
@@ -38,7 +55,9 @@ impl AppState {
                 self.db.clear_scan_states(&library.id).map_err(failed)?;
             }
         }
-        let saved = store.config.clone();
+        // Startup notices were shown when the window opened; don't repeat them.
+        store.config.config_notice = None;
+        let saved = store.snapshot();
         drop(store);
         self.keep_running_on_close.store(saved.keep_running_on_close, Ordering::Relaxed);
         self.events.config_changed(&saved);

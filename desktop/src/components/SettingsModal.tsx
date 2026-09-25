@@ -8,6 +8,7 @@ import { useEffect, useRef, useState, type ReactNode } from "react";
 import { Database, FolderTree, Library as LibraryIcon, SlidersHorizontal, Wrench } from "lucide-react";
 import { useTranslation } from "react-i18next";
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-dialog";
 
 import { migrateSkinPreference, watchAppearance } from "../lib/appearance";
@@ -613,22 +614,45 @@ function ApiKeysSection() {
   const [concurrency, setConcurrency] = useState(4);
   const [language, setLanguage] = useState("zh-CN");
   const [loaded, setLoaded] = useState(false);
+  const [keysLoading, setKeysLoading] = useState(false);
 
   useEffect(() => {
-    void (async () => {
-      const config = await invoke<{
-        apiKeys: { tmdb: string; bangumi?: string; omdb?: string; tvdb?: string };
-        scrapeConcurrency: number;
-        metadataLanguage: string;
-      }>("get_config");
+    type KeysConfig = {
+      apiKeys: { tmdb: string; bangumi?: string; omdb?: string; tvdb?: string };
+      apiKeysLoading?: boolean;
+      scrapeConcurrency: number;
+      metadataLanguage: string;
+    };
+    let disposed = false;
+    let unlisten: (() => void) | undefined;
+    const fill = (config: KeysConfig) => {
       setTmdb(config.apiKeys.tmdb ?? "");
       setBangumi(config.apiKeys.bangumi ?? "");
       setOmdb(config.apiKeys.omdb ?? "");
       setTvdb(config.apiKeys.tvdb ?? "");
       setConcurrency(config.scrapeConcurrency ?? 4);
       setLanguage(config.metadataLanguage ?? "zh-CN");
+      setKeysLoading(false);
       setLoaded(true);
+    };
+    void (async () => {
+      const config = await invoke<KeysConfig>("get_config");
+      if (disposed) return;
+      if (!config.apiKeysLoading) {
+        fill(config);
+        return;
+      }
+      // Saved keys are still coming from the keychain: wait instead of editing blanks.
+      setKeysLoading(true);
+      unlisten = await listen<KeysConfig>("config-changed", (event) => {
+        if (!disposed && !event.payload.apiKeysLoading) fill(event.payload);
+      });
+      if (disposed) unlisten();
     })();
+    return () => {
+      disposed = true;
+      unlisten?.();
+    };
   }, []);
 
   useAutosave(
@@ -661,7 +685,9 @@ function ApiKeysSection() {
   );
 
   return (
-    <div className="kg-settings-group">
+    <div className="kg-settings-group" aria-busy={keysLoading || undefined}>
+      {keysLoading ? <p className="kg-settings-field kg-settings-row-sub">{t("settings.api.keysLoading")}</p> : null}
+      <fieldset disabled={!loaded} className="contents">
       <ApiField label={t("settings.api.tmdb")} value={tmdb} onChange={setTmdb} placeholder="eyJhbGciOi..." />
       <ApiField
         label={t("settings.api.bangumi")}
@@ -698,6 +724,7 @@ function ApiKeysSection() {
           onChange={(e) => setLanguage(e.target.value)}
         />
       </label>
+      </fieldset>
     </div>
   );
 }

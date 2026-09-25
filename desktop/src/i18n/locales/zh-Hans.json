@@ -400,5 +400,6 @@
   "renamer.summaryConflicts": "{{count}} 个有问题",
   "renamer.summaryUnchanged": "{{count}} 个无变化",
   "renamer.undoLast": "撤销上次改名",
-  "renamer.executeN": "改名 {{count}} 个文件"
+  "renamer.executeN": "改名 {{count}} 个文件",
+  "settings.api.keysLoading": "正在从系统钥匙串读取已保存的 API Key…"
 }

@@ -19,6 +19,8 @@ export type AppConfig = {
   trayEnabled: boolean;
   keepRunningOnClose: boolean;
   uiLocale: string;
+  /** Saved keys are still being read from the system keychain. */
+  apiKeysLoading?: boolean;
   apiKeys: {
     tmdb: string;
     tvdb: string;

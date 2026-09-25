@@ -56,7 +56,10 @@ function ThemeBootstrap({ children }: { children: React.ReactNode }) {
       });
     // Settings live in their own window; every window follows the saved config.
     void listen<BootConfig>("config-changed", (event) => {
-      if (!disposed) apply(event.payload);
+      if (disposed) return;
+      apply(event.payload);
+      // e.g. saved API keys could not be read from the keychain after startup.
+      if (event.payload.configNotice) useAppStore.getState().showToast(i18n.t(event.payload.configNotice));
     }).then((fn) => {
       if (disposed) fn();
       else unlistenConfig = fn;

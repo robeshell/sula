@@ -23,6 +23,8 @@ pub struct AppState {
     pub rename_presets: Arc<PresetManager>,
     pub logs: Arc<LogStore>,
     pub events: Arc<dyn Events>,
+    /// Signalled when the startup keychain read finishes (see `config_with_keys`).
+    pub(crate) keys_loaded: Arc<tokio::sync::Notify>,
     pub data_dir: PathBuf,
     pub keep_running_on_close: AtomicBool,
     pub tray_enabled: AtomicBool,
@@ -60,6 +62,7 @@ impl AppState {
         let config_store = ConfigStore::load_or_default(&config_path)?;
         let keep_running_on_close = AtomicBool::new(config_store.config.keep_running_on_close);
         let tray_enabled = AtomicBool::new(config_store.config.tray_enabled);
+        let pending_keys = config_store.pending_key_ref();
         let config = Arc::new(Mutex::new(config_store));
 
         if let Err(error) = renamer::recover_media_operations(&db) {
@@ -74,6 +77,10 @@ impl AppState {
             data_dir.join("rename_snapshots"),
         )?);
         let rename_presets = Arc::new(PresetManager::open(data_dir.join("rename_presets"))?);
+        let keys_loaded = Arc::new(tokio::sync::Notify::new());
+        if let Some(id) = pending_keys {
+            runtime.spawn(load_api_keys(id, Arc::clone(&config), Arc::clone(&keys_loaded), Arc::clone(&events)));
+        }
         tasks.set_observer(Arc::new(TaskEvents {
             events: Arc::clone(&events),
             db: Arc::clone(&db),
@@ -91,10 +98,31 @@ impl AppState {
             rename_presets,
             logs,
             events,
+            keys_loaded,
             data_dir,
             keep_running_on_close,
             tray_enabled,
         })
+    }
+}
+
+/// Reads the stored API keys off the startup path: the keychain may show a
+/// prompt, and nothing should wait for it except work that needs the keys.
+async fn load_api_keys(id: String, config: Arc<Mutex<ConfigStore>>, loaded: Arc<tokio::sync::Notify>, events: Arc<dyn Events>) {
+    let read_id = id.clone();
+    let result = tokio::task::spawn_blocking(move || crate::config::read_api_keys(&read_id))
+        .await
+        .unwrap_or_else(|error| Err(anyhow::anyhow!("keychain read stopped: {error}")));
+    let changed = {
+        let mut store = config.lock().await;
+        let changed = store.finish_key_load(&id, result).then(|| store.snapshot());
+        // A failure notice is shown once, with this update.
+        store.config.config_notice = None;
+        changed
+    };
+    loaded.notify_waiters();
+    if let Some(config) = changed {
+        events.config_changed(&config);
     }
 }
 

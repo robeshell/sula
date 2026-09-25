@@ -400,5 +400,6 @@
   "renamer.summaryConflicts": "問題あり {{count}} 件",
   "renamer.summaryUnchanged": "変更なし {{count}} 件",
   "renamer.undoLast": "直前の変更を取り消す",
-  "renamer.executeN": "{{count}} ファイルの名前を変更"
+  "renamer.executeN": "{{count}} ファイルの名前を変更",
+  "settings.api.keysLoading": "システムのキーチェーンから保存済み API キーを読み込み中…"
 }

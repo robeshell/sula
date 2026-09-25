@@ -92,6 +92,10 @@ pub async fn save_config(
         .store(saved.keep_running_on_close, Ordering::Relaxed);
     crate::tray::set_enabled(&app, tray_enabled);
     crate::tray::set_locale(&app, &saved.ui_locale);
+    #[cfg(target_os = "macos")]
+    crate::app_menu::set_locale(&app, &saved.ui_locale);
+    // Other windows (main ↔ settings) keep their config in sync from this event.
+    let _ = app.emit("config-changed", &saved);
     Ok(saved)
 }
 
@@ -119,11 +123,14 @@ pub async fn add_library(
     let library = Library::new(name, root_path, media_type);
     state.db.insert_library(&library).map_err(err_string)?;
     let _ = enqueue_refresh_inner(&app, &state, library.id.clone()).await?;
+    // Every window keeps its own library list (settings edits them too).
+    app.library_updated();
     Ok(library)
 }
 
 #[tauri::command]
 pub async fn rename_library(
+    app: AppHandle,
     state: State<'_, AppState>,
     id: String,
     name: String,
@@ -139,13 +146,20 @@ pub async fn rename_library(
         .ok_or_else(|| format!("library not found: {id}"))?;
     library.name = name;
     state.db.update_library(&library).map_err(err_string)?;
+    app.library_updated();
     Ok(library)
 }
 
 #[tauri::command]
-pub async fn delete_library(state: State<'_, AppState>, id: String) -> Result<(), String> {
+pub async fn delete_library(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    id: String,
+) -> Result<(), String> {
     let _mutation_guard = state.tasks.locks().lock(&LockScope::library(&id)).await?;
-    state.db.delete_library(&id).map_err(err_string)
+    state.db.delete_library(&id).map_err(err_string)?;
+    app.library_updated();
+    Ok(())
 }
 
 #[tauri::command]
@@ -1063,12 +1077,84 @@ pub async fn open_renamer_window(app: AppHandle, state: State<'_, AppState>) -> 
     .inner_size(1040.0, 740.0)
     .min_inner_size(800.0, 560.0);
 
-    // Match main-window immersive chrome on Windows (macOS keeps system decorations).
+    // Same chrome as the main window: the toolbar hosts the traffic lights on
+    // macOS; Windows is undecorated and draws its own caption buttons.
+    #[cfg(target_os = "macos")]
+    let builder = builder
+        .title_bar_style(tauri::TitleBarStyle::Overlay)
+        .hidden_title(true)
+        .traffic_light_position(tauri::LogicalPosition::new(16.0, 18.0));
     #[cfg(target_os = "windows")]
     let builder = builder.decorations(false);
 
     builder.build().map_err(err_string)?;
     Ok(())
+}
+
+const SETTINGS_LABEL: &str = "settings";
+
+#[tauri::command]
+pub async fn open_settings_window(app: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
+    let locale = ui_locale(&state).await;
+    open_settings(&app, &locale)
+}
+
+/// Menu-bar entry point (⌘,): menu callbacks run on the event loop, so the
+/// window is built from an async task like the command does.
+pub(crate) fn spawn_open_settings(app: &AppHandle) {
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        let locale = match app.try_state::<AppState>() {
+            Some(state) => ui_locale(&state).await,
+            None => crate::ui_i18n::system_locale().to_string(),
+        };
+        if let Err(error) = open_settings(&app, &locale) {
+            tracing::warn!(%error, "failed to open settings window");
+        }
+    });
+}
+
+fn focus_settings(app: &AppHandle) -> bool {
+    let Some(existing) = app.get_webview_window(SETTINGS_LABEL) else {
+        return false;
+    };
+    let _ = existing.unminimize();
+    let _ = existing.show();
+    let _ = existing.set_focus();
+    true
+}
+
+fn open_settings(app: &AppHandle, locale: &str) -> Result<(), String> {
+    if focus_settings(app) {
+        return Ok(());
+    }
+    let builder = tauri::WebviewWindowBuilder::new(
+        app,
+        SETTINGS_LABEL,
+        tauri::WebviewUrl::App("index.html".into()),
+    )
+    .title(crate::ui_i18n::t(locale, "window.settings"))
+    .inner_size(700.0, 610.0)
+    .resizable(false)
+    .maximizable(false)
+    .center();
+
+    // macOS overlay title bar with the lights centred in the 38px title row;
+    // Windows undecorated like the main window.
+    #[cfg(target_os = "macos")]
+    let builder = builder
+        .title_bar_style(tauri::TitleBarStyle::Overlay)
+        .hidden_title(true)
+        .traffic_light_position(tauri::LogicalPosition::new(14.0, 12.0));
+    #[cfg(target_os = "windows")]
+    let builder = builder.decorations(false);
+
+    match builder.build() {
+        Ok(_) => Ok(()),
+        // A concurrent request (menu + shortcut) may have created it first.
+        Err(_) if focus_settings(app) => Ok(()),
+        Err(error) => Err(err_string(error)),
+    }
 }
 
 #[tauri::command]

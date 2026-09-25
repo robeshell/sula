@@ -39,5 +39,16 @@ keyring = { version = "3.6.3", features = ["apple-native", "windows-native", "sy
 tauri-plugin-single-instance = "2.4.5"
 rfd = { version = "0.16", default-features = false, features = ["common-controls-v6"] }
 
+[target.'cfg(target_os = "macos")'.dependencies]
+block2 = "0.6"
+objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSColor", "NSColorSpace", "objc2-core-foundation"] }
+objc2-foundation = { version = "0.3", default-features = false, features = ["std", "block2", "NSNotification", "NSOperation", "NSString"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Registry"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+dbus = "0.9"
+
 [dev-dependencies]
 tempfile = "3"

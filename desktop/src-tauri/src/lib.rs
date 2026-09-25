@@ -1,4 +1,7 @@
+mod accent;
 mod app;
+#[cfg(target_os = "macos")]
+mod app_menu;
 mod commands;
 mod config;
 mod log_store;
@@ -28,6 +31,10 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_notification::init())
         .on_window_event(|window, event| {
+            // Users change the accent in System Settings, then come back to the app.
+            if let tauri::WindowEvent::Focused(true) = event {
+                accent::refresh(window.app_handle());
+            }
             if window.label() != "main" {
                 return;
             }
@@ -49,6 +56,12 @@ pub fn run() {
             app.manage(state);
             logs.attach_app(app.handle().clone());
             tray::setup(app.handle())?;
+            accent::setup(app.handle());
+            #[cfg(target_os = "macos")]
+            {
+                let locale = app.state::<AppState>().config.try_lock().map(|store| store.config.ui_locale.clone());
+                app_menu::setup(app.handle(), locale.as_deref().unwrap_or("zh-Hans"))?;
+            }
             // Windows has no Overlay titlebar; drop native chrome so content
             // can draw edge-to-edge like macOS Overlay + traffic lights.
             #[cfg(target_os = "windows")]
@@ -92,6 +105,8 @@ pub fn run() {
             commands::enqueue_smoke_task,
             commands::cancel_task,
             commands::open_renamer_window,
+            commands::open_settings_window,
+            accent::get_system_accent,
             commands::renamer_collect_files,
             commands::renamer_preview,
             commands::renamer_execute,

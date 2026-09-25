@@ -242,6 +242,99 @@ fn lookup(locale: &str, key: &str) -> Option<String> {
         ("ja", "window.renamer") => "一括リネーム".into(),
         (_, "window.renamer") => "批量重命名".into(),
 
+        ("en", "window.settings") => "Settings".into(),
+        ("ja", "window.settings") => "設定".into(),
+        (_, "window.settings") => "设置".into(),
+
+        // macOS menu bar
+        ("en", "menu.about") => "About {{app}}".into(),
+        ("ja", "menu.about") => "{{app}}について".into(),
+        (_, "menu.about") => "关于 {{app}}".into(),
+
+        ("en", "menu.settings") => "Settings…".into(),
+        ("ja", "menu.settings") => "設定…".into(),
+        (_, "menu.settings") => "设置…".into(),
+
+        ("en", "menu.services") => "Services".into(),
+        ("ja", "menu.services") => "サービス".into(),
+        (_, "menu.services") => "服务".into(),
+
+        ("en", "menu.hide") => "Hide {{app}}".into(),
+        ("ja", "menu.hide") => "{{app}}を隠す".into(),
+        (_, "menu.hide") => "隐藏 {{app}}".into(),
+
+        ("en", "menu.hideOthers") => "Hide Others".into(),
+        ("ja", "menu.hideOthers") => "ほかを隠す".into(),
+        (_, "menu.hideOthers") => "隐藏其他".into(),
+
+        ("en", "menu.showAll") => "Show All".into(),
+        ("ja", "menu.showAll") => "すべてを表示".into(),
+        (_, "menu.showAll") => "全部显示".into(),
+
+        ("en", "menu.quit") => "Quit {{app}}".into(),
+        ("ja", "menu.quit") => "{{app}}を終了".into(),
+        (_, "menu.quit") => "退出 {{app}}".into(),
+
+        ("en", "menu.file") => "File".into(),
+        ("ja", "menu.file") => "ファイル".into(),
+        (_, "menu.file") => "文件".into(),
+
+        ("en", "menu.closeWindow") => "Close Window".into(),
+        ("ja", "menu.closeWindow") => "ウインドウを閉じる".into(),
+        (_, "menu.closeWindow") => "关闭窗口".into(),
+
+        ("en", "menu.edit") => "Edit".into(),
+        ("ja", "menu.edit") => "編集".into(),
+        (_, "menu.edit") => "编辑".into(),
+
+        ("en", "menu.undo") => "Undo".into(),
+        ("ja", "menu.undo") => "取り消す".into(),
+        (_, "menu.undo") => "撤销".into(),
+
+        ("en", "menu.redo") => "Redo".into(),
+        ("ja", "menu.redo") => "やり直す".into(),
+        (_, "menu.redo") => "重做".into(),
+
+        ("en", "menu.cut") => "Cut".into(),
+        ("ja", "menu.cut") => "カット".into(),
+        (_, "menu.cut") => "剪切".into(),
+
+        ("en", "menu.copy") => "Copy".into(),
+        ("ja", "menu.copy") => "コピー".into(),
+        (_, "menu.copy") => "拷贝".into(),
+
+        ("en", "menu.paste") => "Paste".into(),
+        ("ja", "menu.paste") => "ペースト".into(),
+        (_, "menu.paste") => "粘贴".into(),
+
+        ("en", "menu.selectAll") => "Select All".into(),
+        ("ja", "menu.selectAll") => "すべてを選択".into(),
+        (_, "menu.selectAll") => "全选".into(),
+
+        ("en", "menu.view") => "View".into(),
+        ("ja", "menu.view") => "表示".into(),
+        (_, "menu.view") => "显示".into(),
+
+        ("en", "menu.fullscreen") => "Toggle Full Screen".into(),
+        ("ja", "menu.fullscreen") => "フルスクリーンにする".into(),
+        (_, "menu.fullscreen") => "切换全屏幕".into(),
+
+        ("en", "menu.window") => "Window".into(),
+        ("ja", "menu.window") => "ウインドウ".into(),
+        (_, "menu.window") => "窗口".into(),
+
+        ("en", "menu.minimize") => "Minimize".into(),
+        ("ja", "menu.minimize") => "しまう".into(),
+        (_, "menu.minimize") => "最小化".into(),
+
+        ("en", "menu.zoom") => "Zoom".into(),
+        ("ja", "menu.zoom") => "拡大／縮小".into(),
+        (_, "menu.zoom") => "缩放".into(),
+
+        ("en", "menu.help") => "Help".into(),
+        ("ja", "menu.help") => "ヘルプ".into(),
+        (_, "menu.help") => "帮助".into(),
+
         ("en", "err.apiKey") => "API key missing or invalid — check Settings".into(),
         ("ja", "err.apiKey") => "API キーが無効または未設定です。設定を確認してください".into(),
         (_, "err.apiKey") => "API Key 无效或未填写，请到设置中检查".into(),

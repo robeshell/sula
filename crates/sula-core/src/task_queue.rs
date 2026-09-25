@@ -319,6 +319,8 @@ impl TaskQueue {
                 if let Some(existing) = tasks.iter().find(|t| t.snapshot.kind == kind
                     && t.scope == scope
                     && matches!(t.snapshot.status, TaskStatus::Pending | TaskStatus::Running)) {
+                    // A repeated request gets the queued task, and the UI hears about it.
+                    self.inner.notify(&existing.snapshot);
                     return existing.snapshot.clone();
                 }
             }
@@ -327,6 +329,7 @@ impl TaskQueue {
                 else {
                     snapshot.status = TaskStatus::Failed;
                     snapshot.error_message = Some("task queue is full; retry after active tasks finish".into());
+                    self.inner.notify(&snapshot);
                     return snapshot;
                 }
             }

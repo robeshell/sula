@@ -1,14 +1,12 @@
-use std::sync::Arc;
-
 use media_core::{Library, MediaItem, MediaType};
 use tauri::{AppHandle, Emitter, Manager, State};
 
-use crate::app::locks::LockScope;
 use crate::app::organize::{ShowMergePair, ShowMergePlanDto};
-use crate::app::{blocking, err_string, Events};
+use crate::app::{err_string, Events};
 use crate::config::AppConfig;
 use crate::state::{AppState, AppStatusDto};
 use crate::task_queue::TaskSnapshot;
+use sula_core::batch_rename::RenamerOutcome;
 use sula_core::files::DirectoryEntryDto;
 use sula_core::media::{MediaDetailDto, MediaListPayload};
 
@@ -341,19 +339,7 @@ fn open_settings(app: &AppHandle, locale: &str) -> Result<(), String> {
 
 #[tauri::command]
 pub async fn renamer_collect_files(paths: Vec<String>) -> Result<Vec<renamer::FileEntry>, String> {
-    blocking(move || renamer_collect_files_sync(paths)).await
-}
-
-fn renamer_collect_files_sync(paths: Vec<String>) -> Result<Vec<renamer::FileEntry>, String> {
-    let mut out = Vec::new();
-    for raw in paths {
-        let path = std::path::PathBuf::from(&raw);
-        collect_paths_into(&path, &mut out).map_err(err_string)?;
-        if out.len() > MAX_RENAMER_FILES {
-            return Err(format!("too many files (max {MAX_RENAMER_FILES})"));
-        }
-    }
-    Ok(out)
+    sula_core::batch_rename::collect_files(paths).await
 }
 
 #[tauri::command]
@@ -361,115 +347,31 @@ pub async fn renamer_preview(
     files: Vec<renamer::FileEntry>,
     pipeline: renamer::RulePipeline,
 ) -> Result<Vec<renamer::PreviewResult>, String> {
-    Ok(renamer::preview(&files, &pipeline))
+    Ok(sula_core::batch_rename::preview(&files, &pipeline))
 }
 
-#[derive(serde::Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct RenamerOutcome {
-    pub renames: Vec<renamer::CompletedRename>,
-    /// Set when the batch stopped early; `renames` still lists what already moved.
-    pub error: Option<String>,
-    /// Library index rows that could not follow a moved file; the next refresh
-    /// would otherwise treat those files as deleted.
-    pub index_sync_failures: usize,
-    /// Undo only: entries whose renamed file no longer exists and was left alone.
-    pub skipped: usize,
-}
-
-/// The index stores canonical paths. After a rename only the parent directory of
-/// either side still resolves, so canonicalize that and re-attach the file name.
-fn canonical_entry_path(raw: &str) -> String {
-    let path = std::path::Path::new(raw);
-    match (path.parent(), path.file_name()) {
-        (Some(parent), Some(name)) if !parent.as_os_str().is_empty() => {
-            std::path::Path::new(&media_core::scanner::canonicalize_lossy(parent))
-                .join(name)
-                .to_string_lossy()
-                .into_owned()
-        }
-        _ => raw.to_string(),
-    }
-}
-
-fn sync_renamed_entry(db: &media_core::AppDatabase, rename: &renamer::CompletedRename, failures: &mut usize) {
-    let old = canonical_entry_path(&rename.original_path);
-    let new = canonical_entry_path(&rename.new_path);
-    if let Err(error) = db.remap_renamed_path(&old, &new) {
-        tracing::warn!(%old, %new, %error, "renamer: library index not updated");
-        *failures += 1;
-    }
-}
-
-/// Previews are recomputed here from the same inputs as `renamer_preview`, so a
-/// stale or forged preview from the webview can never choose the destination.
 #[tauri::command]
 pub async fn renamer_execute(
-    app: AppHandle,
     state: State<'_, AppState>,
     files: Vec<renamer::FileEntry>,
     pipeline: renamer::RulePipeline,
 ) -> Result<RenamerOutcome, String> {
-    let mutation_guard = state.tasks.locks().lock(&LockScope::Global).await?;
-    let (db, undo) = (Arc::clone(&state.db), Arc::clone(&state.rename_undo));
-    blocking(move || {
-        let _mutation_guard = mutation_guard;
-        let previews = renamer::preview(&files, &pipeline);
-        let mut outcome = RenamerOutcome { renames: Vec::new(), error: None, index_sync_failures: 0, skipped: 0 };
-        let result = renamer::execute(&previews, &undo, |done| {
-            outcome.renames.push(done.clone());
-            sync_renamed_entry(&db, done, &mut outcome.index_sync_failures);
-        });
-        finish_renamer_batch(&app, outcome, result.map(|_| ()))
-    })
-    .await
+    state.rename_files(files, pipeline).await
 }
 
 #[tauri::command]
-pub async fn renamer_undo_last(app: AppHandle, state: State<'_, AppState>) -> Result<RenamerOutcome, String> {
-    let mutation_guard = state.tasks.locks().lock(&LockScope::Global).await?;
-    let (db, undo) = (Arc::clone(&state.db), Arc::clone(&state.rename_undo));
-    blocking(move || {
-        let _mutation_guard = mutation_guard;
-        let mut outcome = RenamerOutcome { renames: Vec::new(), error: None, index_sync_failures: 0, skipped: 0 };
-        let result = undo.undo_last_report(|done| {
-            outcome.renames.push(done.clone());
-            sync_renamed_entry(&db, done, &mut outcome.index_sync_failures);
-        });
-        if let Ok(report) = &result { outcome.skipped = report.skipped; }
-        finish_renamer_batch(&app, outcome, result.map(|_| ()))
-    })
-    .await
-}
-
-/// A failure before anything moved is a plain error; after that the caller must
-/// still learn which entries moved, so the error travels inside the outcome.
-fn finish_renamer_batch(
-    app: &AppHandle,
-    mut outcome: RenamerOutcome,
-    result: Result<(), renamer::ExecuteError>,
-) -> Result<RenamerOutcome, String> {
-    if !outcome.renames.is_empty() {
-        UiEvents(app.clone()).library_updated();
-    }
-    match result {
-        Ok(()) => Ok(outcome),
-        Err(error) if outcome.renames.is_empty() => Err(err_string(error)),
-        Err(error) => {
-            outcome.error = Some(err_string(error));
-            Ok(outcome)
-        }
-    }
+pub async fn renamer_undo_last(state: State<'_, AppState>) -> Result<RenamerOutcome, String> {
+    state.undo_last_rename().await
 }
 
 #[tauri::command]
 pub async fn renamer_snapshot_count(state: State<'_, AppState>) -> Result<usize, String> {
-    Ok(state.rename_undo.snapshots().map_err(err_string)?.len())
+    state.rename_snapshot_count().await
 }
 
 #[tauri::command]
 pub async fn renamer_list_presets(state: State<'_, AppState>) -> Result<Vec<String>, String> {
-    state.rename_presets.list_presets().map_err(err_string)
+    state.rename_presets().await
 }
 
 #[tauri::command]
@@ -478,38 +380,27 @@ pub async fn renamer_save_preset(
     name: String,
     pipeline: renamer::RulePipeline,
 ) -> Result<(), String> {
-    state
-        .rename_presets
-        .save(&name, &pipeline)
-        .map_err(err_string)
+    state.save_rename_preset(name, pipeline).await
 }
 
 #[tauri::command]
-pub async fn renamer_load_preset(
-    state: State<'_, AppState>,
-    name: String,
-) -> Result<Option<renamer::RulePipeline>, String> {
-    state.rename_presets.load(&name).map_err(err_string)
+pub async fn renamer_load_preset(state: State<'_, AppState>, name: String) -> Result<Option<renamer::RulePipeline>, String> {
+    state.load_rename_preset(name).await
 }
 
 #[tauri::command]
 pub async fn renamer_delete_preset(state: State<'_, AppState>, name: String) -> Result<(), String> {
-    state.rename_presets.delete(&name).map_err(err_string)
+    state.delete_rename_preset(name).await
 }
 
 #[tauri::command]
-pub async fn renamer_auto_save_pipeline(
-    state: State<'_, AppState>,
-    pipeline: renamer::RulePipeline,
-) -> Result<(), String> {
-    state.rename_presets.auto_save(&pipeline).map_err(err_string)
+pub async fn renamer_auto_save_pipeline(state: State<'_, AppState>, pipeline: renamer::RulePipeline) -> Result<(), String> {
+    state.save_last_rename_pipeline(pipeline).await
 }
 
 #[tauri::command]
-pub async fn renamer_auto_load_pipeline(
-    state: State<'_, AppState>,
-) -> Result<Option<renamer::RulePipeline>, String> {
-    state.rename_presets.auto_load().map_err(err_string)
+pub async fn renamer_auto_load_pipeline(state: State<'_, AppState>) -> Result<Option<renamer::RulePipeline>, String> {
+    state.last_rename_pipeline().await
 }
 
 #[tauri::command]
@@ -560,37 +451,3 @@ fn reveal_path_impl(path: &std::path::Path) -> Result<(), String> {
 fn reveal_path_impl(path: &std::path::Path) -> Result<(), String> {
     tauri_plugin_opener::reveal_item_in_dir(path).map_err(err_string)
 }
-
-const MAX_RENAMER_FILES: usize = 5_000;
-
-fn collect_paths_into(
-    path: &std::path::Path,
-    out: &mut Vec<renamer::FileEntry>,
-) -> std::io::Result<()> {
-    if path.is_file() {
-        out.push(renamer::FileEntry::new(path));
-        return Ok(());
-    }
-    if !path.is_dir() {
-        return Ok(());
-    }
-    for entry in std::fs::read_dir(path)? {
-        let entry = entry?;
-        let child = entry.path();
-        let name = entry.file_name();
-        let name = name.to_string_lossy();
-        if name.starts_with('.') {
-            continue;
-        }
-        if child.is_dir() {
-            collect_paths_into(&child, out)?;
-        } else if child.is_file() {
-            out.push(renamer::FileEntry::new(&child));
-        }
-        if out.len() > MAX_RENAMER_FILES {
-            break;
-        }
-    }
-    Ok(())
-}
-

@@ -3,6 +3,7 @@
 //! dependency on a particular shell (Tauri today, native shells later).
 
 pub mod app;
+pub mod batch_rename;
 pub mod config;
 pub mod credentials;
 pub mod files;

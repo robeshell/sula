@@ -3,7 +3,7 @@ use reqwest::Client;
 use serde::Deserialize;
 use serde_json::Value;
 
-use crate::http::{reqwest_err, send_with_retry, RATE_LIMITED};
+use crate::http::{humanize_error, reqwest_err, send_with_retry, RATE_LIMITED};
 use crate::matching::relevance_score;
 use crate::types::{
     parse_source_numeric_id, ArtworkUrls, ScrapedEpisode, ScrapedMetadata, ScrapedSeason,
@@ -11,11 +11,15 @@ use crate::types::{
 };
 
 const BASE: &str = "https://api.bgm.tv";
+const EPISODE_PAGE: usize = 200;
+/// Bounds pagination when `total` is wrong or missing.
+const MAX_EPISODE_PAGES: usize = 20;
 
 #[derive(Clone)]
 pub struct BangumiScraper {
     client: Client,
     api_key: String,
+    base: String,
 }
 
 impl BangumiScraper {
@@ -23,7 +27,14 @@ impl BangumiScraper {
         Self {
             client,
             api_key: api_key.into(),
+            base: BASE.into(),
         }
+    }
+
+    #[cfg(test)]
+    fn with_base(mut self, base: impl Into<String>) -> Self {
+        self.base = base.into();
+        self
     }
 
     pub async fn search(
@@ -36,7 +47,8 @@ impl BangumiScraper {
             return Ok(Vec::new());
         }
         let url = format!(
-            "{BASE}/search/subject/{}?type=2&responseGroup=small",
+            "{}/search/subject/{}?type=2&responseGroup=small",
+            self.base,
             urlencoding::encode(query)
         );
         let data = self.get_json(&url).await?;
@@ -105,15 +117,10 @@ impl BangumiScraper {
     ) -> Result<ScrapedMetadata, String> {
         let id = parse_source_numeric_id(source_id)
             .ok_or_else(|| format!("bad bangumi source id: {source_id}"))?;
-        let url = format!("{BASE}/v0/subjects/{id}");
+        let url = format!("{}/v0/subjects/{id}", self.base);
         let detail: SubjectDetail = serde_json::from_value(self.get_json(&url).await?)
             .map_err(|e| e.to_string())?;
-        // Episodes are best-effort, except a rate limit (retryable) fails the fetch.
-        let episodes = match self.fetch_episodes(id).await {
-            Ok(episodes) => episodes,
-            Err(err) if err == RATE_LIMITED => return Err(err),
-            Err(_) => Vec::new(),
-        };
+        let (episodes, issue) = self.fetch_episodes(id).await?;
         let title = detail
             .name_cn
             .clone()
@@ -169,6 +176,7 @@ impl BangumiScraper {
                 episode_count: Some(episodes.len() as i32),
                 episodes,
             }],
+            issues: issue.into_iter().collect(),
         })
     }
 
@@ -185,36 +193,34 @@ impl BangumiScraper {
         })
     }
 
-    async fn fetch_episodes(&self, subject_id: &str) -> Result<Vec<ScrapedEpisode>, String> {
-        let url = format!("{BASE}/v0/episodes?subject_id={subject_id}&type=0&limit=200");
-        let data = self.get_json(&url).await?;
-        let list = data
-            .get("data")
-            .and_then(|v| v.as_array())
-            .cloned()
-            .unwrap_or_default();
-        Ok(list
-            .into_iter()
-            .filter_map(|ep| {
-                let ep_num = ep.get("ep").and_then(|v| v.as_f64()).map(|n| n as i32)?;
-                Some(ScrapedEpisode {
-                    episode_number: ep_num,
-                    title: ep
-                        .get("name_cn")
-                        .and_then(|v| v.as_str())
-                        .filter(|s| !s.is_empty())
-                        .map(str::to_string)
-                        .or_else(|| ep.get("name").and_then(|v| v.as_str()).map(str::to_string)),
-                    overview: ep.get("desc").and_then(|v| v.as_str()).map(str::to_string),
-                    air_date: ep.get("airdate").and_then(|v| v.as_str()).map(str::to_string),
-                    still_url: None,
-                    runtime: ep.get("duration_seconds").and_then(|v| v.as_i64()).map(|n| (n / 60) as i32),
-                    rating: None,
-                    director: None,
-                    writer: None,
-                })
-            })
-            .collect())
+    /// All episode pages. Only a rate limit fails; other page errors keep what was
+    /// fetched and return a humanized issue so the item is saved as partial.
+    async fn fetch_episodes(
+        &self,
+        subject_id: &str,
+    ) -> Result<(Vec<ScrapedEpisode>, Option<String>), String> {
+        let mut out = Vec::new();
+        let mut offset = 0;
+        for _ in 0..MAX_EPISODE_PAGES {
+            let url = format!(
+                "{}/v0/episodes?subject_id={subject_id}&type=0&limit={EPISODE_PAGE}&offset={offset}",
+                self.base
+            );
+            let data = match self.get_json(&url).await {
+                Ok(data) => data,
+                Err(err) if err == RATE_LIMITED => return Err(err),
+                Err(err) => return Ok((out, Some(format!("episodes: {}", humanize_error(&err))))),
+            };
+            let list = data.get("data").and_then(|v| v.as_array()).cloned().unwrap_or_default();
+            let total = data.get("total").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+            offset += list.len();
+            let last = list.is_empty() || offset >= total;
+            out.extend(list.into_iter().filter_map(parse_episode));
+            if last {
+                return Ok((out, None));
+            }
+        }
+        Ok((out, Some(format!("episodes: truncated after {MAX_EPISODE_PAGES} pages"))))
     }
 
     async fn get_json(&self, url: &str) -> Result<Value, String> {
@@ -235,6 +241,26 @@ impl BangumiScraper {
         }
         response.json().await.map_err(reqwest_err)
     }
+}
+
+fn parse_episode(ep: Value) -> Option<ScrapedEpisode> {
+    let ep_num = ep.get("ep").and_then(|v| v.as_f64()).map(|n| n as i32)?;
+    Some(ScrapedEpisode {
+        episode_number: ep_num,
+        title: ep
+            .get("name_cn")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .or_else(|| ep.get("name").and_then(|v| v.as_str()).map(str::to_string)),
+        overview: ep.get("desc").and_then(|v| v.as_str()).map(str::to_string),
+        air_date: ep.get("airdate").and_then(|v| v.as_str()).map(str::to_string),
+        still_url: None,
+        runtime: ep.get("duration_seconds").and_then(|v| v.as_i64()).map(|n| (n / 60) as i32),
+        rating: None,
+        director: None,
+        writer: None,
+    })
 }
 
 #[derive(Deserialize)]
@@ -273,4 +299,57 @@ struct Rating {
 #[derive(Deserialize)]
 struct Tag {
     name: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn page(line: &str, total: usize) -> String {
+        let offset: usize = line
+            .split("offset=")
+            .nth(1)
+            .and_then(|s| s.split([' ', '&']).next()?.parse().ok())
+            .unwrap();
+        let eps: Vec<_> = (offset..total.min(offset + EPISODE_PAGE))
+            .map(|n| serde_json::json!({"ep": n + 1, "name": format!("E{}", n + 1)}))
+            .collect();
+        serde_json::json!({"data": eps, "total": total, "limit": EPISODE_PAGE, "offset": offset}).to_string()
+    }
+
+    fn scraper(base: &str) -> BangumiScraper {
+        BangumiScraper::new(Client::builder().no_proxy().build().unwrap(), "").with_base(base)
+    }
+
+    #[tokio::test]
+    async fn episodes_paginate_by_offset_until_total() {
+        let (base, server) = crate::http::serve_routes(6, |line| page(line, 1100));
+        let (episodes, issue) = scraper(&base).fetch_episodes("975").await.unwrap();
+        let seen = server.join().unwrap();
+        assert_eq!(episodes.len(), 1100);
+        assert_eq!(episodes.last().unwrap().episode_number, 1100);
+        assert!(issue.is_none());
+        assert!(seen[5].contains("offset=1000"), "{seen:?}");
+    }
+
+    #[tokio::test]
+    async fn later_page_failure_is_partial_and_bogus_total_is_bounded() {
+        let (base, server) = crate::http::serve_routes(2, |line| {
+            if line.contains("offset=0") {
+                page(line, 400)
+            } else {
+                "HTTP/1.1 500 Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".into()
+            }
+        });
+        let (episodes, issue) = scraper(&base).fetch_episodes("1").await.unwrap();
+        server.join().unwrap();
+        assert_eq!(episodes.len(), EPISODE_PAGE);
+        assert!(issue.unwrap().starts_with("episodes:"));
+
+        let (base, server) = crate::http::serve_routes(MAX_EPISODE_PAGES, |line| page(line, usize::MAX));
+        let (episodes, issue) = scraper(&base).fetch_episodes("1").await.unwrap();
+        server.join().unwrap();
+        assert_eq!(episodes.len(), EPISODE_PAGE * MAX_EPISODE_PAGES);
+        assert!(issue.unwrap().contains("truncated"));
+    }
 }

@@ -547,7 +547,10 @@ fn rename_planned(db: &AppDatabase, item: &MediaItem, templates: &RenameTemplate
     };
     let folder_name = render(if movie { &templates.movie_folder } else { &templates.tv_show_folder }, &values)?;
     let mut new_root = if exclusive { root.parent().ok_or_else(|| RenameError::NotFound(root.clone()))?.join(folder_name) } else { root.clone() };
-    if new_root != root && new_root.exists() {
+    let fs_error = |e: std::io::Error| RenameError::Filesystem(e.to_string());
+    // `andor (2022)` → `Andor (2022)` on a case-insensitive volume: same directory.
+    let case_only_root = new_root != root && media_core::is_case_only_rename(&root, &new_root).map_err(fs_error)?;
+    if new_root != root && new_root.exists() && !case_only_root {
         if movie { return Err(RenameError::DestinationExists(new_root)); }
         new_root = root.clone(); // Existing show target: organize within current root.
     }
@@ -609,21 +612,28 @@ fn rename_planned(db: &AppDatabase, item: &MediaItem, templates: &RenameTemplate
     }
     let mut files: Vec<_> = destinations.into_iter().collect();
     files.sort_by(|a,b| a.0.cmp(&b.0));
+    // After a case-only root rename every source lives under the new spelling.
+    let source = |from: &Path| -> PathBuf {
+        match from.strip_prefix(&root) { Ok(rel) if case_only_root => new_root.join(rel), _ => from.to_path_buf() }
+    };
     let mut targets = std::collections::HashSet::new();
     for (from, to) in &files {
-        if !targets.insert(to.clone()) || (from != to && to.try_exists().map_err(|e| RenameError::Filesystem(e.to_string()))?) { return Err(RenameError::DestinationExists(to.clone())); }
+        let from = source(from);
+        let blocked = from != *to && to.try_exists().map_err(fs_error)? && !media_core::is_case_only_rename(&from, to).map_err(fs_error)?;
+        if !targets.insert(to.clone()) || blocked { return Err(RenameError::DestinationExists(to.clone())); }
     }
     let new_file = if movie { videos[0].1.to_string_lossy().into_owned() } else { new_root.to_string_lossy().into_owned() };
     let mut journal = crate::media_journal::MergeJournal::begin(db).map_err(RenameError::Filesystem)?;
     let result = (|| {
-        for (from,to) in &files { journal.move_file(from,to).map_err(RenameError::Filesystem)?; }
+        if case_only_root { journal.move_file(&root, &new_root).map_err(RenameError::Filesystem)?; }
+        for (from,to) in &files { journal.move_file(&source(from), to).map_err(RenameError::Filesystem)?; }
         db.commit_media_paths(&item.id, &root, &new_root, &new_file, &files, &journal.id).map_err(|e| RenameError::Database(e.to_string()))
     })();
     if let Err(error) = result {
         return match crate::recover_media_operations(db) { Ok(()) => Err(error), Err(recovery) => Err(RenameError::Filesystem(format!("{error}; recovery pending: {recovery}"))) };
     }
     crate::recover_media_operations(db).map_err(RenameError::Filesystem)?;
-    if exclusive && root != new_root { remove_empty_directories(&root); }
+    if exclusive && root != new_root && !case_only_root { remove_empty_directories(&root); }
     Ok(())
 }
 
@@ -1113,6 +1123,33 @@ mod tests {
         assert!(plan_duplicate_show_merges(&db, &db.list_media_items(&library.id).unwrap()).unwrap().is_empty());
         assert!(!merge_planned_show(&db, &duplicate.id, &canonical.id, &RenameTemplates::default()).unwrap());
         assert!(db.get_media_item(&duplicate.id).unwrap().is_some());
+    }
+
+    #[test]
+    fn case_only_movie_rename_renames_folder_and_file_in_place() {
+        let dir = tempdir().unwrap();
+        let folder = dir.path().join("dune (2021)");
+        std::fs::create_dir_all(&folder).unwrap();
+        let video = folder.join("dune (2021).mkv");
+        std::fs::write(&video, b"x").unwrap();
+        std::fs::write(folder.join("dune (2021).srt"), b"sub").unwrap();
+        let db = AppDatabase::open_in_memory().unwrap();
+        let library = Library::new("Movies", dir.path().display().to_string(), MediaType::Movie);
+        db.insert_library(&library).unwrap();
+        let item = MediaItem::new_movie("Dune", Some(2021), folder.display().to_string(), video.display().to_string(), library.id.clone(), ScrapedStatus::Scraped);
+        db.insert_media_items(&[item.clone()]).unwrap();
+
+        rename_after_scrape(&db, &item, &RenameTemplates::default()).unwrap();
+
+        let new_folder = dir.path().join("Dune (2021)");
+        let new_video = new_folder.join("Dune (2021).mkv");
+        assert!(media_core::entry_name_exists(&new_folder).unwrap());
+        assert!(media_core::entry_name_exists(&new_video).unwrap());
+        assert!(media_core::entry_name_exists(&new_folder.join("Dune (2021).srt")).unwrap());
+        let stored = db.get_media_item(&item.id).unwrap().unwrap();
+        assert_eq!(stored.folder_path, new_folder.display().to_string());
+        assert_eq!(stored.file_path, new_video.display().to_string());
+        assert!(db.media_operations().unwrap().is_empty());
     }
 
     #[test]

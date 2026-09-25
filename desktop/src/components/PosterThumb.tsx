@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState, useSyncExternalStore } from "react";
 
-import { resolvePosterSrc, POSTER_THUMB, subscribePosterCache, posterCacheVersion } from "../lib/posterLoadQueue";
+import { resolvePosterSrc, POSTER_THUMB, subscribePosterCache, posterFolderVersion } from "../lib/posterLoadQueue";
 
 type PosterThumbProps = {
   folderPath: string;
@@ -29,12 +29,17 @@ export function PosterThumb({
   className = "",
   fallbackLabel,
 }: PosterThumbProps) {
-  const cacheVersion = useSyncExternalStore(subscribePosterCache, posterCacheVersion);
+  const cacheVersion = useSyncExternalStore(subscribePosterCache, () =>
+    posterFolderVersion(folderPath),
+  );
   const rootRef = useRef<HTMLDivElement>(null);
   const [visible, setVisible] = useState(false);
   /** undefined = not loaded yet, null = missing, string = url */
   const [src, setSrc] = useState<string | null | undefined>(undefined);
   const candidatesKey = (posterCandidates ?? []).join("|");
+  /** What the current `src` depicts; a cache invalidation alone keeps it on screen. */
+  const identity = [folderPath, posterPath ?? "", candidatesKey, width, height, allowFallbacks].join("\0");
+  const shownIdentity = useRef<string | null>(null);
 
   useEffect(() => {
     const el = rootRef.current;
@@ -55,7 +60,14 @@ export function PosterThumb({
   useEffect(() => {
     if (!visible || !folderPath) return;
     let cancelled = false;
-    setSrc(undefined);
+    const controller = new AbortController();
+    // Different poster → skeleton. Same poster re-resolving after an
+    // invalidation → keep the old image until the new one is ready.
+    if (shownIdentity.current !== identity) setSrc(undefined);
+    const settle = (value: string | null) => {
+      shownIdentity.current = identity;
+      setSrc(value);
+    };
 
     void (async () => {
       const candidates =
@@ -63,7 +75,7 @@ export function PosterThumb({
           ? posterCandidates.filter((c): c is string => Boolean(c?.trim()))
           : [posterPath?.trim() || "poster.jpg"];
       if (candidates.length === 0) {
-        if (!cancelled) setSrc(null);
+        if (!cancelled) settle(null);
         return;
       }
       for (const candidate of candidates) {
@@ -74,20 +86,23 @@ export function PosterThumb({
           width,
           height,
           allowFallbacks,
+          signal: controller.signal,
         });
         if (cancelled) return;
         if (url) {
-          setSrc(url);
+          settle(url);
           return;
         }
       }
-      if (!cancelled) setSrc(null);
+      if (!cancelled) settle(null);
     })();
 
     return () => {
       cancelled = true;
+      controller.abort();
     };
-  }, [visible, folderPath, posterPath, candidatesKey, width, height, allowFallbacks, cacheVersion]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- identity covers the poster props
+  }, [visible, identity, cacheVersion]);
 
   return (
     <div ref={rootRef} className={className}>

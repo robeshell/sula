@@ -107,13 +107,14 @@ impl TaskHandle {
         }
     }
 
+    /// Progress is transient: kept in memory only. History is written on status
+    /// changes, and unfinished tasks are marked interrupted on the next start anyway.
     pub async fn update_progress(&self, progress: TaskProgress) {
-        self.queue
-            .update(&self.id, |snap| {
-                snap.progress = Some(progress);
-                snap.updated_at = Utc::now();
-            })
-            .await;
+        let mut tasks = self.queue.tasks.lock().await;
+        if let Some(task) = tasks.iter_mut().find(|t| t.snapshot.id == self.id) {
+            task.snapshot.progress = Some(progress);
+            task.snapshot.updated_at = Utc::now();
+        }
     }
 }
 
@@ -183,6 +184,10 @@ impl TaskQueue {
         let guard = Arc::clone(&self.inner.mutation_gate).lock_owned().await;
         (self.inner.recover)()?;
         Ok(guard)
+    }
+
+    pub async fn get(&self, id: &str) -> Option<TaskSnapshot> {
+        self.inner.tasks.lock().await.iter().find(|t| t.snapshot.id == id).map(|t| t.snapshot.clone())
     }
 
     pub async fn list(&self) -> Vec<TaskSnapshot> {
@@ -361,8 +366,6 @@ async fn worker_loop(inner: Arc<TaskQueueInner>) {
                 .iter_mut()
                 .find(|t| t.snapshot.status == TaskStatus::Pending && t.work.is_some())
                 .map(|t| {
-                    t.snapshot.status = TaskStatus::Running;
-                    t.snapshot.updated_at = Utc::now();
                     let work = t.work.take().expect("work present");
                     let handle = TaskHandle {
                         id: t.snapshot.id.clone(),
@@ -385,6 +388,11 @@ async fn worker_loop(inner: Arc<TaskQueueInner>) {
         let result = tauri::async_runtime::spawn(async move {
             let _guard = gate.lock_owned().await;
             if job_handle.is_cancelled() { return Err("cancelled".into()); }
+            // Only now is the job actually running; before this it waited for the gate.
+            job_handle.queue.update(&job_handle.id, |snap| {
+                snap.status = TaskStatus::Running;
+                snap.updated_at = Utc::now();
+            }).await;
             recover()?;
             work(job_handle).await
         }).await.unwrap_or_else(|_| Err("task stopped unexpectedly".into()));

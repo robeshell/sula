@@ -31,6 +31,11 @@ pub fn import_nfo_for_item(db: &AppDatabase, item: &MediaItem) -> Result<bool, D
     let exclusive = crate::media_files::owns_folder(db, item)
         .map_err(|e| std::io::Error::other(e.to_string()))?;
     let Some(parsed) = find_and_parse_nfo(item, &folder, exclusive) else {
+        // Episode and season NFOs are still worth importing without a tvshow.nfo;
+        // the show itself stays as scanned.
+        if matches!(item.media_type, MediaType::TvShow | MediaType::Anime) {
+            import_episode_nfos(db, item, &folder)?;
+        }
         return Ok(false);
     };
 
@@ -118,6 +123,9 @@ fn keep_existing_fields(metadata: &mut MediaMetadata, existing: MediaMetadata) {
 }
 
 fn find_and_parse_nfo(item: &MediaItem, folder: &Path, exclusive: bool) -> Option<NfoParsedData> {
+    if matches!(item.media_type, MediaType::TvShow | MediaType::Anime) {
+        return find_show_nfo(folder, exclusive);
+    }
     let mut candidate_names = Vec::new();
     if !item.file_path.is_empty() {
         let video = Path::new(&item.file_path);
@@ -131,11 +139,7 @@ fn find_and_parse_nfo(item: &MediaItem, folder: &Path, exclusive: bool) -> Optio
     if let Some(folder_name) = folder.file_name().and_then(|n| n.to_str()) {
         candidate_names.push(format!("{folder_name}.nfo"));
     }
-    candidate_names.push(if item.media_type == MediaType::Movie {
-        "movie.nfo".into()
-    } else {
-        "tvshow.nfo".into()
-    });
+    candidate_names.push("movie.nfo".into());
 
     for name in &candidate_names {
         let nfo_path = folder.join(name);
@@ -158,6 +162,46 @@ fn find_and_parse_nfo(item: &MediaItem, folder: &Path, exclusive: bool) -> Optio
         }
     }
     None
+}
+
+/// Show-level NFO: only `tvshow.nfo` or `<folder name>.nfo` (case-insensitive), never an
+/// episode NFO — neither by name (`Show.S01E01.nfo`) nor by root (`<episodedetails>`).
+fn find_show_nfo(folder: &Path, exclusive: bool) -> Option<NfoParsedData> {
+    let folder_name = folder.file_name().and_then(|n| n.to_str()).map(|n| format!("{n}.nfo"));
+    let names: Vec<String> = if exclusive { Some("tvshow.nfo".to_string()) } else { None }
+        .into_iter()
+        .chain(folder_name)
+        .filter(|name| !is_episode_nfo_name(name))
+        .collect();
+    names.iter().find_map(|name| {
+        let xml = fs::read_to_string(find_file_ci(folder, name)?).ok()?;
+        let root = nfo_root_name(&xml)?;
+        if root.eq_ignore_ascii_case("episodedetails") || root.eq_ignore_ascii_case("season") {
+            return None;
+        }
+        NfoReader::parse_tvshow_nfo(&xml).ok()
+    })
+}
+
+fn is_episode_nfo_name(name: &str) -> bool {
+    let stem = name.strip_suffix(".nfo").unwrap_or(name);
+    crate::FileNameParser::parse_title(stem).episode.is_some()
+}
+
+fn nfo_root_name(xml: &str) -> Option<String> {
+    let doc = roxmltree::Document::parse(xml).ok()?;
+    Some(doc.root_element().tag_name().name().to_string())
+}
+
+/// `folder/name`, matching the file name case-insensitively.
+fn find_file_ci(folder: &Path, name: &str) -> Option<PathBuf> {
+    let exact = folder.join(name);
+    if exact.is_file() {
+        return Some(exact);
+    }
+    fs::read_dir(folder).ok()?.flatten().map(|e| e.path()).find(|p| {
+        p.is_file() && p.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.eq_ignore_ascii_case(name))
+    })
 }
 
 fn try_parse_file(path: &Path, media_type: MediaType) -> Option<NfoParsedData> {
@@ -330,64 +374,70 @@ fn detect_episode_still_path(episode_file_path: &str, show_root: &Path) -> Optio
     relative_to_show(&matched, show_root)
 }
 
+/// Season NFO: `season.nfo` inside that season's folder, or `seasonNN.nfo` /
+/// `season NN.nfo` (`season-specials.nfo` for 0) at the show root. Exact names only,
+/// so an episode NFO like `Show.S01E01.nfo` is never taken for the season.
 fn detect_season_nfo_url(
     season_number: i32,
     episodes: &[TvEpisode],
     show_root: &Path,
 ) -> Option<PathBuf> {
+    let root_canon = show_root.canonicalize().ok();
+    let is_root = |dir: &Path| dir.canonicalize().ok() == root_canon;
     if let Some(first) = episodes.iter().find(|e| !e.file_path.is_empty()) {
         let season_dir = Path::new(&first.file_path).parent()?;
-        let season_nfo = season_dir.join("season.nfo");
-        if season_nfo.is_file() {
-            return Some(season_nfo);
+        if !is_root(season_dir) {
+            if let Some(found) = find_file_ci(season_dir, "season.nfo") {
+                return Some(found);
+            }
         }
     }
 
-    for candidate in [
-        show_root.join(format!("season{season_number:02}.nfo")),
-        show_root.join(format!("season{season_number}.nfo")),
-    ] {
-        if candidate.is_file() {
-            return Some(candidate);
-        }
+    let mut root_names = vec![
+        format!("season{season_number:02}.nfo"),
+        format!("season{season_number}.nfo"),
+        format!("season {season_number:02}.nfo"),
+        format!("season {season_number}.nfo"),
+    ];
+    if season_number == 0 {
+        root_names.push("season-specials.nfo".into());
+    }
+    if let Some(found) = root_names.iter().find_map(|name| find_file_ci(show_root, name)) {
+        return Some(found);
     }
 
-    let tokens = season_match_tokens(season_number);
     for entry in WalkDir::new(show_root)
+        .min_depth(2)
+        .max_depth(3)
         .follow_links(false)
         .into_iter()
         .filter_map(|e| e.ok())
     {
-        if !entry.file_type().is_file() {
-            continue;
-        }
         let path = entry.path();
-        if !path
-            .extension()
-            .and_then(|e| e.to_str())
-            .is_some_and(|e| e.eq_ignore_ascii_case("nfo"))
+        if !entry.file_type().is_file()
+            || !path.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.eq_ignore_ascii_case("season.nfo"))
         {
             continue;
         }
-        let lower_name = path
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or("")
-            .to_ascii_lowercase();
-        let lower_parent = path
-            .parent()
-            .and_then(|p| p.file_name())
-            .and_then(|n| n.to_str())
-            .unwrap_or("")
-            .to_ascii_lowercase();
-        if lower_name == "season" && tokens.iter().any(|t| lower_parent.contains(t)) {
-            return Some(path.to_path_buf());
-        }
-        if tokens.iter().any(|t| lower_name.contains(t)) {
+        let parent_name = path.parent().and_then(|p| p.file_name()).and_then(|n| n.to_str()).unwrap_or("");
+        if season_dir_number(parent_name) == Some(season_number) {
             return Some(path.to_path_buf());
         }
     }
     None
+}
+
+/// Season number of a season folder name: `Season 1`, `S01`, `第1季`, `Show Season 2`, `Specials`.
+fn season_dir_number(name: &str) -> Option<i32> {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    let re = RE.get_or_init(|| Regex::new(r"(?i)^(?:S(?:eason\s*)?|第\s*)(\d{1,2})(?:\s*季)?$").unwrap());
+    if let Some(n) = re.captures(name.trim()).and_then(|c| c[1].parse().ok()) {
+        return Some(n);
+    }
+    if ["specials", "special", "sp"].iter().any(|s| name.trim().eq_ignore_ascii_case(s)) {
+        return Some(0);
+    }
+    crate::FileNameParser::extract_season_suffix(name.trim()).map(|(_, n)| n)
 }
 
 fn detect_season_poster_path(
@@ -637,5 +687,79 @@ mod tests {
         db.insert_media_items(&[item.clone()]).unwrap();
         assert!(!import_nfo_for_item(&db, &item).unwrap());
         assert!(db.fetch_metadata(&item.id).unwrap().is_none());
+    }
+
+    fn scanned_show(dir: &Path, db: &AppDatabase) -> MediaItem {
+        let library = Library::new("TV", dir.display().to_string(), MediaType::TvShow);
+        db.insert_library(&library).unwrap();
+        let result = crate::scanner::scan_shows(&library, &Default::default(), &Default::default(), |_| {}).unwrap();
+        let item = result.new_items[0].clone();
+        db.insert_media_items(std::slice::from_ref(&item)).unwrap();
+        db.insert_show_episodes(&item.id, &result.episodes[&item.id]).unwrap();
+        item
+    }
+
+    #[test]
+    fn show_import_never_uses_an_episode_nfo_as_the_show_nfo() {
+        let dir = tempdir().unwrap();
+        let show = dir.path().join("Andor");
+        std::fs::create_dir_all(&show).unwrap();
+        std::fs::write(show.join("Andor.S01E01.mkv"), b"x").unwrap();
+        std::fs::write(show.join("Andor.S01E01.nfo"), "<tvshow><title>Kassa</title></tvshow>").unwrap();
+        std::fs::write(show.join("notes.nfo"), "<episodedetails><title>Kassa</title></episodedetails>").unwrap();
+        let db = AppDatabase::open_in_memory().unwrap();
+        let item = scanned_show(dir.path(), &db);
+        assert!(!import_nfo_for_item(&db, &item).unwrap());
+        assert_eq!(db.get_media_item(&item.id).unwrap().unwrap().title, "Andor");
+
+        // `<folder>.nfo` is accepted, case-insensitively, unless its root is an episode.
+        std::fs::write(show.join("ANDOR.nfo"), "<episodedetails><title>Kassa</title></episodedetails>").unwrap();
+        assert!(!import_nfo_for_item(&db, &item).unwrap());
+        std::fs::write(show.join("ANDOR.nfo"), "<tvshow><title>安多</title></tvshow>").unwrap();
+        assert!(import_nfo_for_item(&db, &item).unwrap());
+        assert_eq!(db.get_media_item(&item.id).unwrap().unwrap().title, "安多");
+    }
+
+    #[test]
+    fn episode_nfos_import_without_a_show_nfo() {
+        let dir = tempdir().unwrap();
+        let show = dir.path().join("Andor");
+        std::fs::create_dir_all(&show).unwrap();
+        std::fs::write(show.join("Andor.S01E01.mkv"), b"x").unwrap();
+        std::fs::write(show.join("Andor.S01E01.nfo"), "<episodedetails><title>Kassa</title></episodedetails>").unwrap();
+        let db = AppDatabase::open_in_memory().unwrap();
+        let item = scanned_show(dir.path(), &db);
+        assert!(!import_nfo_for_item(&db, &item).unwrap());
+        let item = db.get_media_item(&item.id).unwrap().unwrap();
+        assert_eq!(item.title, "Andor");
+        let season = db.fetch_seasons(&item.id).unwrap().remove(0);
+        assert_eq!(db.fetch_episodes(&season.id).unwrap()[0].title.as_deref(), Some("Kassa"));
+    }
+
+    #[test]
+    fn episode_nfo_is_not_taken_for_the_season_nfo() {
+        let dir = tempdir().unwrap();
+        let show = dir.path().join("Show");
+        let season_dir = show.join("Season 01");
+        std::fs::create_dir_all(&season_dir).unwrap();
+        std::fs::write(show.join("tvshow.nfo"), "<tvshow><title>Show</title></tvshow>").unwrap();
+        std::fs::write(season_dir.join("Show.S01E01.mkv"), b"x").unwrap();
+        std::fs::write(season_dir.join("Show.S01E01.nfo"),
+            "<episodedetails><title>Pilot</title><plot>First.</plot></episodedetails>").unwrap();
+        let db = AppDatabase::open_in_memory().unwrap();
+        let item = scanned_show(dir.path(), &db);
+        assert!(import_nfo_for_item(&db, &item).unwrap());
+        let season = db.fetch_seasons(&item.id).unwrap().remove(0);
+        assert_eq!(season.title, None);
+        assert_eq!(season.overview, None);
+        let ep = db.fetch_episodes(&season.id).unwrap().remove(0);
+        assert_eq!(ep.title.as_deref(), Some("Pilot"));
+
+        std::fs::write(show.join("Season01.nfo"), "<season><title>Season One</title></season>").unwrap();
+        assert!(import_nfo_for_item(&db, &item).unwrap());
+        assert_eq!(db.fetch_seasons(&item.id).unwrap()[0].title.as_deref(), Some("Season One"));
+        std::fs::write(season_dir.join("season.nfo"), "<season><title>In Folder</title></season>").unwrap();
+        assert!(import_nfo_for_item(&db, &item).unwrap());
+        assert_eq!(db.fetch_seasons(&item.id).unwrap()[0].title.as_deref(), Some("In Folder"));
     }
 }

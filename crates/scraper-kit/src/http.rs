@@ -1,8 +1,8 @@
 //! Shared HTTP client for scrapers — honors env + macOS system proxy (Clash etc.).
 
 use std::net::{TcpStream, ToSocketAddrs};
-use std::sync::OnceLock;
-use std::time::Duration;
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use regex::Regex;
 use reqwest::{Client, Proxy, RequestBuilder, Response};
@@ -11,9 +11,28 @@ use reqwest::{Client, Proxy, RequestBuilder, Response};
 pub const RATE_LIMITED: &str = "rateLimited";
 const MAX_RETRIES: u32 = 3;
 const MAX_RETRY_AFTER_SECS: u64 = 10;
+const CLIENT_TTL: Duration = Duration::from_secs(60);
 
-/// Build an HTTP client that follows `HTTP(S)_PROXY` and, on macOS, system proxy.
+/// Shared HTTP client that follows `HTTP(S)_PROXY` and, on macOS, system proxy.
+/// Proxy detection blocks (DNS, port probes, `scutil`), so the client is cached
+/// process-wide and re-detected at most once per [`CLIENT_TTL`].
 pub fn build_client() -> Client {
+    static CACHE: OnceLock<Mutex<Option<(Instant, Client)>>> = OnceLock::new();
+    let mut cached = CACHE
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if let Some((at, client)) = cached.as_ref() {
+        if at.elapsed() < CLIENT_TTL {
+            return client.clone();
+        }
+    }
+    let client = fresh_client();
+    *cached = Some((Instant::now(), client.clone()));
+    client
+}
+
+fn fresh_client() -> Client {
     let mut builder = Client::builder()
         .user_agent("sula/0.1.0")
         .timeout(Duration::from_secs(30));
@@ -256,9 +275,73 @@ fn http_status_mentions(lower: &str, code: u16) -> bool {
         || lower.contains(&format!("{code} forbidden"))
 }
 
+/// Local HTTP stub: answers `requests` connections via `route(method_and_path)`, then yields the
+/// request lines it saw.
+#[cfg(test)]
+pub(crate) fn serve_routes(
+    requests: usize,
+    route: impl Fn(&str) -> String + Send + 'static,
+) -> (String, std::thread::JoinHandle<Vec<String>>) {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let handle = std::thread::spawn(move || {
+        let mut seen = Vec::new();
+        for _ in 0..requests {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buf = Vec::new();
+            let mut chunk = [0; 4096];
+            // Drain headers + body so closing the socket does not reset the client.
+            loop {
+                let n = stream.read(&mut chunk).unwrap();
+                buf.extend_from_slice(&chunk[..n]);
+                let text = String::from_utf8_lossy(&buf).to_string();
+                if let Some(end) = text.find("\r\n\r\n") {
+                    let len = text[..end].lines().find_map(|l| {
+                        let (k, v) = l.split_once(':')?;
+                        k.eq_ignore_ascii_case("content-length").then(|| v.trim().parse::<usize>().ok())?
+                    });
+                    if n == 0 || buf.len() >= end + 4 + len.unwrap_or(0) {
+                        break;
+                    }
+                } else if n == 0 {
+                    break;
+                }
+            }
+            let text = String::from_utf8_lossy(&buf).to_string();
+            let line = text.lines().next().unwrap_or("").to_string();
+            let body = route(&line);
+            let status = if body.starts_with("HTTP/") { None } else { Some("HTTP/1.1 200 OK") };
+            let response = match status {
+                Some(status) => format!(
+                    "{status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                ),
+                None => body,
+            };
+            stream.write_all(response.as_bytes()).unwrap();
+            seen.push(line);
+        }
+        seen
+    });
+    (format!("http://{addr}"), handle)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn build_client_is_cached() {
+        let started = Instant::now();
+        let _ = build_client();
+        let first = started.elapsed();
+        let started = Instant::now();
+        for _ in 0..50 {
+            let _ = build_client();
+        }
+        assert!(started.elapsed() < first.max(Duration::from_millis(50)), "cached calls must be cheap");
+    }
 
     #[test]
     fn parses_scutil_https_proxy() {

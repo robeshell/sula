@@ -25,18 +25,29 @@ impl FileNameParser {
         "CHS", "CHT", "ENG", "JPN", "KOR", "全集",
     ];
 
+    /// Episode file names: a bare trailing number (`Show 05.mkv`) is read as the episode.
     pub fn parse(filename: &str) -> ParsedFileName {
+        Self::parse_with(filename, true)
+    }
+
+    /// Movie files and show/anime folder names: a bare trailing number is part of the
+    /// title (`Apollo 13`, `District 9`, `The 100`), never an episode.
+    pub fn parse_title(name: &str) -> ParsedFileName {
+        Self::parse_with(name, false)
+    }
+
+    fn parse_with(filename: &str, trailing_episode: bool) -> ParsedFileName {
         let name = Self::drop_extension(filename);
         if name.starts_with('[') {
-            Self::parse_anime(&name)
+            Self::parse_anime(&name, trailing_episode)
         } else {
-            Self::parse_standard(&name)
+            Self::parse_standard(&name, trailing_episode)
         }
     }
 
     /// Re-clean a stored/display title for matching (dots already spaces OK).
     pub fn clean_title_for_match(raw: &str) -> String {
-        Self::parse(&format!("{raw}.mkv")).title
+        Self::parse_title(&format!("{raw}.mkv")).title
     }
 
     pub fn extract_season_suffix(dir_name: &str) -> Option<(String, i32)> {
@@ -87,12 +98,13 @@ impl FileNameParser {
         None
     }
 
-    fn parse_anime(name: &str) -> ParsedFileName {
+    fn parse_anime(name: &str, trailing_episode: bool) -> ParsedFileName {
         static RE_GROUP: OnceLock<Regex> = OnceLock::new();
         static RE_DASH_EP: OnceLock<Regex> = OnceLock::new();
         static RE_CN_EP: OnceLock<Regex> = OnceLock::new();
         static RE_TRAIL_EP: OnceLock<Regex> = OnceLock::new();
         static RE_TRAIL_TAG: OnceLock<Regex> = OnceLock::new();
+        static RE_TRAIL_ROUND: OnceLock<Regex> = OnceLock::new();
 
         let mut remaining = name.to_string();
         let mut sub_group = None;
@@ -111,76 +123,80 @@ impl FileNameParser {
                 .collect();
             if parts.len() >= 2 {
                 if let Ok(ep) = parts[1].parse::<i32>() {
-                    return ParsedFileName {
-                        title: parts[0].clone(),
-                        episode: Some(ep),
-                        sub_group,
-                        ..Default::default()
-                    };
+                    return Self::anime_result(parts[0].clone(), None, Some(ep), sub_group);
                 }
             }
         }
 
-        let re_trail_tag = RE_TRAIL_TAG.get_or_init(|| Regex::new(r"\s*\[[^\]]+\]$").unwrap());
+        // Trailing `[tags]`, `[CRC32]`, and round-bracket quality tags like `(1080p)` /
+        // `(WEB 1080p HEVC)`; a trailing `(2019)` becomes the year.
+        let re_trail_tag = RE_TRAIL_TAG.get_or_init(|| Regex::new(r"\s*[\[【][^\]】]*[\]】]$").unwrap());
+        let re_trail_round = RE_TRAIL_ROUND.get_or_init(|| Regex::new(r"\s*[(（]([^()（）]*)[)）]$").unwrap());
+        let mut year = None;
         loop {
-            let before = remaining.clone();
-            remaining = re_trail_tag.replace(&remaining, "").to_string();
-            if remaining == before {
-                break;
+            if let Some(m) = re_trail_tag.find(&remaining) {
+                remaining.truncate(m.start());
+                continue;
             }
+            if let Some(caps) = re_trail_round.captures(&remaining) {
+                let inner = caps.get(1).unwrap().as_str().trim();
+                let is_year = inner.len() == 4 && (inner.starts_with("19") || inner.starts_with("20"))
+                    && inner.bytes().all(|b| b.is_ascii_digit());
+                if is_year && year.is_none() {
+                    year = inner.parse().ok();
+                } else if !is_release_tag(inner) {
+                    break;
+                }
+                remaining.truncate(caps.get(0).unwrap().start());
+                continue;
+            }
+            break;
         }
         remaining = remaining.trim().to_string();
 
-        let re_dash_ep = RE_DASH_EP.get_or_init(|| Regex::new(r"\s[-–]\s(\d{1,3})$").unwrap());
-        if let Some(caps) = re_dash_ep.captures(&remaining) {
-            let ep: i32 = caps.get(1).unwrap().as_str().parse().unwrap();
-            let title = remaining[..caps.get(0).unwrap().start()].trim().to_string();
-            return ParsedFileName {
-                title,
-                episode: Some(ep),
-                sub_group,
-                ..Default::default()
-            };
-        }
-
+        let re_dash_ep = RE_DASH_EP.get_or_init(|| Regex::new(r"(?i)\s[-–]\s(\d{1,3})(?:v\d{1,2})?$").unwrap());
         let re_cn_ep = RE_CN_EP.get_or_init(|| Regex::new(r"第(\d{1,3})[話话集]").unwrap());
-        if let Some(caps) = re_cn_ep.captures(&remaining) {
-            let ep: i32 = caps.get(1).unwrap().as_str().parse().unwrap();
-            let title = remaining[..caps.get(0).unwrap().start()].trim().to_string();
-            return ParsedFileName {
-                title,
-                episode: Some(ep),
-                sub_group,
-                ..Default::default()
-            };
-        }
-
         let re_trail_ep = RE_TRAIL_EP.get_or_init(|| Regex::new(r"\s(\d{1,3})$").unwrap());
-        if let Some(caps) = re_trail_ep.captures(&remaining) {
-            let ep: i32 = caps.get(1).unwrap().as_str().parse().unwrap();
-            let title = remaining[..caps.get(0).unwrap().start()].trim().to_string();
-            return ParsedFileName {
-                title,
-                episode: Some(ep),
-                sub_group,
-                ..Default::default()
-            };
+        let mut matchers = vec![re_dash_ep, re_cn_ep];
+        if trailing_episode {
+            matchers.push(re_trail_ep);
+        }
+        for re in matchers {
+            if let Some(caps) = re.captures(&remaining) {
+                let ep: i32 = caps.get(1).unwrap().as_str().parse().unwrap();
+                let title = remaining[..caps.get(0).unwrap().start()].trim().to_string();
+                return Self::anime_result(title, year, Some(ep), sub_group);
+            }
         }
 
-        ParsedFileName {
-            title: remaining,
-            sub_group,
-            ..Default::default()
-        }
+        Self::anime_result(remaining, year, None, sub_group)
     }
 
-    fn parse_standard(name: &str) -> ParsedFileName {
+    /// `Title S2` / `Title Season 2` / `Title 第2季` → season from the title suffix.
+    fn anime_result(title: String, year: Option<i32>, episode: Option<i32>, sub_group: Option<String>) -> ParsedFileName {
+        static RE_TITLE_YEAR: OnceLock<Regex> = OnceLock::new();
+        let re_title_year =
+            RE_TITLE_YEAR.get_or_init(|| Regex::new(r"\s*[(（]((?:19|20)\d{2})[)）]$").unwrap());
+        let (title, year) = match re_title_year.captures(&title) {
+            Some(caps) if caps.get(0).unwrap().start() > 0 => {
+                (title[..caps.get(0).unwrap().start()].to_string(), year.or(caps[1].parse().ok()))
+            }
+            _ => (title, year),
+        };
+        let (title, season) = match Self::extract_season_suffix(&title) {
+            Some((base, season)) => (base, Some(season)),
+            None => (title, None),
+        };
+        ParsedFileName { title, year, season, episode, sub_group }
+    }
+
+    fn parse_standard(name: &str, trailing_episode: bool) -> ParsedFileName {
         static RE_SE: OnceLock<Regex> = OnceLock::new();
-        static RE_YEAR: OnceLock<Regex> = OnceLock::new();
+        static RE_NX: OnceLock<Regex> = OnceLock::new();
         static RE_TRAIL_EP: OnceLock<Regex> = OnceLock::new();
         static RE_BRACKETS: OnceLock<Regex> = OnceLock::new();
 
-        let mut s = name.replace('.', " ").replace('_', " ");
+        let mut s = name.replace(['.', '_'], " ");
         let re_brackets = RE_BRACKETS.get_or_init(|| {
             Regex::new(r"(?i)[\[【][^\]】]*?(?:www|http|\.com|\.net|\.cn|btsj)[^\]】]*?[\]】]").unwrap()
         });
@@ -188,18 +204,30 @@ impl FileNameParser {
 
         let mut season = None;
         let mut episode = None;
-        let re_se = RE_SE.get_or_init(|| Regex::new(r"(?i)S(\d{1,2})E(\d{1,3})").unwrap());
+        // `S01E01`, plus multi-episode tails `S01E01E02` / `S01E01-E02` (first episode wins).
+        let re_se = RE_SE.get_or_init(|| {
+            Regex::new(r"(?i)S(\d{1,2})\s?E(\d{1,3})(?:\s?-\s?E\d{1,3}|E\d{1,3})*").unwrap()
+        });
+        // `1x05` / `01x05`; `x264` / `x265` codecs are not episodes.
+        let re_nx = RE_NX.get_or_init(|| Regex::new(r"(?i)\b(\d{1,2})x(\d{1,3})\b").unwrap());
         if let Some(caps) = re_se.captures(&s) {
             season = caps.get(1).and_then(|m| m.as_str().parse().ok());
             episode = caps.get(2).and_then(|m| m.as_str().parse().ok());
             s = re_se.replace(&s, " ").to_string();
+        } else if let Some(caps) = re_nx
+            .captures_iter(&s)
+            .find(|c| !matches!(c.get(2).map(|m| m.as_str()), Some("264" | "265")))
+        {
+            season = caps.get(1).and_then(|m| m.as_str().parse().ok());
+            episode = caps.get(2).and_then(|m| m.as_str().parse().ok());
+            let range = caps.get(0).unwrap().range();
+            s.replace_range(range, " ");
         }
 
         let mut year = None;
-        let re_year = RE_YEAR.get_or_init(|| Regex::new(r"\(?((?:19|20)\d{2})\)?").unwrap());
-        if let Some(caps) = re_year.captures(&s) {
-            year = caps.get(1).and_then(|m| m.as_str().parse().ok());
-            s = re_year.replace(&s, " ").to_string();
+        if let Some((start, end, y)) = Self::pick_year(&s) {
+            year = Some(y);
+            s.replace_range(start..end, " ");
         }
 
         let mut tokens: Vec<&str> = Self::NOISE_TOKENS.to_vec();
@@ -211,11 +239,17 @@ impl FileNameParser {
             }
         }
 
-        let title = s
+        let mut title = s
             .split_whitespace()
             .filter(|t| !t.is_empty() && !is_residual_noise_token(t))
             .collect::<Vec<_>>()
             .join(" ");
+        // `1917.mkv` / `2012 (2009)`: the number is all there is, so it is the title.
+        if title.is_empty() {
+            if let Some(y) = year.take() {
+                title = y.to_string();
+            }
+        }
 
         if season.is_none() {
             if let Some((base, season_num)) = Self::extract_season_suffix(&title) {
@@ -229,7 +263,7 @@ impl FileNameParser {
             }
         }
 
-        if season.is_none() && episode.is_none() {
+        if trailing_episode && season.is_none() && episode.is_none() {
             let re_trail_ep = RE_TRAIL_EP.get_or_init(|| Regex::new(r"\s(\d{1,3})$").unwrap());
             if let Some(caps) = re_trail_ep.captures(&title) {
                 let ep: i32 = caps.get(1).unwrap().as_str().parse().unwrap();
@@ -251,6 +285,41 @@ impl FileNameParser {
             episode,
             sub_group: None,
         }
+    }
+
+    /// Picks the release year and returns its byte range (brackets included) in `s`.
+    ///
+    /// A bracketed `(2017)` / `[2017]` wins; otherwise the last standalone year token, so
+    /// title numbers (`Blade Runner 2049 2017`, `1917 2019`) stay in the title. A leading
+    /// year-like number counts only when it is the sole candidate.
+    fn pick_year(s: &str) -> Option<(usize, usize, i32)> {
+        static RE_YEAR: OnceLock<Regex> = OnceLock::new();
+        let re_year = RE_YEAR.get_or_init(|| Regex::new(r"(?:19|20)\d{2}").unwrap());
+        let bytes = s.as_bytes();
+        // (start, end, year, bracketed, leading)
+        let candidates: Vec<(usize, usize, i32, bool, bool)> = re_year
+            .find_iter(s)
+            .filter(|m| {
+                let before = m.start().checked_sub(1).map(|i| bytes[i]);
+                !before.is_some_and(|b| b.is_ascii_alphanumeric())
+                    && !bytes.get(m.end()).is_some_and(|b| b.is_ascii_alphanumeric())
+            })
+            .map(|m| {
+                let open = m.start() > 0 && matches!(bytes[m.start() - 1], b'(' | b'[');
+                let close = matches!(bytes.get(m.end()), Some(b')' | b']'));
+                let start = if open { m.start() - 1 } else { m.start() };
+                let end = if close { m.end() + 1 } else { m.end() };
+                let leading = s[..start].trim().is_empty();
+                (start, end, m.as_str().parse().unwrap(), open && close, leading)
+            })
+            .collect();
+        let pick = candidates
+            .iter()
+            .rev()
+            .find(|c| c.3)
+            .or_else(|| candidates.iter().rev().find(|c| !c.4))
+            .or(candidates.first())?;
+        Some((pick.0, pick.1, pick.2))
     }
 
     fn drop_extension(filename: &str) -> String {
@@ -296,6 +365,17 @@ fn is_residual_noise_token(token: &str) -> bool {
         return true;
     }
     false
+}
+
+/// Round-bracket release tags in anime names: `1080p`, `WEB 1080p HEVC`, `BD x265 FLAC`, CRC32.
+fn is_release_tag(inner: &str) -> bool {
+    static RE_TAG: OnceLock<Regex> = OnceLock::new();
+    static RE_CRC: OnceLock<Regex> = OnceLock::new();
+    let re_tag = RE_TAG.get_or_init(|| {
+        Regex::new(r"(?i)\b(?:\d{3,4}p|\d{3,4}x\d{3,4}|[248]k|x26[45]|h\.?26[45]|hevc|avc|av1|aac|flac|opus|e?ac-?3|dts|\d{1,2}-?bit|hdr|web(?:-?dl|rip)?|bd(?:rip)?|blu-?ray|dvd(?:rip)?|hdtv|remux|mkv|mp4|chs|cht|big5|gb|jpsc|jptc)\b").unwrap()
+    });
+    let re_crc = RE_CRC.get_or_init(|| Regex::new(r"^[0-9A-Fa-f]{8}$").unwrap());
+    re_tag.is_match(inner) || re_crc.is_match(inner)
 }
 
 fn chinese_numeral(s: &str) -> Option<i32> {
@@ -384,5 +464,68 @@ mod tests {
             ),
             "火遮眼"
         );
+    }
+
+    #[test]
+    fn prefers_last_or_bracketed_year() {
+        let p = FileNameParser::parse_title("Blade.Runner.2049.2017.1080p.mkv");
+        assert_eq!((p.title.as_str(), p.year), ("Blade Runner 2049", Some(2017)));
+        let p = FileNameParser::parse_title("2001.A.Space.Odyssey.1968.mkv");
+        assert_eq!((p.title.as_str(), p.year), ("2001 A Space Odyssey", Some(1968)));
+        let p = FileNameParser::parse_title("1917.2019.mkv");
+        assert_eq!((p.title.as_str(), p.year), ("1917", Some(2019)));
+        let p = FileNameParser::parse_title("Blade Runner 2049 (2017) 2160p.mkv");
+        assert_eq!((p.title.as_str(), p.year), ("Blade Runner 2049", Some(2017)));
+        let p = FileNameParser::parse_title("1917.mkv");
+        assert_eq!((p.title.as_str(), p.year), ("1917", None));
+        let p = FileNameParser::parse_title("Movie.2019x.2020.mkv");
+        assert_eq!((p.title.as_str(), p.year), ("Movie 2019x", Some(2020)));
+    }
+
+    #[test]
+    fn trailing_number_is_title_for_movies_and_folders() {
+        let p = FileNameParser::parse_title("Apollo 13 (1995).mkv");
+        assert_eq!((p.title.as_str(), p.year, p.episode), ("Apollo 13", Some(1995), None));
+        let p = FileNameParser::parse_title("District.9.mkv");
+        assert_eq!((p.title.as_str(), p.episode), ("District 9", None));
+        let p = FileNameParser::parse_title("The 100.mkv");
+        assert_eq!((p.title.as_str(), p.episode), ("The 100", None));
+        let p = FileNameParser::parse_title("[Group] Mob Psycho 100 [BD 1080p]");
+        assert_eq!((p.title.as_str(), p.episode), ("Mob Psycho 100", None));
+        assert_eq!(FileNameParser::clean_title_for_match("Apollo 13"), "Apollo 13");
+        // Episode files keep the bare-number fallback.
+        let p = FileNameParser::parse("Show 05.mkv");
+        assert_eq!((p.title.as_str(), p.episode), ("Show", Some(5)));
+    }
+
+    #[test]
+    fn parses_anime_release_names() {
+        let p = FileNameParser::parse("[SubsPlease] Title - 05 (1080p) [ABCD1234].mkv");
+        assert_eq!(p.sub_group.as_deref(), Some("SubsPlease"));
+        assert_eq!((p.title.as_str(), p.season, p.episode), ("Title", None, Some(5)));
+        let p = FileNameParser::parse("[Group] Title - 05v2 (WEB 1080p HEVC).mkv");
+        assert_eq!((p.title.as_str(), p.episode), ("Title", Some(5)));
+        let p = FileNameParser::parse("[Group] Title S2 - 05 [1080p].mkv");
+        assert_eq!((p.title.as_str(), p.season, p.episode), ("Title", Some(2), Some(5)));
+        let p = FileNameParser::parse("[Group] Title (2019) - 12 (BD 1080p x265 FLAC).mkv");
+        assert_eq!((p.title.as_str(), p.year, p.episode), ("Title", Some(2019), Some(12)));
+        let p = FileNameParser::parse("[Group] Title - 07 (BD 1920x1080 AVC).mkv");
+        assert_eq!((p.title.as_str(), p.episode), ("Title", Some(7)));
+        let p = FileNameParser::parse("[Group] Title (TV) - 03.mkv");
+        assert_eq!((p.title.as_str(), p.episode), ("Title (TV)", Some(3)));
+    }
+
+    #[test]
+    fn parses_nx_and_multi_episode_markers() {
+        let p = FileNameParser::parse("Show.Name.1x05.720p.mkv");
+        assert_eq!((p.title.as_str(), p.season, p.episode), ("Show Name", Some(1), Some(5)));
+        let p = FileNameParser::parse("Show Name - 01x05 - Pilot.mkv");
+        assert_eq!((p.season, p.episode), (Some(1), Some(5)));
+        let p = FileNameParser::parse("Show.Name.1080p.x264.mkv");
+        assert_eq!((p.title.as_str(), p.season, p.episode), ("Show Name", None, None));
+        let p = FileNameParser::parse("Show.Name.S01E01E02.1080p.mkv");
+        assert_eq!((p.title.as_str(), p.season, p.episode), ("Show Name", Some(1), Some(1)));
+        let p = FileNameParser::parse("Show.Name.S01E01-E02.mkv");
+        assert_eq!((p.title.as_str(), p.season, p.episode), ("Show Name", Some(1), Some(1)));
     }
 }

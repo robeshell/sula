@@ -47,7 +47,32 @@ fn loc_err(locale: &str, err: String) -> String {
     }
 }
 
-fn auto_rename_after_scrape(
+/// File moves can be slow on network shares: keep them off the async workers.
+async fn auto_rename_after_scrape(
+    db: &Arc<media_core::AppDatabase>,
+    ids: &[String],
+    templates: &renamer::RenameTemplates,
+    create_season_folders: bool,
+    handle: &crate::task_queue::TaskHandle,
+) -> (u32, u32) {
+    let (db, ids, templates, handle) = (Arc::clone(db), ids.to_vec(), templates.clone(), handle.clone());
+    let total = ids.len() as u32;
+    tokio::task::spawn_blocking(move || auto_rename_blocking(&db, &ids, &templates, create_season_folders, &handle))
+        .await
+        .unwrap_or((0, total))
+}
+
+async fn consolidate_after_scrape(
+    db: &Arc<media_core::AppDatabase>,
+    ids: &[String],
+    templates: &renamer::RenameTemplates,
+    handle: &crate::task_queue::TaskHandle,
+) {
+    let (db, ids, templates, handle) = (Arc::clone(db), ids.to_vec(), templates.clone(), handle.clone());
+    let _ = tokio::task::spawn_blocking(move || consolidate_blocking(&db, &ids, &templates, &handle)).await;
+}
+
+fn auto_rename_blocking(
     db: &media_core::AppDatabase,
     ids: &[String],
     templates: &renamer::RenameTemplates,
@@ -91,7 +116,7 @@ fn auto_rename_after_scrape(
     (ok, failed)
 }
 
-fn consolidate_after_scrape(
+fn consolidate_blocking(
     db: &media_core::AppDatabase,
     ids: &[String],
     templates: &renamer::RenameTemplates,
@@ -143,11 +168,17 @@ pub async fn save_config(
     state: State<'_, AppState>,
     config: AppConfig,
 ) -> Result<AppConfig, String> {
-    let _mutation_guard = state.tasks.lock_mutations().await?;
+    // Ordinary settings must not wait for a long scrape. Only a change of scan
+    // exclusions resets scan state, which has to stay out of a running refresh.
+    let exclusions_changed = state.config.lock().await.config.scan_excluded_folders != config.scan_excluded_folders;
+    let mutation_guard = if exclusions_changed { Some(state.tasks.lock_mutations().await?) } else { None };
     let tray_enabled = config.tray_enabled;
     let mut store = state.config.lock().await;
     let old = store.config.clone();
     let exclusions_changed = old.scan_excluded_folders != config.scan_excluded_folders;
+    if exclusions_changed && mutation_guard.is_none() {
+        return Err("settings changed concurrently; try again".into());
+    }
     store.config = config;
     if let Err(error) = store.save() {
         store.config = old;
@@ -181,7 +212,7 @@ pub async fn add_library(
     root_path: String,
     media_type: MediaType,
 ) -> Result<Library, String> {
-    let _mutation_guard = state.tasks.lock_mutations().await?;
+    // Only inserts a row and queues its first refresh; no files change here.
     let name = name.trim().to_string();
     if name.is_empty() {
         return Err("library name is empty".into());
@@ -201,7 +232,6 @@ pub async fn rename_library(
     id: String,
     name: String,
 ) -> Result<Library, String> {
-    let _mutation_guard = state.tasks.lock_mutations().await?;
     let name = name.trim().to_string();
     if name.is_empty() {
         return Err("library name is empty".into());
@@ -252,7 +282,9 @@ pub async fn rebind_library(
     library.bookmark_data = None;
     state.db.update_library(&library).map_err(err_string)?;
     // Path changed → wipe scan state so next refresh re-bootstraps.
-    let _ = state.db.clear_scan_states(&library.id);
+    if let Err(error) = state.db.clear_scan_states(&library.id) {
+        tracing::warn!(library_id = %library.id, %error, "scan state not cleared after rebind");
+    }
     let _ = enqueue_refresh_inner(&app, &state, library.id.clone()).await?;
     let _ = app.emit("library-updated", ());
     Ok(library)
@@ -263,6 +295,28 @@ pub async fn clear_thumbnail_cache(state: State<'_, AppState>) -> Result<usize, 
     let thumbs = state.thumbs.clear_all().map_err(err_string)?;
     let avatars = state.avatars.clear().map_err(err_string)?;
     Ok(thumbs + avatars)
+}
+
+const MAX_AVATAR_BYTES: usize = 10 * 1024 * 1024;
+
+fn is_public_http_url(url: &reqwest::Url) -> bool {
+    if !matches!(url.scheme(), "http" | "https") {
+        return false;
+    }
+    let Some(host) = url.host_str() else { return false };
+    let host = host.trim_start_matches('[').trim_end_matches(']').trim_end_matches('.').to_ascii_lowercase();
+    match host.parse::<std::net::IpAddr>() {
+        Ok(std::net::IpAddr::V4(ip)) => {
+            !(ip.is_loopback() || ip.is_private() || ip.is_link_local() || ip.is_unspecified() || ip.is_broadcast())
+        }
+        Ok(std::net::IpAddr::V6(ip)) => {
+            let unique_local = (ip.segments()[0] & 0xfe00) == 0xfc00;
+            let link_local = (ip.segments()[0] & 0xffc0) == 0xfe80;
+            !(ip.is_loopback() || ip.is_unspecified() || unique_local || link_local)
+                && ip.to_ipv4_mapped().is_none_or(|v4| !(v4.is_loopback() || v4.is_private()))
+        }
+        Err(_) => host != "localhost" && !host.ends_with(".localhost") && !host.ends_with(".local"),
+    }
 }
 
 #[tauri::command]
@@ -277,15 +331,34 @@ pub async fn resolve_actor_avatar(
     if let Some(cached) = state.avatars.cached_path(&url) {
         return Ok(Some(cached.display().to_string()));
     }
+    // The URL comes from scraped metadata: only fetch public http(s) hosts, also
+    // after redirects, and cap the body so a hostile source can't fill the disk.
+    let parsed = reqwest::Url::parse(&url).map_err(err_string)?;
+    if !is_public_http_url(&parsed) {
+        return Ok(None);
+    }
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(20))
+        .redirect(reqwest::redirect::Policy::custom(|attempt| {
+            if attempt.previous().len() >= 5 || !is_public_http_url(attempt.url()) {
+                attempt.stop()
+            } else {
+                attempt.follow()
+            }
+        }))
         .build()
         .map_err(err_string)?;
-    let response = client.get(&url).send().await.map_err(err_string)?;
+    let mut response = client.get(parsed).send().await.map_err(|e| e.without_url().to_string())?;
     if !response.status().is_success() {
         return Ok(None);
     }
-    let bytes = response.bytes().await.map_err(err_string)?;
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response.chunk().await.map_err(|e| e.without_url().to_string())? {
+        if bytes.len() + chunk.len() > MAX_AVATAR_BYTES {
+            return Ok(None);
+        }
+        bytes.extend_from_slice(&chunk);
+    }
     let avatars = Arc::clone(&state.avatars);
     let stored = tokio::task::spawn_blocking(move || avatars.store(&url, &bytes))
         .await
@@ -468,6 +541,15 @@ pub async fn resolve_poster_thumbnail(
     ) else {
         return Ok(None);
     };
+    // Thumbnails land in a webview-readable cache: only images inside a library.
+    let canonical = media_core::scanner::canonicalize_lossy(std::path::Path::new(&source));
+    let inside_library = state.db.list_libraries().map_err(err_string)?.iter().any(|library| {
+        let root = media_core::scanner::canonicalize_lossy(std::path::Path::new(&library.root_path));
+        media_core::db::path_rooted_under(&canonical, &root)
+    });
+    if !inside_library {
+        return Ok(None);
+    }
     let thumbs = Arc::clone(&state.thumbs);
     let result = tokio::task::spawn_blocking(move || thumbs.ensure(&source, width, height))
         .await
@@ -833,7 +915,7 @@ pub async fn scrape_library(
                             &templates,
                             config.rename_create_season_folders,
                             &handle,
-                        );
+                        ).await;
                         let mut summary_text = loc_scrape_summary(&locale, &summary.format_result());
                         if rename_failed > 0 {
                             summary_text = format!(
@@ -861,7 +943,7 @@ pub async fn scrape_library(
                             })
                             .await;
                     } else {
-                        consolidate_after_scrape(&db, &success_ids, &templates, &handle);
+                        consolidate_after_scrape(&db, &success_ids, &templates, &handle).await;
                     }
                 }
                 Ok(())
@@ -956,7 +1038,7 @@ pub async fn scrape_items(
                             &templates,
                             config.rename_create_season_folders,
                             &handle,
-                        );
+                        ).await;
                         let mut summary_text = loc_scrape_summary(&locale, &summary.format_result());
                         if rename_failed > 0 {
                             summary_text = format!(
@@ -980,7 +1062,7 @@ pub async fn scrape_items(
                             })
                             .await;
                     } else {
-                        consolidate_after_scrape(&db, &summary.success_ids, &templates, &handle);
+                        consolidate_after_scrape(&db, &summary.success_ids, &templates, &handle).await;
                     }
                 }
                 Ok(())
@@ -1095,7 +1177,7 @@ pub async fn rescrape_items(
                                 &templates,
                                 config.rename_create_season_folders,
                                 &handle,
-                            );
+                            ).await;
                             let mut summary_text =
                                 loc_scrape_summary(&locale, &summary.format_result());
                             if rename_failed > 0 {
@@ -1120,7 +1202,7 @@ pub async fn rescrape_items(
                                 })
                                 .await;
                         } else {
-                            consolidate_after_scrape(&db, &summary.success_ids, &templates, &handle);
+                            consolidate_after_scrape(&db, &summary.success_ids, &templates, &handle).await;
                         }
                     }
                     Ok(())
@@ -1191,7 +1273,9 @@ pub async fn apply_rename_templates(
                         })
                         .await;
                     // Season packs that share TMDB with an existing show are absorbed first.
-                    let _ = renamer::consolidate_show_item(&db, &item, &templates);
+                    if let Err(error) = renamer::consolidate_show_item(&db, &item, &templates) {
+                        tracing::warn!(item_id = %id, %error, "consolidate before rename failed");
+                    }
                     let Some(item) = db
                         .get_media_item(&id)
                         .map_err(err_string)?
@@ -1502,9 +1586,9 @@ pub async fn apply_manual_match(
                         &templates,
                         config.rename_create_season_folders,
                         &handle,
-                    );
+                    ).await;
                 } else {
-                    consolidate_after_scrape(&db, &[item.id.clone()], &templates, &handle);
+                    consolidate_after_scrape(&db, &[item.id.clone()], &templates, &handle).await;
                 }
                 handle
                     .update_progress(TaskProgress {
@@ -1543,12 +1627,17 @@ fn scraper_keys(config: &AppConfig) -> scraper_kit::ScraperKeys {
 }
 
 fn watch_task(app: AppHandle, tasks: Arc<crate::task_queue::TaskQueue>, id: String) {
+    // A deduplicated enqueue returns an already-watched task; one watcher per task.
+    static WATCHED: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> = std::sync::OnceLock::new();
+    let watched = WATCHED.get_or_init(Default::default);
+    if !watched.lock().unwrap_or_else(|e| e.into_inner()).insert(id.clone()) {
+        return;
+    }
     tauri::async_runtime::spawn(async move {
         let mut last_fingerprint = String::new();
         loop {
             tokio::time::sleep(std::time::Duration::from_millis(250)).await;
-            let list = tasks.list().await;
-            if let Some(current) = list.into_iter().find(|t| t.id == id) {
+            if let Some(current) = tasks.get(&id).await {
                 let fingerprint = task_fingerprint(&current);
                 if fingerprint != last_fingerprint {
                     last_fingerprint = fingerprint;
@@ -1575,6 +1664,7 @@ fn watch_task(app: AppHandle, tasks: Arc<crate::task_queue::TaskQueue>, id: Stri
                 break;
             }
         }
+        watched.lock().unwrap_or_else(|e| e.into_inner()).remove(&id);
     });
 }
 
@@ -2012,4 +2102,21 @@ fn err_string(err: impl ToString) -> String {
 fn task_scope(label: &str, ids: &[String]) -> Option<String> {
     let mut ids = ids.to_vec(); ids.sort(); ids.dedup();
     Some(format!("{label}:{}", serde_json::to_string(&ids).expect("string list")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_public_http_url;
+
+    #[test]
+    fn avatar_urls_must_be_public_http() {
+        let ok = |raw: &str| is_public_http_url(&reqwest::Url::parse(raw).unwrap());
+        assert!(ok("https://image.tmdb.org/t/p/w185/a.jpg"));
+        assert!(ok("http://lain.bgm.tv/pic/crt/l/a.jpg"));
+        for bad in ["file:///etc/passwd", "http://localhost:8080/x", "http://127.0.0.1/x", "http://10.0.0.5/x",
+            "http://192.168.1.2/x", "http://169.254.169.254/latest", "http://[::1]/x", "http://[fd00::1]/x",
+            "http://nas.local/x", "http://[::ffff:127.0.0.1]/x"] {
+            assert!(!ok(bad), "{bad}");
+        }
+    }
 }

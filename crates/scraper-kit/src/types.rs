@@ -49,6 +49,9 @@ pub struct ScrapedMetadata {
     pub tvdb_id: Option<String>,
     pub bangumi_id: Option<String>,
     pub seasons: Vec<ScrapedSeason>,
+    /// Humanized partial-fetch problems (e.g. missing seasons); non-empty saves as partial.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub issues: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]

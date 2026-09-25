@@ -85,7 +85,7 @@
   "detail.director": "監督",
   "detail.file": "ファイルの場所",
   "detail.pickItem": "リストから項目を選ぶと詳細を表示します。",
-  "detail.runtime": "上映時間",
+  "detail.runtime": "{{h}} 時間 {{m}} 分",
   "detail.runtimeHours": "{{h}} 時間",
   "detail.runtimeMinutes": "{{m}} 分",
   "tasks.title": "タスク",
@@ -339,5 +339,12 @@
   "settings.language.saved": "言語設定を保存しました",
   "err.configRecovered": "設定ファイルが破損しています。バックアップを保存し、初期設定に戻しました。",
   "err.credentialsUnavailable": "システムのキーチェーンから保存済み API キーを読み込めなかったため、現在は空になっています。必要に応じて設定で再入力してください。",
-  "tasks.result": "成功 {{success}} · 未一致 {{unmatched}} · 失敗 {{failed}}"
+  "tasks.result": "成功 {{success}} · 未一致 {{unmatched}} · 失敗 {{failed}}",
+  "toast.deleteSelectionGone": "選択中の項目がバックグラウンドで変更または削除されました。何も削除していません。もう一度選択してください。",
+  "window.controls": "ウィンドウ",
+  "window.minimize": "最小化",
+  "window.maximize": "最大化",
+  "window.close": "閉じる",
+  "settings.api.omdbPlaceholder": "OMDb API キー",
+  "settings.api.tvdbPlaceholder": "TVDB API キー"
 }

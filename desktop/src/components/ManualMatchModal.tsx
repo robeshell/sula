@@ -2,7 +2,7 @@ import { ModalFrame } from "./ModalFrame";
 import { DialogTitle } from "./ui/dialog";
 import { Button } from "./ui/button";
 import { Input } from "./ui/input";
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { invoke } from "@tauri-apps/api/core";
 
@@ -39,27 +39,36 @@ export function ManualMatchModal({
   const [candidates, setCandidates] = useState<MatchCandidate[]>([]);
   const [searched, setSearched] = useState(false);
 
+  /** Only the newest search may write results; a slow older one is dropped. */
+  const searchRequest = useRef(0);
+
   const search = async () => {
+    const request = ++searchRequest.current;
+    const isCurrent = () => request === searchRequest.current;
     setLoading(true);
     try {
       const rows = await invoke<MatchCandidate[]>("search_match_candidates", {
         query,
         mediaType,
       });
+      if (!isCurrent()) return;
       setCandidates(rows);
       setSearched(true);
       if (rows.length === 0) {
         showToast(t("match.noResults"));
       }
     } catch (err) {
-      showToast(String(err));
+      if (isCurrent()) showToast(String(err));
     } finally {
-      setLoading(false);
+      if (isCurrent()) setLoading(false);
     }
   };
 
   useEffect(() => {
     void search();
+    return () => {
+      searchRequest.current += 1; // unmounted: ignore anything still in flight
+    };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
@@ -101,7 +110,7 @@ export function ManualMatchModal({
             autoFocus
             onChange={(e) => setQuery(e.target.value)}
             onKeyDown={(e) => {
-              if (e.key === "Enter") void search();
+              if (e.key === "Enter" && !loading && !applying) void search();
             }}
           />
           <Button variant="default" size="sm"

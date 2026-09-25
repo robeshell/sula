@@ -63,8 +63,68 @@ function titleKey(title: string): string {
   return title.normalize("NFKD").replace(/\p{M}/gu, "").toLocaleLowerCase();
 }
 
-function compareTitle(a: string, b: string): number {
-  return titleKey(a).localeCompare(titleKey(b), undefined, { numeric: true });
+/** Same ordering as `a.localeCompare(b, undefined, { numeric: true })`, built once. */
+const titleCollator = new Intl.Collator(undefined, { numeric: true });
+
+/** Folded title per item object; items are immutable snapshots, so this is stable. */
+const titleKeyCache = new WeakMap<object, string>();
+function cachedTitleKey(item: SortableMedia): string {
+  let key = titleKeyCache.get(item);
+  if (key === undefined) {
+    key = titleKey(item.title);
+    titleKeyCache.set(item, key);
+  }
+  return key;
+}
+
+type Decorated<T> = { item: T; key: string };
+
+function compareDecorated<T extends SortableMedia>(
+  sortOption: MediaSortOption,
+): (lhs: Decorated<T>, rhs: Decorated<T>) => number {
+  const byTitle = (lhs: Decorated<T>, rhs: Decorated<T>) =>
+    titleCollator.compare(lhs.key, rhs.key);
+  switch (sortOption) {
+    case "nameAscending":
+      return byTitle;
+    case "nameDescending":
+      return (lhs, rhs) => titleCollator.compare(rhs.key, lhs.key);
+    case "yearDescending":
+      return (lhs, rhs) => {
+        const ly = lhs.item.year ?? Number.MIN_SAFE_INTEGER;
+        const ry = rhs.item.year ?? Number.MIN_SAFE_INTEGER;
+        if (ly === ry) return byTitle(lhs, rhs);
+        return ry - ly;
+      };
+    case "yearAscending":
+      return (lhs, rhs) => {
+        const ly = lhs.item.year ?? Number.MAX_SAFE_INTEGER;
+        const ry = rhs.item.year ?? Number.MAX_SAFE_INTEGER;
+        if (ly === ry) return byTitle(lhs, rhs);
+        return ly - ry;
+      };
+    case "addedAtDescending":
+      return (lhs, rhs) => {
+        if (lhs.item.addedAt === rhs.item.addedAt) return byTitle(lhs, rhs);
+        return lhs.item.addedAt < rhs.item.addedAt ? 1 : -1;
+      };
+    case "addedAtAscending":
+      return (lhs, rhs) => {
+        if (lhs.item.addedAt === rhs.item.addedAt) return byTitle(lhs, rhs);
+        return lhs.item.addedAt > rhs.item.addedAt ? 1 : -1;
+      };
+    case "unscrapedFirst":
+      return (lhs, rhs) => {
+        const lr = statusRank(lhs.item.status);
+        const rr = statusRank(rhs.item.status);
+        if (lr !== rr) return lr - rr;
+        // Same status: newest first so refresh additions surface at the top.
+        if (lhs.item.addedAt !== rhs.item.addedAt) {
+          return lhs.item.addedAt < rhs.item.addedAt ? 1 : -1;
+        }
+        return byTitle(lhs, rhs);
+      };
+  }
 }
 
 export function filterAndSortMedia<T extends SortableMedia>(
@@ -86,44 +146,8 @@ export function filterAndSortMedia<T extends SortableMedia>(
     next = next.filter((item) => item.status === statusFilter);
   }
 
-  const sorted = [...next];
-  sorted.sort((lhs, rhs) => {
-    switch (sortOption) {
-      case "nameAscending":
-        return compareTitle(lhs.title, rhs.title);
-      case "nameDescending":
-        return compareTitle(rhs.title, lhs.title);
-      case "yearDescending": {
-        const ly = lhs.year ?? Number.MIN_SAFE_INTEGER;
-        const ry = rhs.year ?? Number.MIN_SAFE_INTEGER;
-        if (ly === ry) return compareTitle(lhs.title, rhs.title);
-        return ry - ly;
-      }
-      case "yearAscending": {
-        const ly = lhs.year ?? Number.MAX_SAFE_INTEGER;
-        const ry = rhs.year ?? Number.MAX_SAFE_INTEGER;
-        if (ly === ry) return compareTitle(lhs.title, rhs.title);
-        return ly - ry;
-      }
-      case "addedAtDescending": {
-        if (lhs.addedAt === rhs.addedAt) return compareTitle(lhs.title, rhs.title);
-        return lhs.addedAt < rhs.addedAt ? 1 : -1;
-      }
-      case "addedAtAscending": {
-        if (lhs.addedAt === rhs.addedAt) return compareTitle(lhs.title, rhs.title);
-        return lhs.addedAt > rhs.addedAt ? 1 : -1;
-      }
-      case "unscrapedFirst": {
-        const lr = statusRank(lhs.status);
-        const rr = statusRank(rhs.status);
-        if (lr !== rr) return lr - rr;
-        // Same status: newest first so refresh additions surface at the top.
-        if (lhs.addedAt !== rhs.addedAt) {
-          return lhs.addedAt < rhs.addedAt ? 1 : -1;
-        }
-        return compareTitle(lhs.title, rhs.title);
-      }
-    }
-  });
-  return sorted;
+  // Decorate-sort-undecorate: fold each title once, not once per comparison.
+  const decorated = next.map((item) => ({ item, key: cachedTitleKey(item) }));
+  decorated.sort(compareDecorated<T>(sortOption));
+  return decorated.map((entry) => entry.item);
 }

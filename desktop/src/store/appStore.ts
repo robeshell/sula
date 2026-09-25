@@ -11,7 +11,12 @@ import {
 } from "../lib/mediaList";
 import { localizeUserMessage } from "../lib/localizeMessage";
 import { notifyTaskDone } from "../lib/notify";
-import { POSTER_THUMB, resolvePosterSrc, invalidatePosterCache } from "../lib/posterLoadQueue";
+import {
+  POSTER_THUMB,
+  resolvePosterSrc,
+  invalidatePosterCache,
+  invalidatePosterFolders,
+} from "../lib/posterLoadQueue";
 
 export type AppConfig = {
   scrapeConcurrency: number;
@@ -263,7 +268,17 @@ type AppStore = {
   showToast: (message: string, durationMs?: number) => void;
   refreshStatus: () => Promise<void>;
   refreshLibraries: () => Promise<void>;
+  /** User-initiated library switch: clears the list, selection and detail. */
   selectLibrary: (id: string | null) => Promise<void>;
+  /**
+   * Background refresh of the current library (task finished, library-updated).
+   * Keeps the list, selection and detail; coalesces bursts into one reload.
+   * `posters: "all"` re-resolves every poster (e.g. after a rescrape).
+   */
+  reloadLibraryItems: (
+    libraryId: string,
+    opts?: { posters?: "changed" | "all" },
+  ) => Promise<void>;
   selectMedia: (id: string | null) => Promise<void>;
   toggleMediaSelection: (id: string, additive: boolean) => Promise<void>;
   clearMediaSelection: () => void;
@@ -316,6 +331,64 @@ let toastTimer: ReturnType<typeof setTimeout> | null = null;
 let libraryRequest = 0;
 let detailRequest = 0;
 
+type MediaPage = {
+  items: MediaItem[];
+  metadata: MediaMetaSummary[];
+  showStats: ShowListStats[];
+  nextOffset?: number | null;
+};
+
+/** Trailing debounce that merges a task's completion with its library-updated event. */
+const RELOAD_DEBOUNCE_MS = 150;
+type ReloadRequest = {
+  libraryId: string;
+  posters: "changed" | "all";
+  waiters: Array<() => void>;
+};
+let pendingReload: ReloadRequest | null = null;
+let reloadTimer: ReturnType<typeof setTimeout> | null = null;
+let reloadRunning: Promise<void> | null = null;
+
+function scheduleReload(
+  run: (req: ReloadRequest) => Promise<void>,
+  libraryId: string,
+  posters: "changed" | "all",
+): Promise<void> {
+  if (pendingReload && pendingReload.libraryId !== libraryId) {
+    pendingReload.waiters.forEach((resolve) => resolve());
+    pendingReload = null;
+  }
+  const req: ReloadRequest = pendingReload ?? { libraryId, posters, waiters: [] };
+  if (posters === "all") req.posters = "all";
+  pendingReload = req;
+  const done = new Promise<void>((resolve) => req.waiters.push(resolve));
+  if (reloadTimer) clearTimeout(reloadTimer);
+  reloadTimer = setTimeout(() => {
+    reloadTimer = null;
+    void flushReload(run);
+  }, RELOAD_DEBOUNCE_MS);
+  return done;
+}
+
+async function flushReload(run: (req: ReloadRequest) => Promise<void>) {
+  // A request made mid-flight may postdate the pages already fetched: run again.
+  while (reloadRunning) await reloadRunning;
+  const req = pendingReload;
+  if (!req || reloadTimer) return; // a newer timer owns this request
+  pendingReload = null;
+  reloadRunning = run(req)
+    .catch(() => {})
+    .finally(() => {
+      reloadRunning = null;
+      req.waiters.forEach((resolve) => resolve());
+    });
+  await reloadRunning;
+}
+
+function metaFingerprint(meta: MediaMetaSummary | undefined): string {
+  return meta ? JSON.stringify(meta) : "";
+}
+
 export const useAppStore = create<AppStore>((set, get) => ({
   status: null,
   libraries: [],
@@ -364,7 +437,6 @@ export const useAppStore = create<AppStore>((set, get) => ({
   },
 
   refreshLibraries: async () => {
-    invalidatePosterCache();
     try {
       const libraries = await invoke<Library[]>("list_libraries");
       const selected = get().selectedLibraryId;
@@ -372,11 +444,14 @@ export const useAppStore = create<AppStore>((set, get) => ({
         selected && libraries.some((l) => l.id === selected)
           ? selected
           : libraries[0]?.id ?? null;
-      set({ libraries, selectedLibraryId: nextSelected });
-      if (nextSelected) {
+      set({ libraries });
+      // Item changes arrive via reloadLibraryItems (task completion /
+      // library-updated); only a changed selection needs a fresh load here.
+      if (nextSelected && nextSelected !== selected) {
         await get().selectLibrary(nextSelected);
-      } else {
+      } else if (!nextSelected) {
         set({
+          selectedLibraryId: null,
           mediaItems: [],
           metadataById: {},
           showStatsById: {},
@@ -435,6 +510,76 @@ export const useAppStore = create<AppStore>((set, get) => ({
       get().showToast(message);
     }
   },
+
+  reloadLibraryItems: (libraryId, opts) =>
+    scheduleReload(
+      async ({ libraryId: id, posters }) => {
+        if (get().selectedLibraryId !== id) return;
+        const request = ++libraryRequest;
+        const stale = () => request !== libraryRequest || get().selectedLibraryId !== id;
+        const items = new Map<string, MediaItem>();
+        const metadataById: Record<string, MediaMetaSummary> = {};
+        const showStatsById: Record<string, ShowListStats> = {};
+        try {
+          let offset: number | null = 0;
+          while (offset !== null) {
+            const page: MediaPage = await invoke("list_media_page", { libraryId: id, offset, limit: 256 });
+            if (stale()) return;
+            for (const item of page.items) items.set(item.id, item);
+            for (const meta of page.metadata) metadataById[meta.mediaItemId] = meta;
+            for (const stats of page.showStats ?? []) showStatsById[stats.mediaItemId] = stats;
+            const next: number | null = page.nextOffset ?? null;
+            if (next !== null && next <= offset) throw new Error("invalid media page cursor");
+            offset = next;
+          }
+        } catch (err) {
+          if (stale()) return;
+          const message = String(err);
+          set({ error: message });
+          get().showToast(message);
+          return;
+        }
+
+        const prev = get();
+        if (posters === "all") {
+          invalidatePosterCache();
+        } else {
+          const changed = new Set<string>();
+          const oldById = new Map(prev.mediaItems.map((item) => [item.id, item]));
+          for (const item of items.values()) {
+            const old = oldById.get(item.id);
+            if (!old) continue;
+            if (
+              old.folderPath !== item.folderPath ||
+              old.status !== item.status ||
+              metaFingerprint(prev.metadataById[item.id]) !== metaFingerprint(metadataById[item.id])
+            ) {
+              changed.add(old.folderPath);
+              changed.add(item.folderPath);
+            }
+          }
+          invalidatePosterFolders(changed);
+        }
+
+        const selectedIds = prev.selectedMediaIds.filter((x) => items.has(x));
+        const keepDetail = prev.selectedMediaId !== null && items.has(prev.selectedMediaId);
+        set({
+          mediaItems: [...items.values()],
+          metadataById,
+          showStatsById,
+          selectedMediaIds: selectedIds,
+          ...(keepDetail
+            ? {}
+            : prev.selectedMediaId !== null
+              ? { selectedMediaId: null, detail: null, detailLoading: false, posterUrl: null }
+              : {}),
+        });
+        // Not awaited: a slow detail fetch must not hold up the next list reload.
+        if (keepDetail) void refreshOpenDetail(get, set, prev.selectedMediaId!);
+      },
+      libraryId,
+      opts?.posters ?? "changed",
+    ),
 
   selectMedia: async (id) => {
     const request = ++detailRequest;
@@ -897,7 +1042,12 @@ export const useAppStore = create<AppStore>((set, get) => ({
 
   deleteSelectedItems: async (alsoTrash) => {
     const ids = get().selectedMediaIds;
-    if (ids.length === 0) return;
+    if (ids.length === 0) {
+      // The selection can vanish under an open confirmation (a background
+      // reload removed the items); say so instead of silently doing nothing.
+      get().showToast(tt("toast.deleteSelectionGone"), 3200);
+      return;
+    }
     try {
       const n = await invoke<number>("delete_media_items", {
         itemIds: ids,
@@ -911,7 +1061,7 @@ export const useAppStore = create<AppStore>((set, get) => ({
         posterUrl: null,
       });
       const libraryId = get().selectedLibraryId;
-      if (libraryId) await get().selectLibrary(libraryId);
+      if (libraryId) void get().reloadLibraryItems(libraryId);
       get().showToast(
         alsoTrash
           ? tt("toast.deletedWithTrash", { n })
@@ -964,7 +1114,7 @@ export const useAppStore = create<AppStore>((set, get) => ({
           get().showToast(title, 2800);
           void notifyTaskDone(tt("toast.itemsRefreshDone"), detail);
           const libraryId = get().selectedLibraryId;
-          if (libraryId) void get().selectLibrary(libraryId);
+          if (libraryId) void get().reloadLibraryItems(libraryId);
         } else {
           const added =
             task.progress?.stageKey === "saveResults"
@@ -987,7 +1137,7 @@ export const useAppStore = create<AppStore>((set, get) => ({
                 searchQuery: "",
               });
             }
-            void get().selectLibrary(targetId);
+            void get().reloadLibraryItems(targetId);
           }
         }
       } else if (
@@ -1014,7 +1164,7 @@ export const useAppStore = create<AppStore>((set, get) => ({
           void notifyTaskDone(label);
         }
         const libraryId = get().selectedLibraryId;
-        if (libraryId) void get().selectLibrary(libraryId);
+        if (libraryId) void get().reloadLibraryItems(libraryId, { posters: "all" });
       } else if (task.kind === "rename") {
         const detail = task.progress?.current?.trim();
         get().showToast(
@@ -1022,7 +1172,7 @@ export const useAppStore = create<AppStore>((set, get) => ({
         );
         void notifyTaskDone(tt("toast.renameDone"), detail);
         const libraryId = get().selectedLibraryId;
-        if (libraryId) void get().selectLibrary(libraryId);
+        if (libraryId) void get().reloadLibraryItems(libraryId);
       } else if (task.kind === "organize") {
         const detail = task.progress?.current?.trim();
         get().showToast(
@@ -1032,7 +1182,7 @@ export const useAppStore = create<AppStore>((set, get) => ({
         );
         void notifyTaskDone(tt("toast.organizeDone"), detail);
         const libraryId = get().selectedLibraryId;
-        if (libraryId) void get().selectLibrary(libraryId);
+        if (libraryId) void get().reloadLibraryItems(libraryId);
       } else if (task.kind === "cleanup") {
         const detail = task.progress?.current?.trim();
         get().showToast(
@@ -1047,6 +1197,33 @@ export const useAppStore = create<AppStore>((set, get) => ({
     }
   },
 }));
+
+/** Re-fetch the open detail after a background reload without a loading flash. */
+async function refreshOpenDetail(
+  get: () => AppStore,
+  set: (partial: Partial<AppStore>) => void,
+  id: string,
+) {
+  const request = ++detailRequest;
+  const current = () => request === detailRequest && get().selectedMediaId === id;
+  try {
+    const detail = await invoke<MediaDetail>("get_media_detail", { id });
+    if (!current()) return;
+    set({ detail, detailLoading: false });
+    const posterPath = get().metadataById[id]?.posterPath ?? detail.metadata?.posterPath;
+    if (!posterPath) return;
+    const url = await resolvePosterSrc({
+      folderPath: detail.item.folderPath,
+      posterPath,
+      width: POSTER_THUMB.width,
+      height: POSTER_THUMB.height,
+    });
+    if (current() && url) set({ posterUrl: url });
+  } catch {
+    // Keep showing the previous detail; the next explicit selection surfaces errors.
+    if (current()) set({ detailLoading: false });
+  }
+}
 
 async function ensureScrapeKeys(
   get: () => AppStore,

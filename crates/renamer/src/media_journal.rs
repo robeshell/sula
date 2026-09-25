@@ -1,6 +1,6 @@
 //! Write-ahead merge moves. The database commit marker shares the merge transaction.
 use crate::execute::{file_identity, FileIdentity};
-use media_core::{AppDatabase, CollisionPolicy, FilesystemService};
+use media_core::{entry_name_exists, is_case_only_rename, AppDatabase, CollisionPolicy, FilesystemService};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
@@ -42,7 +42,7 @@ impl<'a> MergeJournal<'a> {
         if from == to {
             return Ok(());
         }
-        if to.try_exists().map_err(|e| e.to_string())? {
+        if to.try_exists().map_err(|e| e.to_string())? && !is_case_only_rename(from, to).map_err(|e| e.to_string())? {
             return Err(format!("destination exists: {}", to.display()));
         }
         let mut parent = to.parent();
@@ -83,6 +83,11 @@ fn was_moved(step: &Move) -> Result<bool, String> {
     let (path, moved) = match state {
         (true, false) => (&step.from, false),
         (false, true) => (&step.to, true),
+        // Case-only rename: both spellings resolve to one entry; the listing decides.
+        (true, true) if is_case_only_rename(&step.from, &step.to).map_err(|e| e.to_string())?
+            || is_case_only_rename(&step.to, &step.from).map_err(|e| e.to_string())? => {
+            (&step.to, entry_name_exists(&step.to).map_err(|e| e.to_string())?)
+        }
         _ => {
             return Err(format!(
                 "ambiguous media recovery: {} -> {}",

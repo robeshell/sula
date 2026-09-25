@@ -2,7 +2,7 @@ use media_core::MediaType;
 use reqwest::Client;
 use serde::Deserialize;
 
-use crate::http::{reqwest_err, send_with_retry, RATE_LIMITED};
+use crate::http::{humanize_error, reqwest_err, send_with_retry, RATE_LIMITED};
 use crate::matching::relevance_score;
 use crate::types::{
     parse_source_numeric_id, ArtworkUrls, ScrapedEpisode, ScrapedMetadata, ScrapedSeason,
@@ -132,8 +132,10 @@ impl TmdbScraper {
         let data = self.get_json(&url).await?;
         if uses_tv {
             let detail: TvDetail = serde_json::from_value(data).map_err(|e| e.to_string())?;
-            let seasons = self.fetch_seasons(id, &detail.seasons, language).await?;
-            Ok(map_tv_detail(detail, seasons))
+            let (seasons, issue) = self.fetch_seasons(id, &detail.seasons, language).await?;
+            let mut meta = map_tv_detail(detail, seasons);
+            meta.issues.extend(issue);
+            Ok(meta)
         } else {
             let detail: MovieDetail = serde_json::from_value(data).map_err(|e| e.to_string())?;
             Ok(map_movie_detail(detail))
@@ -174,20 +176,21 @@ impl TmdbScraper {
         tv_id: &str,
         seasons: &[TvSeasonStub],
         language: &str,
-    ) -> Result<Vec<ScrapedSeason>, String> {
+    ) -> Result<(Vec<ScrapedSeason>, Option<String>), String> {
         let mut out = Vec::new();
+        let mut failed = Vec::new();
         for stub in seasons {
             if stub.season_number < 0 {
                 continue;
             }
-            // Skip broken seasons, but a rate limit fails the whole fetch so it can be retried.
+            // Keep good seasons and report broken ones; a rate limit fails the whole fetch (retryable).
             match self.fetch_season(tv_id, stub.season_number, language).await {
                 Ok(season) => out.push(season),
                 Err(err) if err == RATE_LIMITED => return Err(err),
-                Err(_) => {}
+                Err(err) => failed.push((stub.season_number, err)),
             }
         }
-        Ok(out)
+        Ok((out, seasons_issue(&failed)))
     }
 
     /// Fetch a single TV season (title / overview / poster / episodes).
@@ -252,6 +255,16 @@ impl TmdbScraper {
         }
         response.json().await.map_err(reqwest_err)
     }
+}
+
+/// `seasons 2, 5: err.connect` (first error, at most 10 numbers listed).
+fn seasons_issue(failed: &[(i32, String)]) -> Option<String> {
+    let (_, first) = failed.first()?;
+    let mut nums: Vec<String> = failed.iter().take(10).map(|(n, _)| n.to_string()).collect();
+    if failed.len() > 10 {
+        nums.push("…".into());
+    }
+    Some(format!("seasons {}: {}", nums.join(", "), humanize_error(first)))
 }
 
 fn extract_year(date: Option<&str>) -> Option<i32> {
@@ -343,6 +356,7 @@ fn map_movie_detail(detail: MovieDetail) -> ScrapedMetadata {
         tvdb_id: None,
         bangumi_id: None,
         seasons: Vec::new(),
+        issues: Vec::new(),
     }
 }
 
@@ -401,6 +415,7 @@ fn map_tv_detail(detail: TvDetail, seasons: Vec<ScrapedSeason>) -> ScrapedMetada
             .and_then(|e| e.tvdb_id.map(|id| id.to_string())),
         bangumi_id: None,
         seasons,
+        issues: Vec::new(),
     }
 }
 
@@ -648,4 +663,16 @@ struct ImageResponse {
 #[derive(Deserialize)]
 struct ImageItem {
     file_path: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn failed_seasons_become_humanized_issue() {
+        assert_eq!(seasons_issue(&[]), None);
+        let failed = [(2, "error sending request".to_string()), (5, "TMDB HTTP 404".to_string())];
+        assert_eq!(seasons_issue(&failed).as_deref(), Some("seasons 2, 5: err.connect"));
+    }
 }

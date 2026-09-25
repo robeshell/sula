@@ -1,9 +1,11 @@
 import { useEffect, useState } from "react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
+import { useTranslation } from "react-i18next";
 
 import { isImmersiveWindow } from "../lib/windowChrome";
 
 export function WindowControls() {
+  const { t } = useTranslation();
   const [visible, setVisible] = useState(false);
 
   useEffect(() => {
@@ -17,11 +19,11 @@ export function WindowControls() {
   const win = getCurrentWindow();
 
   return (
-    <div className="kg-window-controls" role="group" aria-label="Window">
+    <div className="kg-window-controls" role="group" aria-label={t("window.controls")}>
       <button
         type="button"
         className="kg-window-control"
-        aria-label="Minimize"
+        aria-label={t("window.minimize")}
         onClick={() => void win.minimize()}
       >
         <svg width="10" height="10" viewBox="0 0 10 10" aria-hidden>
@@ -31,7 +33,7 @@ export function WindowControls() {
       <button
         type="button"
         className="kg-window-control"
-        aria-label="Maximize"
+        aria-label={t("window.maximize")}
         onClick={() => void win.toggleMaximize()}
       >
         <svg width="10" height="10" viewBox="0 0 10 10" aria-hidden>
@@ -50,7 +52,7 @@ export function WindowControls() {
       <button
         type="button"
         className="kg-window-control kg-window-control-close"
-        aria-label="Close"
+        aria-label={t("window.close")}
         onClick={() => void win.close()}
       >
         <svg width="10" height="10" viewBox="0 0 10 10" aria-hidden>

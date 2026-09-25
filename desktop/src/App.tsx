@@ -260,7 +260,11 @@ function App() {
     });
     void listen("library-updated", () => {
       if (disposed) return;
-      // Coalesce bursts so a finishing scan doesn't thrash the list.
+      // Items reload in place (selection/detail kept); the store coalesces this
+      // with the reload the finishing task already requested.
+      const { selectedLibraryId: libraryId, reloadLibraryItems } = useAppStore.getState();
+      if (libraryId) void reloadLibraryItems(libraryId);
+      // Coalesce bursts so a finishing scan doesn't thrash the library list.
       if (libTimer) clearTimeout(libTimer);
       libTimer = setTimeout(() => {
         libTimer = null;

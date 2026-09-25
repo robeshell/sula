@@ -339,5 +339,12 @@
   "settings.language.saved": "语言设置已保存",
   "err.configRecovered": "设置文件损坏，已保留备份并恢复默认设置。",
   "err.credentialsUnavailable": "无法从系统钥匙串读取已保存的 API Key，本次启动暂按空值处理。如需刮削，请到设置中重新填写。",
-  "tasks.result": "成功 {{success}} · 未匹配 {{unmatched}} · 失败 {{failed}}"
+  "tasks.result": "成功 {{success}} · 未匹配 {{unmatched}} · 失败 {{failed}}",
+  "toast.deleteSelectionGone": "所选项目已在后台变化或被移除，未删除任何内容，请重新选择。",
+  "window.controls": "窗口",
+  "window.minimize": "最小化",
+  "window.maximize": "最大化",
+  "window.close": "关闭",
+  "settings.api.omdbPlaceholder": "OMDb API Key",
+  "settings.api.tvdbPlaceholder": "TVDB API Key"
 }

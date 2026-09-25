@@ -54,14 +54,15 @@ impl TemplateEngine {
     }
 
     pub fn sanitize_filename(name: &str) -> String {
-        let mut s = name.to_string();
-        for ch in ['/', ':', '\0', '\\', '?', '*', '"', '<', '>', '|'] {
-            s = s.replace(ch, "");
-        }
+        let mut s: String = name
+            .chars()
+            .filter(|c| !c.is_control() && !matches!(c, '/' | ':' | '\\' | '?' | '*' | '"' | '<' | '>' | '|'))
+            .collect();
         while s.ends_with('.') || s.ends_with(' ') {
             s.pop();
         }
-        s
+        // A leading dot (`.hack//SIGN`) would hide the entry from Finder and the scanner.
+        s.trim_start_matches(['.', ' ']).to_string()
     }
 
     pub fn extract_variables(template: &str) -> Vec<String> {
@@ -127,6 +128,8 @@ mod tests {
         assert_eq!(TemplateEngine::sanitize_filename("A/B\\C"), "ABC");
         assert_eq!(TemplateEngine::sanitize_filename("test..."), "test");
         assert_eq!(TemplateEngine::sanitize_filename("hello "), "hello");
+        assert_eq!(TemplateEngine::sanitize_filename(".hack//SIGN (2002)"), "hackSIGN (2002)");
+        assert_eq!(TemplateEngine::sanitize_filename("..."), "");
     }
 
     #[test]

@@ -339,5 +339,12 @@
   "settings.language.saved": "Language settings saved",
   "err.configRecovered": "Your settings file was damaged. A backup was kept and defaults restored.",
   "err.credentialsUnavailable": "Saved API keys could not be read from the system keychain, so scraping keys are empty for now. Re-enter them in Settings if needed.",
-  "tasks.result": "Succeeded {{success}} · Unmatched {{unmatched}} · Failed {{failed}}"
+  "tasks.result": "Succeeded {{success}} · Unmatched {{unmatched}} · Failed {{failed}}",
+  "toast.deleteSelectionGone": "The selected items changed or were removed in the background. Nothing was deleted — select them again.",
+  "window.controls": "Window",
+  "window.minimize": "Minimize",
+  "window.maximize": "Maximize",
+  "window.close": "Close",
+  "settings.api.omdbPlaceholder": "OMDb API Key",
+  "settings.api.tvdbPlaceholder": "TVDB API Key"
 }

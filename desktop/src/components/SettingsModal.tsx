@@ -6,7 +6,7 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from "./ui/tabs";
 import { Button } from "./ui/button";
 import { Input } from "./ui/input";
 import { invalidatePosterCache } from "../lib/posterLoadQueue";
-import { useEffect, useState, type CSSProperties, type ReactNode } from "react";
+import { useEffect, useRef, useState, type CSSProperties, type ReactNode } from "react";
 import { useTranslation } from "react-i18next";
 import { invoke } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
@@ -524,6 +524,61 @@ function KeepRunningOnCloseRow() {
   );
 }
 
+/**
+ * Debounced autosave for a settings form. Saves only after the user changed
+ * something (the loaded values are the baseline), and a pending edit is written
+ * immediately when the section unmounts (tab switch, Esc) instead of dropped.
+ */
+function useAutosave<T>(
+  value: T,
+  loaded: boolean,
+  save: (value: T) => Promise<void>,
+  delayMs = 450,
+) {
+  const saveRef = useRef(save);
+  saveRef.current = save;
+  const lastSaved = useRef<string | null>(null);
+  const pending = useRef<{ value: T; key: string } | null>(null);
+  const timer = useRef<number | null>(null);
+  const key = JSON.stringify(value);
+
+  const flush = () => {
+    if (timer.current !== null) {
+      window.clearTimeout(timer.current);
+      timer.current = null;
+    }
+    const next = pending.current;
+    if (!next) return;
+    pending.current = null;
+    const previous = lastSaved.current;
+    lastSaved.current = next.key;
+    void saveRef.current(next.value).catch(() => {
+      // Still dirty relative to what is on disk: the next edit retries.
+      if (lastSaved.current === next.key) lastSaved.current = previous;
+    });
+  };
+
+  useEffect(() => {
+    if (!loaded) return;
+    if (lastSaved.current === null) {
+      lastSaved.current = key; // baseline: opening the page is not an edit
+      return;
+    }
+    if (timer.current !== null) window.clearTimeout(timer.current);
+    timer.current = null;
+    if (key === lastSaved.current) {
+      pending.current = null;
+      return;
+    }
+    pending.current = { value, key };
+    timer.current = window.setTimeout(flush, delayMs);
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- `key` encodes `value`
+  }, [loaded, key, delayMs]);
+
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  useEffect(() => () => flush(), []);
+}
+
 const DEFAULT_TEMPLATES = {
   renameMovieFolderTemplate: "{title} ({year})",
   renameMovieFileTemplate: "{title} ({year})",
@@ -570,43 +625,28 @@ function RenameSection() {
     })();
   }, []);
 
-  useEffect(() => {
-    if (!loaded) return;
-    const timer = window.setTimeout(() => {
-      void (async () => {
-        try {
-          const config = await invoke<Record<string, unknown>>("get_config");
-          await invoke("save_config", {
-            config: {
-              ...config,
-              renameAutoAfterScrape: autoRename,
-              renameCreateSeasonFolders: createSeasons,
-              renameMovieFolderTemplate: movieFolder,
-              renameMovieFileTemplate: movieFile,
-              renameTvShowFolderTemplate: tvFolder,
-              renameSeasonFolderTemplate: seasonFolder,
-              renameEpisodeFileTemplate: episodeFile,
-            },
-          });
-          showToast(t("settings.rename.saved"));
-        } catch (err) {
-          showToast(String(err));
-        }
-      })();
-    }, 450);
-    return () => window.clearTimeout(timer);
-  }, [
+  useAutosave(
+    {
+      renameAutoAfterScrape: autoRename,
+      renameCreateSeasonFolders: createSeasons,
+      renameMovieFolderTemplate: movieFolder,
+      renameMovieFileTemplate: movieFile,
+      renameTvShowFolderTemplate: tvFolder,
+      renameSeasonFolderTemplate: seasonFolder,
+      renameEpisodeFileTemplate: episodeFile,
+    },
     loaded,
-    autoRename,
-    createSeasons,
-    movieFolder,
-    movieFile,
-    tvFolder,
-    seasonFolder,
-    episodeFile,
-    showToast,
-    t,
-  ]);
+    async (changes) => {
+      try {
+        const config = await invoke<Record<string, unknown>>("get_config");
+        await invoke("save_config", { config: { ...config, ...changes } });
+        showToast(t("settings.rename.saved"));
+      } catch (err) {
+        showToast(String(err));
+        throw err;
+      }
+    },
+  );
 
   const resetDefaults = () => {
     setMovieFolder(DEFAULT_TEMPLATES.renameMovieFolderTemplate);
@@ -724,35 +764,34 @@ function ApiKeysSection() {
     })();
   }, []);
 
-  useEffect(() => {
-    if (!loaded) return;
-    const timer = window.setTimeout(() => {
-      void (async () => {
-        try {
-          const config = await invoke<Record<string, unknown>>("get_config");
-          const apiKeys = {
-            ...((config.apiKeys as Record<string, string>) ?? {}),
-            tmdb,
-            bangumi,
-            omdb,
-            tvdb,
-          };
-          await invoke("save_config", {
-            config: {
-              ...config,
-              apiKeys,
-              scrapeConcurrency: Math.min(8, Math.max(1, concurrency)),
-              metadataLanguage: language,
-            },
-          });
-          showToast(t("settings.api.saved"));
-        } catch (err) {
-          showToast(String(err));
-        }
-      })();
-    }, 450);
-    return () => window.clearTimeout(timer);
-  }, [loaded, tmdb, bangumi, omdb, tvdb, concurrency, language, showToast, t]);
+  useAutosave(
+    { tmdb, bangumi, omdb, tvdb, concurrency, language },
+    loaded,
+    async (v) => {
+      try {
+        const config = await invoke<Record<string, unknown>>("get_config");
+        const apiKeys = {
+          ...((config.apiKeys as Record<string, string>) ?? {}),
+          tmdb: v.tmdb,
+          bangumi: v.bangumi,
+          omdb: v.omdb,
+          tvdb: v.tvdb,
+        };
+        await invoke("save_config", {
+          config: {
+            ...config,
+            apiKeys,
+            scrapeConcurrency: Math.min(8, Math.max(1, v.concurrency)),
+            metadataLanguage: v.language,
+          },
+        });
+        showToast(t("settings.api.saved"));
+      } catch (err) {
+        showToast(String(err));
+        throw err;
+      }
+    },
+  );
 
   return (
     <div className="kg-settings-group">
@@ -767,13 +806,13 @@ function ApiKeysSection() {
         label={t("settings.api.omdb")}
         value={omdb}
         onChange={setOmdb}
-        placeholder="OMDb API Key"
+        placeholder={t("settings.api.omdbPlaceholder")}
       />
       <ApiField
         label={t("settings.api.tvdb")}
         value={tvdb}
         onChange={setTvdb}
-        placeholder="TVDB API Key"
+        placeholder={t("settings.api.tvdbPlaceholder")}
       />
       <label className="kg-settings-field">
         <span className="kg-settings-block-label">{t("settings.api.concurrency")}</span>
@@ -1020,46 +1059,51 @@ function ScrapeExclusionsSection() {
   const { t } = useTranslation();
   const [folders, setFolders] = useState<string[]>([]);
   const [draft, setDraft] = useState("");
-  const [saving, setSaving] = useState(false);
   const [message, setMessage] = useState<string | null>(null);
+  /** Source of truth between renders so quick successive edits build on each other. */
+  const foldersRef = useRef<string[]>([]);
+  const saveQueue = useRef<Promise<void>>(Promise.resolve());
+  const [loaded, setLoaded] = useState(false);
 
   useEffect(() => {
     void (async () => {
       const config = await invoke<{ scanExcludedFolders: string[] }>("get_config");
-      setFolders(config.scanExcludedFolders ?? []);
+      foldersRef.current = config.scanExcludedFolders ?? [];
+      setFolders(foldersRef.current);
+      setLoaded(true);
     })();
   }, []);
 
-  const persist = async (next: string[]) => {
-    setSaving(true);
+  const update = (next: string[]) => {
+    foldersRef.current = next;
+    setFolders(next);
     setMessage(null);
-    try {
-      const config = await invoke<Record<string, unknown>>("get_config");
-      await invoke("save_config", {
-        config: { ...config, scanExcludedFolders: next },
-      });
-      setFolders(next);
-      setMessage(t("settings.exclusions.saved"));
-    } catch (err) {
-      setMessage(String(err));
-    } finally {
-      setSaving(false);
-    }
+    // Saves run in order; each writes the full list as of its edit.
+    saveQueue.current = saveQueue.current.then(async () => {
+      try {
+        const config = await invoke<Record<string, unknown>>("get_config");
+        await invoke("save_config", {
+          config: { ...config, scanExcludedFolders: next },
+        });
+        setMessage(t("settings.exclusions.saved"));
+      } catch (err) {
+        setMessage(String(err));
+      }
+    });
   };
 
   const add = () => {
     const value = draft.trim();
-    if (!value) return;
-    if (folders.some((f) => f.toLowerCase() === value.toLowerCase())) {
-      setDraft("");
-      return;
-    }
-    void persist([...folders, value]);
+    // Before the list loads, an edit would overwrite the saved folders with [].
+    if (!value || !loaded) return;
     setDraft("");
+    const current = foldersRef.current;
+    if (current.some((f) => f.toLowerCase() === value.toLowerCase())) return;
+    update([...current, value]);
   };
 
   const remove = (name: string) => {
-    void persist(folders.filter((f) => f !== name));
+    update(foldersRef.current.filter((f) => f !== name));
   };
 
   return (
@@ -1093,7 +1137,7 @@ function ScrapeExclusionsSection() {
           placeholder={t("settings.exclusions.placeholder")}
           className="flex-1"
         />
-        <Button variant="default" size="sm" type="button" disabled={saving} onClick={add}>
+        <Button variant="default" size="sm" type="button" disabled={!loaded || !draft.trim()} onClick={add}>
           {t("common.add")}
         </Button>
       </div>

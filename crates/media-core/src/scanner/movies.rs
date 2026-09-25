@@ -125,7 +125,7 @@ pub fn scan_movies_under_cancellable(
                 .parent()
                 .map(canonicalize_lossy)
                 .unwrap_or_else(|| absolute.clone());
-            let parsed = FileNameParser::parse(&file_name);
+            let parsed = FileNameParser::parse_title(&file_name);
             let nfo_path = path.with_extension("nfo");
             let status = if nfo_path.is_file() {
                 ScrapedStatus::Scraped
@@ -184,5 +184,17 @@ mod tests {
             scan_movies_under(&library, &[a], &HashSet::new(), &HashSet::new(), |_| {}).unwrap();
         assert_eq!(result.new_items.len(), 1);
         assert_eq!(result.new_items[0].title, "A");
+    }
+
+    #[test]
+    fn trailing_title_number_is_not_an_episode() {
+        let dir = tempdir().unwrap();
+        let movie_dir = dir.path().join("Apollo 13 (1995)");
+        std::fs::create_dir_all(&movie_dir).unwrap();
+        std::fs::write(movie_dir.join("Apollo 13 (1995).mkv"), b"x").unwrap();
+        let library = Library::new("Movies", dir.path().display().to_string(), MediaType::Movie);
+        let result = scan_movies(&library, &HashSet::new(), &HashSet::new(), |_| {}).unwrap();
+        assert_eq!(result.new_items[0].title, "Apollo 13");
+        assert_eq!(result.new_items[0].year, Some(1995));
     }
 }

@@ -138,8 +138,15 @@ pub async fn scrape_library_cancellable(
         tokio::select! {
             _ = tokio::time::sleep(std::time::Duration::from_millis(50)) => {},
             result = jobs.join_next() => {
-                let (id, title, result) = result.expect("nonempty job set").map_err(|e| e.to_string())?;
                 done += 1;
+                // A panicked task fails only its own item (it stays Unscraped for the next run).
+                let (id, title, result) = match result.expect("nonempty job set") {
+                    Ok(joined) => joined,
+                    Err(error) => {
+                        tracing::warn!(%error, "scrape task failed");
+                        (String::new(), String::new(), Err(error.to_string()))
+                    }
+                };
                 match result {
                     Ok(ScrapeItemOutcome::Matched) => summary.success_ids.push(id),
                     Ok(ScrapeItemOutcome::Unmatched) => summary.unmatched += 1,
@@ -258,6 +265,7 @@ async fn persist_match(
     };
 
     issues.extend(artwork.issues.clone());
+    issues.extend(scraped.issues.iter().cloned());
 
     let metadata = MediaMetadata {
         media_item_id: item.id.clone(),
@@ -495,6 +503,26 @@ mod tests {
         let updated = db.get_media_item(&item.id).unwrap().unwrap();
         assert_eq!(updated.status, ScrapedStatus::Partial);
         assert!(updated.scrape_issue.unwrap().contains("NFO"));
+    }
+
+    #[tokio::test]
+    async fn provider_issues_save_as_partial_with_data() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = AppDatabase::open_in_memory().unwrap();
+        let lib = Library::new("Movies", dir.path().to_string_lossy(), MediaType::Movie);
+        db.insert_library(&lib).unwrap();
+        let video = dir.path().join("Original.mkv");
+        std::fs::write(&video, b"video").unwrap();
+        let item = MediaItem::new_movie("Original", Some(2000), dir.path().to_string_lossy(), video.to_string_lossy(), lib.id, ScrapedStatus::Unscraped);
+        db.insert_media_items(std::slice::from_ref(&item)).unwrap();
+        let mut meta = metadata();
+        meta.issues.push("seasons 2: err.connect".into());
+        let err = persist_match(&db, &Client::new(), &item, meta, "kodi").await.unwrap_err();
+        assert!(err.contains("seasons 2: err.connect"));
+        let updated = db.get_media_item(&item.id).unwrap().unwrap();
+        assert_eq!(updated.status, ScrapedStatus::Partial);
+        assert_eq!(updated.title, "Matched title");
+        assert!(video.with_extension("nfo").exists());
     }
 
     #[tokio::test]

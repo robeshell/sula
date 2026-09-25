@@ -176,7 +176,7 @@ pub fn scan_shows_under_cancellable(
         let (title, year) = if let Some(override_title) = title_overrides.get(&show_path) {
             (override_title.clone(), None)
         } else {
-            let dir_parsed = FileNameParser::parse(&format!("{show_name}.mkv"));
+            let dir_parsed = FileNameParser::parse_title(&format!("{show_name}.mkv"));
             let title = if dir_parsed.title.is_empty() {
                 show_name.clone()
             } else {
@@ -631,5 +631,18 @@ mod tests {
         assert_eq!(absorbed[0].0, first.new_items[0].id);
         assert_eq!(absorbed[0].1.len(), 1);
         assert_eq!(absorbed[0].1[0].season, 2);
+    }
+
+    #[test]
+    fn show_folder_trailing_number_stays_in_title() {
+        let dir = tempdir().unwrap();
+        let season = dir.path().join("The 100").join("Season 01");
+        std::fs::create_dir_all(&season).unwrap();
+        std::fs::write(season.join("The.100.S01E01.mkv"), b"x").unwrap();
+        let library = Library::new("TV", dir.path().display().to_string(), MediaType::TvShow);
+        let result = scan_shows(&library, &HashSet::new(), &HashSet::new(), |_| {}).unwrap();
+        assert_eq!(result.new_items[0].title, "The 100");
+        let eps = result.episodes.get(&result.new_items[0].id).unwrap();
+        assert_eq!((eps[0].season, eps[0].episode), (1, 1));
     }
 }

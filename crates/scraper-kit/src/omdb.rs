@@ -153,6 +153,7 @@ impl OmdbScraper {
             tvdb_id: None,
             bangumi_id: None,
             seasons: Vec::new(),
+            issues: Vec::new(),
         })
     }
 

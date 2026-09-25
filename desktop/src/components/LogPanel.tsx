@@ -29,28 +29,65 @@ export function LogPanel({ onClose }: { onClose: () => void }) {
   }, [onClose]);
 
   useEffect(() => {
-    void invoke<LogEntry[]>("list_logs")
-      .then(setEntries)
-      .catch(() => setEntries([]));
+    let disposed = false;
+    const unlisteners: Array<() => void> = [];
+    // Events that arrive before the snapshot are buffered, then merged by id,
+    // so nothing logged between `listen` and `list_logs` is lost or doubled.
+    let snapshotLoaded = false;
+    let buffered: LogEntry[] = [];
+    let clearedBeforeSnapshot = false;
+    const track = (registration: Promise<() => void>) =>
+      registration.then(
+        (unlisten) => {
+          if (disposed) unlisten();
+          else unlisteners.push(unlisten);
+        },
+        () => {},
+      );
 
-    let unlistenEntry: (() => void) | undefined;
-    let unlistenClear: (() => void) | undefined;
-    void listen<LogEntry>("log://entry", (event) => {
-      setEntries((prev) => {
-        const next = [...prev, event.payload];
-        return next.length > 500 ? next.slice(next.length - 500) : next;
-      });
-    }).then((fn) => {
-      unlistenEntry = fn;
-    });
-    void listen("log://cleared", () => {
-      setEntries([]);
-    }).then((fn) => {
-      unlistenClear = fn;
-    });
+    void (async () => {
+      // Register first: `listen` is async, and a snapshot taken before it
+      // resolves would miss entries emitted in between.
+      await Promise.all([
+        track(
+          listen<LogEntry>("log://entry", (event) => {
+            if (disposed) return;
+            if (!snapshotLoaded) {
+              buffered.push(event.payload);
+              return;
+            }
+            setEntries((prev) => mergeLogEntries(prev, [event.payload]));
+          }),
+        ),
+        track(
+          listen("log://cleared", () => {
+            if (disposed) return;
+            if (!snapshotLoaded) {
+              buffered = [];
+              clearedBeforeSnapshot = true;
+              return;
+            }
+            setEntries([]);
+          }),
+        ),
+      ]);
+      if (disposed) return;
+      let snapshot: LogEntry[] = [];
+      try {
+        snapshot = await invoke<LogEntry[]>("list_logs");
+      } catch {
+        snapshot = [];
+      }
+      if (disposed) return;
+      snapshotLoaded = true;
+      // A clear during loading may predate the snapshot; only post-clear events are safe.
+      setEntries(mergeLogEntries(clearedBeforeSnapshot ? [] : snapshot, buffered));
+      buffered = [];
+    })();
+
     return () => {
-      unlistenEntry?.();
-      unlistenClear?.();
+      disposed = true;
+      unlisteners.splice(0).forEach((unlisten) => unlisten());
     };
   }, []);
 
@@ -123,6 +160,21 @@ export function LogPanel({ onClose }: { onClose: () => void }) {
       </div>
     </div>
   );
+}
+
+const MAX_LOG_ENTRIES = 500;
+
+/** Append entries not already present (by id), keeping the newest MAX_LOG_ENTRIES. */
+function mergeLogEntries(base: LogEntry[], extra: LogEntry[]): LogEntry[] {
+  if (extra.length === 0) return base.slice(-MAX_LOG_ENTRIES);
+  const seen = new Set(base.map((entry) => entry.id));
+  const next = [...base];
+  for (const entry of extra) {
+    if (seen.has(entry.id)) continue;
+    seen.add(entry.id);
+    next.push(entry);
+  }
+  return next.length > MAX_LOG_ENTRIES ? next.slice(next.length - MAX_LOG_ENTRIES) : next;
 }
 
 function levelClass(level: LogLevel): string {

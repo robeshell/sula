@@ -31,8 +31,24 @@ pub enum TaskStatus {
     Cancelled,
 }
 
+impl TaskStatus {
+    pub fn is_finished(self) -> bool {
+        matches!(self, Self::Completed | Self::Failed | Self::Cancelled)
+    }
+}
+
 pub use crate::app::TaskProgress;
 use crate::app::locks::{LockScope, MutationLocks};
+
+/// Told about every task change as it happens, so a shell can push it to its UI.
+/// Called while the queue is locked (keeps changes in order): never call back
+/// into the queue from here.
+pub trait TaskObserver: Send + Sync {
+    fn task_changed(&self, task: &TaskSnapshot);
+}
+
+/// Progress can tick per file; the UI hears about it at most this often.
+const PROGRESS_NOTICE_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TaskResult {
@@ -65,6 +81,10 @@ struct TaskRecord {
     lock: Option<LockScope>,
     cancel: Arc<AtomicBool>,
     work: Option<TaskWork>,
+    /// When progress was last reported to the observer.
+    progress_noticed: Option<std::time::Instant>,
+    /// A held-back progress update is waiting for its delayed notice.
+    progress_flush_pending: bool,
 }
 
 type TaskWork = Box<dyn FnOnce(TaskHandle) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send>> + Send>;
@@ -98,6 +118,25 @@ impl TaskHandle {
         if let Some(task) = tasks.iter_mut().find(|t| t.snapshot.id == self.id) {
             task.snapshot.progress = Some(progress);
             task.snapshot.updated_at = Utc::now();
+            let now = std::time::Instant::now();
+            match task.progress_noticed.map(|at| now.duration_since(at)) {
+                Some(since) if since < PROGRESS_NOTICE_INTERVAL => {
+                    // Held back; make sure the latest value still arrives if progress then stalls.
+                    if !task.progress_flush_pending {
+                        task.progress_flush_pending = true;
+                        let (queue, id) = (Arc::clone(&self.queue), self.id.clone());
+                        tokio::spawn(async move {
+                            tokio::time::sleep(PROGRESS_NOTICE_INTERVAL - since).await;
+                            queue.flush_progress(&id).await;
+                        });
+                    }
+                }
+                _ => {
+                    task.progress_noticed = Some(now);
+                    task.progress_flush_pending = false;
+                    self.queue.notify(&task.snapshot);
+                }
+            }
         }
     }
 }
@@ -116,6 +155,7 @@ impl crate::app::Progress for TaskHandle {
 
 struct TaskQueueInner {
     tasks: Mutex<Vec<TaskRecord>>,
+    observer: std::sync::RwLock<Option<Arc<dyn TaskObserver>>>,
     wake: Notify,
     locks: Arc<MutationLocks>,
     history: Option<std::path::PathBuf>,
@@ -156,7 +196,7 @@ impl TaskQueue {
                 snapshot.error_message = Some("interrupted by application exit; completed changes were preserved".into());
                 snapshot.updated_at = Utc::now();
             }
-            TaskRecord { snapshot, scope: None, lock: None, cancel: Arc::new(AtomicBool::new(false)), work: None }
+            TaskRecord { snapshot, scope: None, lock: None, cancel: Arc::new(AtomicBool::new(false)), work: None, progress_noticed: None, progress_flush_pending: false }
         }).collect();
         Ok(Self::start(runtime, locks, Some(history), records))
     }
@@ -164,6 +204,7 @@ impl TaskQueue {
     fn start(runtime: &tokio::runtime::Handle, locks: Arc<MutationLocks>, history: Option<std::path::PathBuf>, records: Vec<TaskRecord>) -> Self {
         let inner = Arc::new(TaskQueueInner {
             tasks: Mutex::new(records),
+            observer: std::sync::RwLock::new(None),
             wake: Notify::new(),
             locks,
             history,
@@ -173,6 +214,13 @@ impl TaskQueue {
             worker_loop(worker).await;
         });
         Self { inner }
+    }
+
+    /// Receives every later task change (enqueue, status, progress, result).
+    pub fn set_observer(&self, observer: Arc<dyn TaskObserver>) {
+        if let Ok(mut slot) = self.inner.observer.write() {
+            *slot = Some(observer);
+        }
     }
 
     /// Shared by queued jobs and direct file-mutating commands.
@@ -288,12 +336,15 @@ impl TaskQueue {
                 lock,
                 cancel,
                 work: Some(work),
+                progress_noticed: None,
+                progress_flush_pending: false,
             });
             if let Err(error) = self.inner.persist(&tasks) {
                 snapshot.status = TaskStatus::Failed;
                 snapshot.error_message = Some(error);
                 if let Some(last) = tasks.last_mut() { last.snapshot = snapshot.clone(); last.work = None; }
             }
+            self.inner.notify(&snapshot);
         }
         self.inner.wake.notify_one();
         snapshot
@@ -309,6 +360,7 @@ impl TaskQueue {
                 task.snapshot.updated_at = Utc::now();
                 task.work = None;
             }
+            self.inner.notify(&task.snapshot);
             if let Err(error) = self.inner.persist(&tasks) { tracing::error!(%error, "task cancellation persistence failed"); }
             return true;
         }
@@ -345,10 +397,30 @@ impl TaskQueueInner {
         }).map_err(|e| e.to_string())?;
         Ok(())
     }
+    fn notify(&self, task: &TaskSnapshot) {
+        if let Ok(observer) = self.observer.read() {
+            if let Some(observer) = observer.as_ref() {
+                observer.task_changed(task);
+            }
+        }
+    }
+
+    async fn flush_progress(&self, id: &str) {
+        let mut tasks = self.tasks.lock().await;
+        if let Some(task) = tasks.iter_mut().find(|t| t.snapshot.id == id && t.progress_flush_pending) {
+            task.progress_flush_pending = false;
+            task.progress_noticed = Some(std::time::Instant::now());
+            if task.snapshot.status == TaskStatus::Running {
+                self.notify(&task.snapshot);
+            }
+        }
+    }
+
     async fn update(&self, id: &str, f: impl FnOnce(&mut TaskSnapshot)) {
         let mut tasks = self.tasks.lock().await;
         if let Some(task) = tasks.iter_mut().find(|t| t.snapshot.id == id) {
             f(&mut task.snapshot);
+            self.notify(&task.snapshot);
         }
         if let Err(error) = self.persist(&tasks) { tracing::error!(%error, "task history write failed"); }
     }
@@ -404,6 +476,7 @@ async fn worker_loop(inner: Arc<TaskQueueInner>) {
                 } else {
                     task.snapshot.status = TaskStatus::Completed;
                 }
+                inner.notify(&task.snapshot);
             }
             if let Err(error) = inner.persist(&tasks) { tracing::error!(%error, "task completion persistence failed"); }
         }
@@ -442,6 +515,41 @@ mod tests {
         assert!(queue.locks().lock(&LockScope::Global).await.is_ok());
         let next = queue.enqueue("ready", TaskKind::Rename, None, lib("lib"), |_| Box::pin(async { Ok(()) })).await;
         assert_eq!(terminal(&queue, &next.id).await.status, TaskStatus::Completed);
+    }
+
+    struct Recorder(std::sync::Mutex<Vec<(TaskStatus, Option<u32>)>>);
+
+    impl TaskObserver for Recorder {
+        fn task_changed(&self, task: &TaskSnapshot) {
+            self.0.lock().unwrap().push((task.status, task.progress.as_ref().map(|p| p.completed)));
+        }
+    }
+
+    #[tokio::test]
+    async fn observer_hears_each_status_in_order_and_throttled_progress() {
+        let queue = TaskQueue::new();
+        let recorder = Arc::new(Recorder(std::sync::Mutex::new(Vec::new())));
+        queue.set_observer(recorder.clone());
+        let task = queue.enqueue("job", TaskKind::Smoke, None, None, |handle| Box::pin(async move {
+            // A burst far faster than the notice interval, then a stall: the first
+            // update goes out at once and the last one once the interval passes.
+            for step in 1..=50 {
+                handle.update_progress(TaskProgress::new(step, 50, "step", "smoke")).await;
+            }
+            tokio::time::sleep(PROGRESS_NOTICE_INTERVAL * 3).await;
+            Ok(())
+        })).await;
+        let done = terminal(&queue, &task.id).await;
+
+        let seen = recorder.0.lock().unwrap().clone();
+        let statuses: Vec<_> = seen.iter().map(|(status, _)| *status).collect();
+        let mut distinct = statuses.clone();
+        distinct.dedup();
+        assert_eq!(distinct, [TaskStatus::Pending, TaskStatus::Running, TaskStatus::Completed]);
+        let progress: Vec<_> = seen.iter().filter(|(status, _)| *status == TaskStatus::Running).filter_map(|(_, p)| *p).collect();
+        assert_eq!(progress, [1, 50], "{seen:?}");
+        assert_eq!(seen.last().unwrap().1, Some(50));
+        assert_eq!(done.progress.map(|p| p.completed), Some(50));
     }
 
     #[tokio::test]

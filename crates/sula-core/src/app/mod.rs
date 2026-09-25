@@ -7,6 +7,7 @@ pub mod cleanup;
 pub mod library;
 pub mod locks;
 pub mod organize;
+pub mod posters;
 pub mod scrape;
 mod scrape_persist;
 
@@ -43,9 +44,12 @@ pub trait Progress: Send + Sync {
     }
 }
 
-/// UI notifications a service may raise outside the task lifecycle.
+/// Notifications for the shell's UI.
 pub trait Events: Send + Sync {
+    /// Library contents changed; lists should reload.
     fn library_updated(&self);
+    /// A task was queued or changed status, progress or result.
+    fn task_updated(&self, _task: &crate::task_queue::TaskSnapshot) {}
 }
 
 pub fn err_string(err: impl ToString) -> String {

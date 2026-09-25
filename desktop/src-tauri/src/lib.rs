@@ -51,7 +51,10 @@ pub fn run() {
         .setup(move |app| {
             let runtime = tauri::async_runtime::handle().inner().clone();
             let state = state::app_data_dir()
-                .and_then(|data_dir| AppState::bootstrap(data_dir, &runtime, logs.clone()))
+                .and_then(|data_dir| {
+                    let events = Arc::new(commands::UiEvents(app.handle().clone()));
+                    AppState::bootstrap(data_dir, &runtime, logs.clone(), events)
+                })
                 .unwrap_or_else(|error| startup_failed(app.handle(), &error));
             app.manage(state);
             logs.attach_sink(Arc::new(LogEvents(app.handle().clone())));

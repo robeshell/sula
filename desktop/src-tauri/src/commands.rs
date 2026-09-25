@@ -16,7 +16,7 @@ use crate::app::scrape::{localized_error, ScrapeService, ScrapeSettings};
 use crate::app::{blocking, err_string, Events};
 use crate::config::AppConfig;
 use crate::state::{AppState, AppStatusDto, CratesDto};
-use crate::task_queue::{TaskKind, TaskSnapshot, TaskStatus};
+use crate::task_queue::{TaskKind, TaskSnapshot};
 
 async fn ui_locale(state: &State<'_, AppState>) -> String {
     state.config.lock().await.config.ui_locale.clone()
@@ -24,11 +24,15 @@ async fn ui_locale(state: &State<'_, AppState>) -> String {
 
 /// Forwards core events to the webview (`Events` belongs to sula-core, so the
 /// handle is wrapped).
-struct UiEvents<'a>(&'a AppHandle);
+pub(crate) struct UiEvents(pub AppHandle);
 
-impl Events for UiEvents<'_> {
+impl Events for UiEvents {
     fn library_updated(&self) {
         let _ = self.0.emit("library-updated", ());
+    }
+
+    fn task_updated(&self, task: &TaskSnapshot) {
+        let _ = self.0.emit("task-updated", task);
     }
 }
 
@@ -128,7 +132,7 @@ pub async fn add_library(
     state.db.insert_library(&library).map_err(err_string)?;
     let _ = enqueue_refresh_inner(&app, &state, library.id.clone()).await?;
     // Every window keeps its own library list (settings edits them too).
-    UiEvents(&app).library_updated();
+    UiEvents(app.clone()).library_updated();
     Ok(library)
 }
 
@@ -150,7 +154,7 @@ pub async fn rename_library(
         .ok_or_else(|| format!("library not found: {id}"))?;
     library.name = name;
     state.db.update_library(&library).map_err(err_string)?;
-    UiEvents(&app).library_updated();
+    UiEvents(app.clone()).library_updated();
     Ok(library)
 }
 
@@ -162,7 +166,7 @@ pub async fn delete_library(
 ) -> Result<(), String> {
     let _mutation_guard = state.tasks.locks().lock(&LockScope::library(&id)).await?;
     state.db.delete_library(&id).map_err(err_string)?;
-    UiEvents(&app).library_updated();
+    UiEvents(app.clone()).library_updated();
     Ok(())
 }
 
@@ -205,7 +209,7 @@ pub async fn rebind_library(
         tracing::warn!(library_id = %library.id, %error, "scan state not cleared after rebind");
     }
     let _ = enqueue_refresh_inner(&app, &state, library.id.clone()).await?;
-    UiEvents(&app).library_updated();
+    UiEvents(app.clone()).library_updated();
     Ok(library)
 }
 
@@ -359,7 +363,7 @@ pub async fn merge_planned_shows(
     let templates = state.config.lock().await.config.rename_templates();
     blocking(move || {
         let _mutation_guard = mutation_guard;
-        crate::app::organize::merge_planned_shows(&db, &pairs, &templates, &UiEvents(&app))
+        crate::app::organize::merge_planned_shows(&db, &pairs, &templates, &UiEvents(app.clone()))
     })
     .await
 }
@@ -460,7 +464,6 @@ pub async fn refresh_library(
 
 #[tauri::command]
 pub async fn refresh_media_items(
-    app: AppHandle,
     state: State<'_, AppState>,
     item_ids: Vec<String>,
 ) -> Result<TaskSnapshot, String> {
@@ -487,8 +490,6 @@ pub async fn refresh_media_items(
         })
         .await;
 
-    watch_task(app.clone(), Arc::clone(&state.tasks), snapshot.id.clone());
-    let _ = app.emit("task-updated", &snapshot);
     Ok(snapshot)
 }
 
@@ -499,7 +500,6 @@ pub async fn list_tasks(state: State<'_, AppState>) -> Result<Vec<TaskSnapshot>,
 
 #[tauri::command]
 pub async fn enqueue_smoke_task(
-    app: AppHandle,
     state: State<'_, AppState>,
     title: Option<String>,
 ) -> Result<TaskSnapshot, String> {
@@ -507,7 +507,6 @@ pub async fn enqueue_smoke_task(
         .tasks
         .enqueue_smoke(title.unwrap_or_else(|| "M0 smoke task".into()))
         .await;
-    watch_task(app, Arc::clone(&state.tasks), snapshot.id.clone());
     Ok(snapshot)
 }
 
@@ -559,8 +558,6 @@ async fn enqueue_refresh_inner(
         })
         .await;
 
-    watch_task(app.clone(), Arc::clone(&state.tasks), snapshot.id.clone());
-    let _ = app.emit("task-updated", &snapshot);
     Ok(snapshot)
 }
 
@@ -597,14 +594,11 @@ pub async fn scrape_library(
         })
         .await;
 
-    watch_task(app.clone(), Arc::clone(&state.tasks), snapshot.id.clone());
-    let _ = app.emit("task-updated", &snapshot);
     Ok(snapshot)
 }
 
 #[tauri::command]
 pub async fn scrape_items(
-    app: AppHandle,
     state: State<'_, AppState>,
     item_ids: Vec<String>,
 ) -> Result<TaskSnapshot, String> {
@@ -621,14 +615,11 @@ pub async fn scrape_items(
         })
         .await;
 
-    watch_task(app.clone(), Arc::clone(&state.tasks), snapshot.id.clone());
-    let _ = app.emit("task-updated", &snapshot);
     Ok(snapshot)
 }
 
 #[tauri::command]
 pub async fn rescrape_items(
-    app: AppHandle,
     state: State<'_, AppState>,
     item_ids: Vec<String>,
 ) -> Result<TaskSnapshot, String> {
@@ -665,14 +656,11 @@ pub async fn rescrape_items(
         )
         .await;
 
-    watch_task(app.clone(), Arc::clone(&state.tasks), snapshot.id.clone());
-    let _ = app.emit("task-updated", &snapshot);
     Ok(snapshot)
 }
 
 #[tauri::command]
 pub async fn scrape_season(
-    app: AppHandle,
     state: State<'_, AppState>,
     media_item_id: String,
     season_number: i32,
@@ -682,13 +670,11 @@ pub async fn scrape_season(
     let snapshot = state.tasks.enqueue_scoped(format!("Season {season_number}"), TaskKind::Scrape,
         Some(media_item_id.clone()), task_scope("season", &[media_item_id.clone(), season_number.to_string()]), None,
         move |handle| Box::pin(async move { service.scrape_season(&media_item_id, season_number, &handle).await })).await;
-    watch_task(app, Arc::clone(&state.tasks), snapshot.id.clone());
     Ok(snapshot)
 }
 
 #[tauri::command]
 pub async fn apply_rename_templates(
-    app: AppHandle,
     state: State<'_, AppState>,
     item_ids: Vec<String>,
 ) -> Result<TaskSnapshot, String> {
@@ -706,14 +692,11 @@ pub async fn apply_rename_templates(
         })
         .await;
 
-    watch_task(app.clone(), Arc::clone(&state.tasks), snapshot.id.clone());
-    let _ = app.emit("task-updated", &snapshot);
     Ok(snapshot)
 }
 
 #[tauri::command]
 pub async fn organize_season_folders(
-    app: AppHandle,
     state: State<'_, AppState>,
     item_ids: Vec<String>,
 ) -> Result<TaskSnapshot, String> {
@@ -753,8 +736,6 @@ pub async fn organize_season_folders(
         )
         .await;
 
-    watch_task(app.clone(), Arc::clone(&state.tasks), snapshot.id.clone());
-    let _ = app.emit("task-updated", &snapshot);
     Ok(snapshot)
 }
 
@@ -775,7 +756,6 @@ pub async fn scan_media_residuals(
 
 #[tauri::command]
 pub async fn cleanup_media_residuals(
-    app: AppHandle,
     state: State<'_, AppState>,
     paths: Vec<String>,
 ) -> Result<TaskSnapshot, String> {
@@ -793,8 +773,6 @@ pub async fn cleanup_media_residuals(
         })
         .await;
 
-    watch_task(app.clone(), Arc::clone(&state.tasks), snapshot.id.clone());
-    let _ = app.emit("task-updated", &snapshot);
     Ok(snapshot)
 }
 
@@ -814,7 +792,7 @@ pub async fn delete_media_items(
     let db = Arc::clone(&state.db);
     blocking(move || {
         let _mutation_guard = mutation_guard;
-        crate::app::cleanup::delete_media_items(&db, &item_ids, also_trash, &SystemTrash, &UiEvents(&app))
+        crate::app::cleanup::delete_media_items(&db, &item_ids, also_trash, &SystemTrash, &UiEvents(app.clone()))
     })
     .await
 }
@@ -836,7 +814,6 @@ pub async fn search_match_candidates(
 
 #[tauri::command]
 pub async fn apply_manual_match(
-    app: AppHandle,
     state: State<'_, AppState>,
     item_id: String,
     source_id: String,
@@ -862,8 +839,6 @@ pub async fn apply_manual_match(
         })
         .await;
 
-    watch_task(app.clone(), Arc::clone(&state.tasks), snapshot.id.clone());
-    let _ = app.emit("task-updated", &snapshot);
     Ok(snapshot)
 }
 
@@ -910,159 +885,7 @@ fn organize_service(state: &State<'_, AppState>, config: &AppConfig) -> Organize
     }
 }
 
-fn watch_task(app: AppHandle, tasks: Arc<crate::task_queue::TaskQueue>, id: String) {
-    // A deduplicated enqueue returns an already-watched task; one watcher per task.
-    static WATCHED: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> = std::sync::OnceLock::new();
-    let watched = WATCHED.get_or_init(Default::default);
-    if !watched.lock().unwrap_or_else(|e| e.into_inner()).insert(id.clone()) {
-        return;
-    }
-    tauri::async_runtime::spawn(async move {
-        let mut last_fingerprint = String::new();
-        loop {
-            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
-            if let Some(current) = tasks.get(&id).await {
-                let fingerprint = task_fingerprint(&current);
-                if fingerprint != last_fingerprint {
-                    last_fingerprint = fingerprint;
-                    let _ = app.emit("task-updated", &current);
-                }
-                if matches!(
-                    current.status,
-                    TaskStatus::Completed | TaskStatus::Failed | TaskStatus::Cancelled
-                ) {
-                    let _ = app.emit("library-updated", ());
-                    if current.status == TaskStatus::Completed {
-                        if let Some(state) = app.try_state::<AppState>() {
-                            schedule_thumb_warm(
-                                Arc::clone(&state.db),
-                                Arc::clone(&state.thumbs),
-                                current.kind,
-                                current.target_id.clone(),
-                            );
-                        }
-                    }
-                    break;
-                }
-            } else {
-                break;
-            }
-        }
-        watched.lock().unwrap_or_else(|e| e.into_inner()).remove(&id);
-    });
-}
 
-fn schedule_thumb_warm(
-    db: Arc<media_core::AppDatabase>,
-    thumbs: Arc<media_core::ThumbnailCache>,
-    kind: TaskKind,
-    target_id: Option<String>,
-) {
-    let Some(target_id) = target_id else {
-        return;
-    };
-    tauri::async_runtime::spawn(async move {
-        let warm = tokio::task::spawn_blocking(move || match kind {
-            TaskKind::Refresh | TaskKind::BatchScrape => {
-                warm_library_posters(&db, &thumbs, &target_id)
-            }
-            TaskKind::Scrape | TaskKind::ManualMatch => {
-                warm_item_poster(&db, &thumbs, &target_id)
-            }
-            _ => 0,
-        })
-        .await;
-        match warm {
-            Ok(n) if n > 0 => tracing::info!(count = n, "poster thumbs warmed"),
-            Ok(_) => {}
-            Err(err) => tracing::warn!(error = %err, "poster warm task join failed"),
-        }
-    });
-}
-
-fn warm_library_posters(
-    db: &media_core::AppDatabase,
-    thumbs: &media_core::ThumbnailCache,
-    library_id: &str,
-) -> usize {
-    let Ok(items) = db.list_media_items(library_id) else {
-        return 0;
-    };
-    let Ok(metas) = db.list_metadata_summaries(library_id) else {
-        return 0;
-    };
-    let mut by_id = std::collections::HashMap::new();
-    for item in &items {
-        by_id.insert(item.id.clone(), item);
-    }
-    let mut jobs = Vec::new();
-    for meta in metas {
-        let Some(poster) = meta.poster_path.as_deref().filter(|p| !p.is_empty()) else {
-            continue;
-        };
-        let Some(item) = by_id.get(&meta.media_item_id) else {
-            continue;
-        };
-        let Some(source) =
-            media_core::ThumbnailCache::resolve_poster_source(&item.folder_path, poster)
-        else {
-            continue;
-        };
-        jobs.push(source);
-    }
-    if jobs.is_empty() {
-        return 0;
-    }
-
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    let warmed = AtomicUsize::new(0);
-    let workers = 4usize.min(jobs.len());
-    let chunk = (jobs.len() + workers - 1) / workers;
-    std::thread::scope(|scope| {
-        for piece in jobs.chunks(chunk.max(1)) {
-            let piece = piece.to_vec();
-            let warmed = &warmed;
-            scope.spawn(move || {
-                for source in &piece {
-                    if thumbs.ensure_poster_thumb(source).is_ok() {
-                        warmed.fetch_add(1, Ordering::Relaxed);
-                    }
-                }
-            });
-        }
-    });
-    warmed.load(Ordering::Relaxed)
-}
-
-fn warm_item_poster(
-    db: &media_core::AppDatabase,
-    thumbs: &media_core::ThumbnailCache,
-    item_id: &str,
-) -> usize {
-    let Ok(Some(item)) = db.get_media_item(item_id) else {
-        return 0;
-    };
-    let Ok(Some(meta)) = db.fetch_metadata(item_id) else {
-        return 0;
-    };
-    let Some(poster) = meta.poster_path.as_deref().filter(|p| !p.is_empty()) else {
-        return 0;
-    };
-    let Some(source) =
-        media_core::ThumbnailCache::resolve_poster_source(&item.folder_path, poster)
-    else {
-        return 0;
-    };
-    if thumbs.ensure_poster_thumb(&source).is_ok() {
-        1
-    } else {
-        0
-    }
-}
-
-fn task_fingerprint(task: &TaskSnapshot) -> String {
-    serde_json::to_string(task).unwrap_or_default()
-}
 
 #[tauri::command]
 pub async fn open_renamer_window(app: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
@@ -1274,7 +1097,7 @@ fn finish_renamer_batch(
     result: Result<(), renamer::ExecuteError>,
 ) -> Result<RenamerOutcome, String> {
     if !outcome.renames.is_empty() {
-        UiEvents(app).library_updated();
+        UiEvents(app.clone()).library_updated();
     }
     match result {
         Ok(()) => Ok(outcome),

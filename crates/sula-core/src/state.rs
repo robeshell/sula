@@ -7,9 +7,10 @@ use renamer::{PresetManager, RenameUndoManager};
 use tokio::sync::Mutex;
 
 use crate::app::locks::MutationLocks;
+use crate::app::Events;
 use crate::config::{AppConfig, ConfigStore};
 use crate::log_store::LogStore;
-use crate::task_queue::TaskQueue;
+use crate::task_queue::{TaskObserver, TaskQueue, TaskSnapshot, TaskStatus};
 
 pub struct AppState {
     _instance_lock: std::fs::File,
@@ -21,6 +22,7 @@ pub struct AppState {
     pub rename_undo: Arc<RenameUndoManager>,
     pub rename_presets: Arc<PresetManager>,
     pub logs: Arc<LogStore>,
+    pub events: Arc<dyn Events>,
     pub data_dir: PathBuf,
     pub keep_running_on_close: AtomicBool,
     pub tray_enabled: AtomicBool,
@@ -40,7 +42,12 @@ impl std::error::Error for AlreadyRunning {}
 impl AppState {
     /// Opens everything under `data_dir` (shells pass [`app_data_dir`] so existing
     /// libraries are found) and starts the task queue on `runtime`.
-    pub fn bootstrap(data_dir: PathBuf, runtime: &tokio::runtime::Handle, logs: Arc<LogStore>) -> anyhow::Result<Self> {
+    pub fn bootstrap(
+        data_dir: PathBuf,
+        runtime: &tokio::runtime::Handle,
+        logs: Arc<LogStore>,
+        events: Arc<dyn Events>,
+    ) -> anyhow::Result<Self> {
         std::fs::create_dir_all(&data_dir)?;
 
         let instance_lock = std::fs::OpenOptions::new().read(true).write(true).create(true).truncate(false).open(data_dir.join("application.lock"))?;
@@ -67,6 +74,11 @@ impl AppState {
             data_dir.join("rename_snapshots"),
         )?);
         let rename_presets = Arc::new(PresetManager::open(data_dir.join("rename_presets"))?);
+        tasks.set_observer(Arc::new(TaskEvents {
+            events: Arc::clone(&events),
+            db: Arc::clone(&db),
+            thumbs: Arc::clone(&thumbs),
+        }));
 
         Ok(Self {
             _instance_lock: instance_lock,
@@ -78,10 +90,31 @@ impl AppState {
             rename_undo,
             rename_presets,
             logs,
+            events,
             data_dir,
             keep_running_on_close,
             tray_enabled,
         })
+    }
+}
+
+/// Relays task changes to the shell; finished tasks also reload library lists
+/// and warm the posters they may have changed.
+struct TaskEvents {
+    events: Arc<dyn Events>,
+    db: Arc<AppDatabase>,
+    thumbs: Arc<ThumbnailCache>,
+}
+
+impl TaskObserver for TaskEvents {
+    fn task_changed(&self, task: &TaskSnapshot) {
+        self.events.task_updated(task);
+        if task.status.is_finished() {
+            self.events.library_updated();
+            if task.status == TaskStatus::Completed {
+                crate::app::posters::warm_after_task(Arc::clone(&self.db), Arc::clone(&self.thumbs), task.kind, task.target_id.clone());
+            }
+        }
     }
 }
 

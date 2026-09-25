@@ -5,7 +5,7 @@ use media_core::{
     Library, MediaItem, MediaMetaSummary, MediaMetadata, MediaType, ScrapedStatus, ShowListStats,
     TvEpisode, TvSeason,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, Manager, State};
 
 use crate::config::AppConfig;
@@ -325,66 +325,87 @@ pub async fn list_media_page(
     Ok(MediaListPayload { items, metadata, show_stats, next_offset })
 }
 
-/// Merge duplicate TV/anime shows in the background (same TMDB / title+year).
-/// Cheap no-op when there is nothing to merge; never call from the list hot path.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ShowMergePlanDto {
+    pub source_id: String,
+    pub source_title: String,
+    pub source_folder: String,
+    pub target_id: String,
+    pub target_title: String,
+    pub target_folder: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ShowMergePair {
+    pub source_id: String,
+    pub target_id: String,
+}
+
+/// Read-only preview of duplicate-show merges for a library or selected items, so
+/// the user sees exactly which folders would be absorbed before anything moves.
 #[tauri::command]
-pub async fn consolidate_library_shows(
+pub async fn plan_show_merges(
     state: State<'_, AppState>,
-    library_id: String,
-) -> Result<u32, String> {
-    let mutation_guard = state.tasks.lock_mutations().await?;
-    let library = state
-        .db
-        .get_library(&library_id)
-        .map_err(err_string)?
-        .ok_or_else(|| format!("library not found: {library_id}"))?;
-    if !matches!(
-        library.media_type,
-        MediaType::TvShow | MediaType::Anime
-    ) {
-        return Ok(0);
-    }
-    let templates = state.config.lock().await.config.rename_templates();
+    library_id: Option<String>,
+    item_ids: Option<Vec<String>>,
+) -> Result<Vec<ShowMergePlanDto>, String> {
     let db = Arc::clone(&state.db);
     tokio::task::spawn_blocking(move || {
-        let _mutation_guard = mutation_guard;
-        renamer::consolidate_library_duplicate_shows(&db, &library_id, &templates).map_err(err_string)
+        let candidates = match (library_id, item_ids) {
+            (_, Some(ids)) => ids
+                .iter()
+                .filter_map(|id| db.get_media_item(id).transpose())
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(err_string)?,
+            (Some(library_id), None) => db.list_media_items(&library_id).map_err(err_string)?,
+            (None, None) => Vec::new(),
+        };
+        let plan = renamer::plan_duplicate_show_merges(&db, &candidates).map_err(err_string)?;
+        Ok(plan
+            .into_iter()
+            .map(|(source, target)| ShowMergePlanDto {
+                source_id: source.id,
+                source_title: source.title,
+                source_folder: source.folder_path,
+                target_id: target.id,
+                target_title: target.title,
+                target_folder: target.folder_path,
+            })
+            .collect())
     })
     .await
     .map_err(|e| e.to_string())?
-    .map(|n| n as u32)
 }
 
-/// Absorb selected TV/anime items into a better canonical duplicate (same TMDB / title+year).
+/// Execute merges the user confirmed from `plan_show_merges`. Each pair is checked
+/// again against the current index and skipped if the match changed meanwhile.
 #[tauri::command]
-pub async fn consolidate_media_items(
+pub async fn merge_planned_shows(
+    app: AppHandle,
     state: State<'_, AppState>,
-    item_ids: Vec<String>,
+    pairs: Vec<ShowMergePair>,
 ) -> Result<u32, String> {
     let mutation_guard = state.tasks.lock_mutations().await?;
-    if item_ids.is_empty() {
-        return Ok(0);
-    }
     let templates = state.config.lock().await.config.rename_templates();
     let db = Arc::clone(&state.db);
-    tokio::task::spawn_blocking(move || {
+    let merged = tokio::task::spawn_blocking(move || {
         let _mutation_guard = mutation_guard;
         let mut merged = 0u32;
-        for id in item_ids {
-            let Some(item) = db.get_media_item(&id).map_err(err_string)? else {
-                continue;
-            };
-            if !matches!(item.media_type, MediaType::TvShow | MediaType::Anime) {
-                continue;
-            }
-            if renamer::consolidate_show_item(&db, &item, &templates).map_err(err_string)? {
+        for pair in pairs {
+            if renamer::merge_planned_show(&db, &pair.source_id, &pair.target_id, &templates).map_err(err_string)? {
                 merged += 1;
             }
         }
-        Ok(merged)
+        Ok::<_, String>(merged)
     })
     .await
-    .map_err(|e| e.to_string())?
+    .map_err(|e| e.to_string())??;
+    if merged > 0 {
+        let _ = app.emit("library-updated", ());
+    }
+    Ok(merged)
 }
 
 #[derive(Debug, Serialize)]
@@ -1715,19 +1736,89 @@ pub async fn renamer_preview(
     Ok(renamer::preview(&files, &pipeline))
 }
 
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RenamerOutcome {
+    pub renames: Vec<renamer::CompletedRename>,
+    /// Set when the batch stopped early; `renames` still lists what already moved.
+    pub error: Option<String>,
+    /// Library index rows that could not follow a moved file; the next refresh
+    /// would otherwise treat those files as deleted.
+    pub index_sync_failures: usize,
+}
+
+/// The index stores canonical paths. After a rename only the parent directory of
+/// either side still resolves, so canonicalize that and re-attach the file name.
+fn canonical_entry_path(raw: &str) -> String {
+    let path = std::path::Path::new(raw);
+    match (path.parent(), path.file_name()) {
+        (Some(parent), Some(name)) if !parent.as_os_str().is_empty() => {
+            std::path::Path::new(&media_core::scanner::canonicalize_lossy(parent))
+                .join(name)
+                .to_string_lossy()
+                .into_owned()
+        }
+        _ => raw.to_string(),
+    }
+}
+
+fn sync_renamed_entry(db: &media_core::AppDatabase, rename: &renamer::CompletedRename, failures: &mut usize) {
+    let old = canonical_entry_path(&rename.original_path);
+    let new = canonical_entry_path(&rename.new_path);
+    if let Err(error) = db.remap_renamed_path(&old, &new) {
+        tracing::warn!(%old, %new, %error, "renamer: library index not updated");
+        *failures += 1;
+    }
+}
+
+/// Previews are recomputed here from the same inputs as `renamer_preview`, so a
+/// stale or forged preview from the webview can never choose the destination.
 #[tauri::command]
 pub async fn renamer_execute(
+    app: AppHandle,
     state: State<'_, AppState>,
-    previews: Vec<renamer::PreviewResult>,
-) -> Result<Vec<renamer::CompletedRename>, String> {
+    files: Vec<renamer::FileEntry>,
+    pipeline: renamer::RulePipeline,
+) -> Result<RenamerOutcome, String> {
     let _mutation_guard = state.tasks.lock_mutations().await?;
-    renamer::execute(&previews, &state.rename_undo).map_err(err_string)
+    let previews = renamer::preview(&files, &pipeline);
+    let mut outcome = RenamerOutcome { renames: Vec::new(), error: None, index_sync_failures: 0 };
+    let result = renamer::execute(&previews, &state.rename_undo, |done| {
+        outcome.renames.push(done.clone());
+        sync_renamed_entry(&state.db, done, &mut outcome.index_sync_failures);
+    });
+    finish_renamer_batch(&app, outcome, result.map(|_| ()))
 }
 
 #[tauri::command]
-pub async fn renamer_undo_last(state: State<'_, AppState>) -> Result<usize, String> {
+pub async fn renamer_undo_last(app: AppHandle, state: State<'_, AppState>) -> Result<RenamerOutcome, String> {
     let _mutation_guard = state.tasks.lock_mutations().await?;
-    state.rename_undo.undo_last().map_err(err_string)
+    let mut outcome = RenamerOutcome { renames: Vec::new(), error: None, index_sync_failures: 0 };
+    let result = state.rename_undo.undo_last_with(|done| {
+        outcome.renames.push(done.clone());
+        sync_renamed_entry(&state.db, done, &mut outcome.index_sync_failures);
+    });
+    finish_renamer_batch(&app, outcome, result.map(|_| ()))
+}
+
+/// A failure before anything moved is a plain error; after that the caller must
+/// still learn which entries moved, so the error travels inside the outcome.
+fn finish_renamer_batch(
+    app: &AppHandle,
+    mut outcome: RenamerOutcome,
+    result: Result<(), renamer::ExecuteError>,
+) -> Result<RenamerOutcome, String> {
+    if !outcome.renames.is_empty() {
+        let _ = app.emit("library-updated", ());
+    }
+    match result {
+        Ok(()) => Ok(outcome),
+        Err(error) if outcome.renames.is_empty() => Err(err_string(error)),
+        Err(error) => {
+            outcome.error = Some(err_string(error));
+            Ok(outcome)
+        }
+    }
 }
 
 #[tauri::command]

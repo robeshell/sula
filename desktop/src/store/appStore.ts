@@ -42,6 +42,55 @@ function tt(key: string, opts?: Record<string, unknown>): string {
   return i18n.t(key, opts);
 }
 
+function itemTitles(items: MediaItem[], ids: string[]): string[] {
+  const byId = new Map(items.map((item) => [item.id, item]));
+  return ids.map((id) => {
+    const item = byId.get(id);
+    return item ? (item.year ? `${item.title} (${item.year})` : item.title) : id;
+  });
+}
+
+function folderName(path: string): string {
+  return path.split(/[/\\]/).filter(Boolean).pop() ?? path;
+}
+
+type ShowMergePlan = {
+  sourceId: string;
+  sourceTitle: string;
+  sourceFolder: string;
+  targetId: string;
+  targetTitle: string;
+  targetFolder: string;
+};
+
+/** Preview duplicate-show merges, ask once with the concrete list, then run
+ * exactly the confirmed pairs (the backend re-checks each one). */
+async function confirmAndMergeShows(
+  get: () => AppStore,
+  scope: { libraryId: string } | { itemIds: string[] },
+) {
+  const plan = await invoke<ShowMergePlan[]>("plan_show_merges", scope);
+  if (plan.length === 0) {
+    get().showToast(tt("toast.mergedNone"));
+    return;
+  }
+  const confirmed = await confirmAction({
+    title: tt("confirm.mergeTitle"),
+    description: tt("confirm.mergeDescription", { n: plan.length }),
+    details: plan.map((p) => `${folderName(p.sourceFolder)} → ${folderName(p.targetFolder)}`),
+    confirmLabel: tt("confirm.mergeAction"),
+  });
+  if (!confirmed) return;
+  const merged = await invoke<number>("merge_planned_shows", {
+    pairs: plan.map((p) => ({ sourceId: p.sourceId, targetId: p.targetId })),
+  });
+  if (merged === plan.length) {
+    get().showToast(tt("toast.mergedShows", { n: merged }), 3200);
+  } else {
+    get().showToast(tt("toast.mergedPartial", { n: merged, skipped: plan.length - merged }), 4200);
+  }
+}
+
 function scrapeUnmatchedCount(summary: string): number {
   const m =
     summary.match(/(?:^|\s)unmatched=(\d+)/) ||
@@ -668,6 +717,13 @@ export const useAppStore = create<AppStore>((set, get) => ({
       get().showToast(tt("toast.renameOnlyScraped"));
       return;
     }
+    const confirmed = await confirmAction({
+      title: tt("confirm.renameTitle"),
+      description: tt("confirm.renameDescription", { n: scraped.length }),
+      details: itemTitles(get().mediaItems, scraped),
+      confirmLabel: tt("confirm.renameAction"),
+    });
+    if (!confirmed) return;
     try {
       const task = await invoke<TaskSnapshot>("apply_rename_templates", {
         itemIds: scraped,
@@ -695,6 +751,13 @@ export const useAppStore = create<AppStore>((set, get) => ({
       get().showToast(tt("toast.organizeOnlyTvAnime"));
       return;
     }
+    const confirmed = await confirmAction({
+      title: tt("confirm.organizeTitle"),
+      description: tt("confirm.organizeDescription", { n: targets.length }),
+      details: itemTitles(get().mediaItems, targets),
+      confirmLabel: tt("confirm.organizeAction"),
+    });
+    if (!confirmed) return;
     try {
       const task = await invoke<TaskSnapshot>("organize_season_folders", {
         itemIds: targets,
@@ -720,16 +783,7 @@ export const useAppStore = create<AppStore>((set, get) => ({
       return;
     }
     try {
-      const merged = await invoke<number>("consolidate_media_items", {
-        itemIds: targets,
-      });
-      if (merged > 0) {
-        get().showToast(tt("toast.mergedShows", { n: merged }), 3200);
-        const libraryId = get().selectedLibraryId;
-        if (libraryId) await get().selectLibrary(libraryId);
-      } else {
-        get().showToast(tt("toast.mergedNone"));
-      }
+      await confirmAndMergeShows(get, { itemIds: targets });
     } catch (err) {
       const message = localizeUserMessage(String(err));
       set({ error: message });
@@ -746,15 +800,7 @@ export const useAppStore = create<AppStore>((set, get) => ({
       return;
     }
     try {
-      const merged = await invoke<number>("consolidate_library_shows", {
-        libraryId,
-      });
-      if (merged > 0) {
-        get().showToast(tt("toast.mergedShows", { n: merged }), 3200);
-        await get().selectLibrary(libraryId);
-      } else {
-        get().showToast(tt("toast.mergedNone"));
-      }
+      await confirmAndMergeShows(get, { libraryId });
     } catch (err) {
       const message = localizeUserMessage(String(err));
       set({ error: message });

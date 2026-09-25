@@ -2,6 +2,7 @@ use std::path::{Path, PathBuf};
 
 use reqwest::Client;
 
+use crate::http::{reqwest_err, send_with_retry};
 use crate::types::ArtworkUrls;
 
 pub async fn download_artwork(
@@ -30,16 +31,13 @@ async fn download_one(
     file_name: &str,
     url: &str,
 ) -> Result<String, String> {
-    let bytes = client
-        .get(url)
-        .send()
-        .await
-        .map_err(|e| e.to_string())?
+    let bytes = send_with_retry(client.get(url))
+        .await?
         .error_for_status()
-        .map_err(|e| e.to_string())?
+        .map_err(reqwest_err)?
         .bytes()
         .await
-        .map_err(|e| e.to_string())?;
+        .map_err(reqwest_err)?;
     std::fs::create_dir_all(folder).map_err(|e| e.to_string())?;
     let path = folder.join(file_name);
     media_core::FilesystemService::new().write_file(&bytes, &path, media_core::WriteOptions {

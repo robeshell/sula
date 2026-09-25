@@ -21,6 +21,8 @@ pub struct DirectoryPlan {
     pub removed: Vec<String>,
     /// True when the library had no prior scan-state rows (first incremental bootstrap).
     pub bootstrap: bool,
+    /// Directories below the root that are separate mounts (canonical paths).
+    pub mount_points: Vec<String>,
 }
 
 impl DirectoryPlan {
@@ -125,7 +127,7 @@ pub fn plan_directories_cancellable(
         ));
     }
 
-    let live = walk_directories(&root, excluded_folders, cancel)?;
+    let (live, mount_points) = walk_directories(&root, excluded_folders, cancel)?;
     let prev_map: HashMap<String, f64> = previous
         .iter()
         .map(|s| {
@@ -140,6 +142,7 @@ pub fn plan_directories_cancellable(
     let mut plan = DirectoryPlan {
         live: live.clone(),
         bootstrap,
+        mount_points,
         ..DirectoryPlan::default()
     };
 
@@ -172,10 +175,14 @@ fn walk_directories(
     root: &Path,
     excluded_folders: &HashSet<String>,
     cancel: &std::sync::atomic::AtomicBool,
-) -> Result<HashMap<String, f64>, std::io::Error> {
+) -> Result<(HashMap<String, f64>, Vec<String>), std::io::Error> {
     let mut live = HashMap::new();
+    let mut mount_points = Vec::new();
+    let mut devices: HashMap<PathBuf, Option<u64>> = HashMap::new();
     let root_canon = canonicalize_lossy(root);
-    live.insert(root_canon.clone(), dir_mtime_secs(root)?);
+    let root_meta = std::fs::metadata(root)?;
+    live.insert(root_canon.clone(), system_time_to_secs(root_meta.modified()?));
+    devices.insert(root.to_path_buf(), device_id(&root_meta));
 
     let walker = WalkDir::new(root).follow_links(false).into_iter().filter_entry(|entry| {
         if entry.depth() == 0 {
@@ -205,9 +212,58 @@ fn walk_directories(
         }
         let path = entry.path();
         let key = canonicalize_lossy(path);
-        live.insert(key, dir_mtime_secs(path)?);
+        let metadata = std::fs::metadata(path)?;
+        let device = device_id(&metadata);
+        let parent_device = path.parent().and_then(|parent| devices.get(parent)).copied().flatten();
+        if device.is_some() && parent_device.is_some() && device != parent_device {
+            mount_points.push(key.clone());
+        }
+        devices.insert(path.to_path_buf(), device);
+        live.insert(key, system_time_to_secs(metadata.modified()?));
     }
-    Ok(live)
+    mount_points.sort();
+    Ok((live, mount_points))
+}
+
+#[cfg(unix)]
+fn device_id(metadata: &std::fs::Metadata) -> Option<u64> {
+    use std::os::unix::fs::MetadataExt;
+    Some(metadata.dev())
+}
+
+// Stable Rust exposes no volume id on other platforms; sub-mount detection is Unix-only.
+#[cfg(not(unix))]
+fn device_id(_metadata: &std::fs::Metadata) -> Option<u64> {
+    None
+}
+
+/// Whether `path` is currently the root of a filesystem other than its parent's.
+pub fn is_mount_point(path: &Path) -> Result<bool, std::io::Error> {
+    let Some(parent) = path.parent() else { return Ok(false) };
+    let own = device_id(&std::fs::metadata(path)?);
+    let parent = device_id(&std::fs::metadata(parent)?);
+    Ok(own.is_some() && parent.is_some() && own != parent)
+}
+
+/// Recorded sub-mounts that still exist as plain directories: the mount is gone and
+/// everything that used to live below it only looks deleted. A mount point whose
+/// directory was removed as well is treated as intentionally retired.
+pub fn offline_mount_points(recorded: &[String]) -> Result<Vec<String>, std::io::Error> {
+    let mut offline = Vec::new();
+    for mount in recorded {
+        let path = Path::new(mount);
+        match std::fs::metadata(path) {
+            Ok(metadata) if metadata.is_dir() => {
+                if !is_mount_point(path)? {
+                    offline.push(mount.clone());
+                }
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(offline)
 }
 
 pub fn dir_mtime_secs(path: &Path) -> Result<f64, std::io::Error> {

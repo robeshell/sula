@@ -123,6 +123,54 @@ pub fn consolidate_library_duplicate_shows(
     Ok(merged)
 }
 
+/// Dry run of the consolidation: which show would be absorbed into which, in the
+/// order the merge would run. Nothing on disk or in the index changes.
+pub fn plan_duplicate_show_merges(
+    db: &AppDatabase,
+    candidates: &[MediaItem],
+) -> Result<Vec<(MediaItem, MediaItem)>, RenameError> {
+    let mut ranked: Vec<&MediaItem> = candidates
+        .iter()
+        .filter(|i| matches!(i.media_type, MediaType::TvShow | MediaType::Anime))
+        .collect();
+    ranked.sort_by_key(|a| show_root_score(a));
+    let mut absorbed = std::collections::HashSet::new();
+    let mut plan = Vec::new();
+    for item in ranked {
+        if absorbed.contains(&item.id) {
+            continue;
+        }
+        if let Some(target) = find_canonical_show_duplicate_excluding(db, item, &absorbed)? {
+            absorbed.insert(item.id.clone());
+            plan.push((item.clone(), target));
+        }
+    }
+    Ok(plan)
+}
+
+/// Merge one pair the user confirmed from [`plan_duplicate_show_merges`]. Skips
+/// (returns `false`) when the current index no longer picks the same target.
+pub fn merge_planned_show(
+    db: &AppDatabase,
+    source_id: &str,
+    target_id: &str,
+    templates: &RenameTemplates,
+) -> Result<bool, RenameError> {
+    let Some(source) = db
+        .get_media_item(source_id)
+        .map_err(|e| RenameError::Database(e.to_string()))?
+    else {
+        return Ok(false);
+    };
+    match find_canonical_show_duplicate(db, &source)? {
+        Some(target) if target.id == target_id => {
+            merge_show_into(db, &source, &target, templates)?;
+            Ok(true)
+        }
+        _ => Ok(false),
+    }
+}
+
 /// If `item` is a duplicate of a better canonical show, merge it in and delete `item`.
 pub fn consolidate_show_item(
     db: &AppDatabase,
@@ -139,6 +187,14 @@ pub fn consolidate_show_item(
 fn find_canonical_show_duplicate(
     db: &AppDatabase,
     item: &MediaItem,
+) -> Result<Option<MediaItem>, RenameError> {
+    find_canonical_show_duplicate_excluding(db, item, &std::collections::HashSet::new())
+}
+
+fn find_canonical_show_duplicate_excluding(
+    db: &AppDatabase,
+    item: &MediaItem,
+    excluded: &std::collections::HashSet<String>,
 ) -> Result<Option<MediaItem>, RenameError> {
     if !matches!(item.media_type, MediaType::TvShow | MediaType::Anime) {
         return Ok(None);
@@ -166,7 +222,7 @@ fn find_canonical_show_duplicate(
         .map_err(|e| RenameError::Database(e.to_string()))?;
     let mut matches = Vec::new();
     for other in others {
-        if other.id == item.id {
+        if other.id == item.id || excluded.contains(&other.id) {
             continue;
         }
         if !matches!(other.media_type, MediaType::TvShow | MediaType::Anime) {
@@ -189,7 +245,16 @@ fn find_canonical_show_duplicate(
                 .as_ref()
                 .zip(om.as_ref().and_then(|m| m.tvdb_id.as_ref()))
                 .is_some_and(|(a, b)| a == b);
-        let same_title_year = !title_key.is_empty()
+        // Two different provider records are two different shows, whatever the title says.
+        let conflicting_provider = [
+            (tmdb.as_ref(), om.as_ref().and_then(|m| m.tmdb_id.as_ref())),
+            (bangumi.as_ref(), om.as_ref().and_then(|m| m.bangumi_id.as_ref())),
+            (tvdb.as_ref(), om.as_ref().and_then(|m| m.tvdb_id.as_ref())),
+        ]
+        .iter()
+        .any(|(a, b)| matches!((a, b), (Some(a), Some(b)) if !b.is_empty() && a != b));
+        let same_title_year = !conflicting_provider
+            && !title_key.is_empty()
             && title_key == normalize_show_title(&other.title)
             && year.is_some()
             && year == other.year
@@ -1016,6 +1081,38 @@ mod tests {
             !pack.exists(),
             "merged source folder should be removed after consolidate"
         );
+    }
+
+    #[test]
+    fn merge_plan_is_read_only_and_respects_provider_ids() {
+        let dir = tempdir().unwrap();
+        let main = dir.path().join("Show (2020)");
+        let pack = dir.path().join("Show.S02.1080p");
+        std::fs::create_dir_all(&main).unwrap();
+        std::fs::create_dir_all(&pack).unwrap();
+        let db = AppDatabase::open_in_memory().unwrap();
+        let library = Library::new("TV", dir.path().display().to_string(), MediaType::TvShow);
+        db.insert_library(&library).unwrap();
+        let canonical = MediaItem::new_show(MediaType::TvShow, "Show", Some(2020), main.display().to_string(), library.id.clone(), ScrapedStatus::Scraped);
+        let duplicate = MediaItem::new_show(MediaType::TvShow, "Show", Some(2020), pack.display().to_string(), library.id.clone(), ScrapedStatus::Scraped);
+        db.insert_media_items(&[canonical.clone(), duplicate.clone()]).unwrap();
+        let set_tmdb = |id: &str, tmdb: &str| db.with_conn(|c| {
+            c.execute("INSERT INTO media_metadata (mediaItemId, sourceId, tmdbId, scrapedAt) VALUES (?1, 'tmdb', ?2, '2026-01-01T00:00:00Z')
+                ON CONFLICT(mediaItemId) DO UPDATE SET tmdbId=excluded.tmdbId", [id, tmdb])?;
+            Ok(())
+        }).unwrap();
+
+        let plan = plan_duplicate_show_merges(&db, &db.list_media_items(&library.id).unwrap()).unwrap();
+        assert_eq!(plan.len(), 1);
+        assert_eq!((plan[0].0.id.as_str(), plan[0].1.id.as_str()), (duplicate.id.as_str(), canonical.id.as_str()));
+        assert!(pack.is_dir() && db.get_media_item(&duplicate.id).unwrap().is_some());
+
+        // Same title and year, different TMDB records: two shows, never merged.
+        set_tmdb(&canonical.id, "100");
+        set_tmdb(&duplicate.id, "200");
+        assert!(plan_duplicate_show_merges(&db, &db.list_media_items(&library.id).unwrap()).unwrap().is_empty());
+        assert!(!merge_planned_show(&db, &duplicate.id, &canonical.id, &RenameTemplates::default()).unwrap());
+        assert!(db.get_media_item(&duplicate.id).unwrap().is_some());
     }
 
     #[test]

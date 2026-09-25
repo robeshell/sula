@@ -175,8 +175,9 @@ fn parse_year(root: Node<'_, '_>) -> Option<i32> {
         return Some(y);
     }
     let premiered = child_text(root, "premiered")?;
-    if premiered.len() >= 4 {
-        return premiered[..4].parse().ok();
+    // Byte slicing would panic on non-ASCII dates such as `二〇二三年`.
+    if let Some(year) = premiered.get(..4) {
+        return year.parse().ok();
     }
     None
 }
@@ -400,6 +401,14 @@ mod tests {
             vec!["Cillian Murphy".to_string(), "Emily Blunt".to_string()]
         );
         assert_eq!(parsed.source_id.as_deref(), Some("tmdb:872585"));
+    }
+
+    #[test]
+    fn non_ascii_premiered_does_not_panic() {
+        let parsed = NfoReader::parse_movie_nfo("<movie><title>X</title><premiered>二〇二三年</premiered></movie>").unwrap();
+        assert_eq!(parsed.year, None);
+        let parsed = NfoReader::parse_movie_nfo("<movie><title>X</title><premiered>2023-07-21</premiered></movie>").unwrap();
+        assert_eq!(parsed.year, Some(2023));
     }
 
     #[test]

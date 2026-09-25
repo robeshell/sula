@@ -83,6 +83,34 @@ pub enum FilesystemError {
     TrashUnavailable,
 }
 
+/// True when `destination` resolves to the same entry as `source` only because the
+/// filesystem ignores case or Unicode normalization (APFS, NTFS, SMB shares). A
+/// hard link or any other entry literally named `destination` does not qualify.
+pub fn is_case_only_rename(source: &Path, destination: &Path) -> std::io::Result<bool> {
+    if source == destination || source.parent() != destination.parent() {
+        return Ok(false);
+    }
+    if !source.exists() || !destination.exists() || !same_file::is_same_file(source, destination)? {
+        return Ok(false);
+    }
+    Ok(!entry_name_exists(destination)?)
+}
+
+/// Whether the parent directory lists an entry with exactly this file name,
+/// bypassing case- and normalization-insensitive lookups.
+pub fn entry_name_exists(path: &Path) -> std::io::Result<bool> {
+    let (Some(parent), Some(name)) = (path.parent(), path.file_name()) else {
+        return Ok(false);
+    };
+    let parent = if parent.as_os_str().is_empty() { Path::new(".") } else { parent };
+    for entry in fs::read_dir(parent)? {
+        if entry?.file_name() == name {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 pub struct FilesystemService;
 
 impl FilesystemService {
@@ -115,7 +143,11 @@ impl FilesystemService {
             return Err(FilesystemError::NotFound(source.to_path_buf()));
         }
 
-        if destination.exists() {
+        let case_only = is_case_only_rename(source, destination).map_err(|err| FilesystemError::Io {
+            path: destination.to_path_buf(),
+            source: err,
+        })?;
+        if destination.exists() && !case_only {
             match collision {
                 CollisionPolicy::Fail => {
                     return Err(FilesystemError::AlreadyExists(destination.to_path_buf()));
@@ -365,5 +397,31 @@ mod tests {
         assert_eq!(moved.moved_paths.len(), 1);
         assert!(dst.exists());
         assert!(!src.exists());
+    }
+
+    #[test]
+    fn case_only_rename_moves_on_insensitive_filesystems() {
+        let dir = tempdir().unwrap();
+        let src = dir.path().join("andor.mkv");
+        let dst = dir.path().join("Andor.mkv");
+        fs::write(&src, b"video").unwrap();
+        FilesystemService::new().move_item(&src, &dst, CollisionPolicy::Fail).unwrap();
+        assert!(entry_name_exists(&dst).unwrap());
+        assert!(!entry_name_exists(&src).unwrap());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn hard_link_is_not_a_case_only_rename() {
+        let dir = tempdir().unwrap();
+        let src = dir.path().join("a.mkv");
+        let dst = dir.path().join("b.mkv");
+        fs::write(&src, b"video").unwrap();
+        fs::hard_link(&src, &dst).unwrap();
+        assert!(!is_case_only_rename(&src, &dst).unwrap());
+        assert!(matches!(
+            FilesystemService::new().move_item(&src, &dst, CollisionPolicy::Fail),
+            Err(FilesystemError::AlreadyExists(_))
+        ));
     }
 }

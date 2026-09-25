@@ -8,6 +8,20 @@ pub fn normalize(locale: &str) -> &str {
     }
 }
 
+/// Maps a BCP-47-ish tag (`en_US.UTF-8`, `ja-JP`, `zh-Hant`) to a supported UI locale.
+pub fn from_tag(tag: &str) -> Option<&'static str> {
+    let lower = tag.to_ascii_lowercase();
+    if lower.starts_with("en") { Some("en") } else if lower.starts_with("ja") { Some("ja") } else if lower.starts_with("zh") { Some("zh-Hans") } else { None }
+}
+
+/// Best-effort OS locale for surfaces shown before the config is available.
+pub fn system_locale() -> &'static str {
+    ["LC_ALL", "LC_MESSAGES", "LANG"].iter()
+        .filter_map(|name| std::env::var(name).ok())
+        .find_map(|value| from_tag(&value))
+        .unwrap_or("zh-Hans")
+}
+
 pub fn t(locale: &str, key: &str) -> String {
     let locale = normalize(locale);
     if let Some(text) = lookup(locale, key) {
@@ -255,6 +269,18 @@ fn lookup(locale: &str, key: &str) -> Option<String> {
         ("en", "err.noTmdbId") => "No TMDB id on this show — scrape or rematch first".into(),
         ("ja", "err.noTmdbId") => "TMDB ID がありません。先にスクレイプまたは再マッチしてください".into(),
         (_, "err.noTmdbId") => "该条目没有 TMDB ID，请先刮削或重新匹配".into(),
+
+        ("en", "startup.failedTitle") => "Sula could not start".into(),
+        ("ja", "startup.failedTitle") => "Sula を起動できません".into(),
+        (_, "startup.failedTitle") => "Sula 无法启动".into(),
+
+        ("en", "startup.failedBody") => "Sula failed to initialize its data and will now quit.\n\n{{err}}".into(),
+        ("ja", "startup.failedBody") => "Sula のデータを初期化できなかったため終了します。\n\n{{err}}".into(),
+        (_, "startup.failedBody") => "Sula 初始化数据失败，即将退出。\n\n{{err}}".into(),
+
+        ("en", "startup.alreadyRunning") => "Sula is already running. Use the existing window or the tray icon.".into(),
+        ("ja", "startup.alreadyRunning") => "Sula はすでに起動しています。既存のウィンドウまたはトレイアイコンを使用してください。".into(),
+        (_, "startup.alreadyRunning") => "Sula 已在运行，请使用已打开的窗口或托盘图标。".into(),
 
         _ => return None,
     })

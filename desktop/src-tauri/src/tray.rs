@@ -196,6 +196,9 @@ pub fn setup(app: &AppHandle) -> tauri::Result<()> {
 }
 
 pub fn set_enabled(app: &AppHandle, enabled: bool) {
+    if let Some(state) = app.try_state::<AppState>() {
+        state.tray_enabled.store(enabled, std::sync::atomic::Ordering::Relaxed);
+    }
     if let Some(handle) = app.try_state::<TrayHandle>() {
         let _ = handle.tray.set_visible(enabled);
     }

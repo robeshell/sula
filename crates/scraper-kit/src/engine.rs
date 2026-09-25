@@ -318,7 +318,7 @@ async fn persist_match(
         issues.push(format!("NFO: {error}"));
     }
     if !issues.is_empty() {
-        let issue = issues.join("; ");
+        let issue = crate::http::redact_secrets(&issues.join("; "));
         db.update_status(&item.id, ScrapedStatus::Partial, Some(&issue)).map_err(|e| e.to_string())?;
         return Err(issue);
     }
@@ -359,11 +359,14 @@ pub async fn scrape_season(
     let tmdb = crate::tmdb::TmdbScraper::new(client.clone(), options.keys.tmdb.clone());
     let scraped = tmdb
         .fetch_season(&tmdb_id, season_number, &options.language)
-        .await?;
+        .await
+        .map_err(|e| crate::http::humanize_error(&e))?;
     if !media_core::media_files::owns_folder(db, item).map_err(|e| e.to_string())? {
         return Err("cannot write metadata into a shared show folder".into());
     }
-    let result = merge_seasons(db, &client, item, &[scraped]).await;
+    let result = merge_seasons(db, &client, item, &[scraped])
+        .await
+        .map_err(|e| crate::http::redact_secrets(&e));
     if let Err(ref issue) = result { db.update_status(&item.id, ScrapedStatus::Partial, Some(issue)).map_err(|e| e.to_string())?; }
     result
 }

@@ -43,7 +43,7 @@ pub fn import_nfo_for_item(db: &AppDatabase, item: &MediaItem) -> Result<bool, D
     let poster_path = artwork("poster", &["poster", "cover", "folder"]);
     let fanart_path = artwork("fanart", &["fanart", "backdrop", "background"]);
 
-    let metadata = MediaMetadata {
+    let mut metadata = MediaMetadata {
         media_item_id: item.id.clone(),
         overview: parsed.overview.clone(),
         outline: parsed.outline.clone(),
@@ -82,12 +82,18 @@ pub fn import_nfo_for_item(db: &AppDatabase, item: &MediaItem) -> Result<bool, D
         trailer: parsed.trailer.clone(),
         scraped_at: Utc::now(),
     };
+    // An NFO (including Sula's own, which carries only a subset of fields) adds to
+    // what the index already knows; it never blanks values it simply doesn't mention.
+    if let Some(existing) = db.fetch_metadata(&item.id)? {
+        keep_existing_fields(&mut metadata, existing);
+    }
 
     db.upsert_metadata(&metadata)?;
     db.update_status(&item.id, ScrapedStatus::Scraped, None)?;
 
     if !parsed.title.is_empty() {
-        db.update_title(&item.id, &parsed.title, parsed.original_title.as_deref())?;
+        let original_title = parsed.original_title.as_deref().or(item.original_title.as_deref());
+        db.update_title(&item.id, &parsed.title, original_title)?;
     }
 
     if matches!(item.media_type, MediaType::TvShow | MediaType::Anime) {
@@ -95,6 +101,20 @@ pub fn import_nfo_for_item(db: &AppDatabase, item: &MediaItem) -> Result<bool, D
     }
 
     Ok(true)
+}
+
+fn keep_existing_fields(metadata: &mut MediaMetadata, existing: MediaMetadata) {
+    macro_rules! keep {
+        ($($field:ident),*) => { $( if metadata.$field.is_none() { metadata.$field = existing.$field; } )* };
+    }
+    keep!(overview, outline, tagline, rating, rating_votes, content_rating, director, writer, studio,
+        country, language, premiered, end_date, runtime, show_status, collection_name, collection_id,
+        imdb_id, tmdb_id, tvdb_id, bangumi_id, poster_path, fanart_path, banner_path, logo_path, thumb_path,
+        video_codec, video_resolution, audio_codec, audio_channels, trailer);
+    if metadata.genres.is_empty() { metadata.genres = existing.genres; }
+    if metadata.tags.is_empty() { metadata.tags = existing.tags; }
+    if metadata.credits.is_empty() { metadata.credits = existing.credits; }
+    if metadata.source_id.is_empty() { metadata.source_id = existing.source_id; }
 }
 
 fn find_and_parse_nfo(item: &MediaItem, folder: &Path, exclusive: bool) -> Option<NfoParsedData> {
@@ -560,6 +580,39 @@ mod tests {
         assert_eq!(items[0].status, ScrapedStatus::Scraped);
         assert_eq!(items[0].title, "奥本海默");
         assert_eq!(items[0].original_title.as_deref(), Some("Oppenheimer"));
+    }
+
+    #[test]
+    fn reimporting_a_sparse_nfo_keeps_richer_indexed_metadata() {
+        let dir = tempdir().unwrap();
+        let movie_dir = dir.path().join("Dune (2021)");
+        std::fs::create_dir_all(&movie_dir).unwrap();
+        let video = movie_dir.join("Dune.mkv");
+        std::fs::write(&video, b"x").unwrap();
+        let nfo = movie_dir.join("Dune.nfo");
+        std::fs::write(&nfo, r#"<movie><title>Dune</title><originaltitle>Dune: Part One</originaltitle>
+            <director>Denis Villeneuve</director><studio>Legendary</studio><runtime>155</runtime>
+            <uniqueid type="tmdb" default="true">438631</uniqueid></movie>"#).unwrap();
+        let db = AppDatabase::open_in_memory().unwrap();
+        let library = Library::new("Movies", dir.path().display().to_string(), MediaType::Movie);
+        db.insert_library(&library).unwrap();
+        let item = MediaItem::new_movie("Dune", Some(2021), movie_dir.display().to_string(),
+            video.display().to_string(), library.id.clone(), ScrapedStatus::Unscraped);
+        db.insert_media_items(&[item.clone()]).unwrap();
+        assert!(import_nfo_for_item(&db, &item).unwrap());
+
+        // A later, sparser NFO (like the compact Kodi one Sula writes) only adds.
+        std::fs::write(&nfo, r#"<movie><title>Dune</title><plot>Paul Atreides...</plot>
+            <uniqueid type="tmdb" default="true">438631</uniqueid></movie>"#).unwrap();
+        let item = db.get_media_item(&item.id).unwrap().unwrap();
+        assert!(import_nfo_for_item(&db, &item).unwrap());
+        let meta = db.fetch_metadata(&item.id).unwrap().unwrap();
+        assert_eq!(meta.director.as_deref(), Some("Denis Villeneuve"));
+        assert_eq!(meta.studio.as_deref(), Some("Legendary"));
+        assert_eq!(meta.runtime, Some(155));
+        assert_eq!(meta.overview.as_deref(), Some("Paul Atreides..."));
+        let item = db.get_media_item(&item.id).unwrap().unwrap();
+        assert_eq!(item.original_title.as_deref(), Some("Dune: Part One"));
     }
 
     #[test]

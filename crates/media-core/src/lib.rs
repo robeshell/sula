@@ -21,7 +21,7 @@ pub use cleanup::{
 pub use db::{AppDatabase, DatabaseError, DirectoryScanState, MediaMetaSummary, ShowListStats};
 pub use filesystem::{
     CollisionPolicy, FilesystemChangeSet, FilesystemError, FilesystemMoveRecord,
-    FilesystemService, RemovalStrategy, WriteOptions,
+    FilesystemService, RemovalStrategy, WriteOptions, entry_name_exists, is_case_only_rename,
 };
 pub use models::{
     CastMember, Library, MediaItem, MediaMetadata, MediaType, ScrapedStatus, TvEpisode, TvSeason,

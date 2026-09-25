@@ -1,9 +1,16 @@
 //! Shared HTTP client for scrapers — honors env + macOS system proxy (Clash etc.).
 
 use std::net::{TcpStream, ToSocketAddrs};
+use std::sync::OnceLock;
 use std::time::Duration;
 
-use reqwest::{Client, Proxy};
+use regex::Regex;
+use reqwest::{Client, Proxy, RequestBuilder, Response};
+
+/// Error marker for HTTP 429 that survived all retries; humanized to `err.rateLimit`.
+pub const RATE_LIMITED: &str = "rateLimited";
+const MAX_RETRIES: u32 = 3;
+const MAX_RETRY_AFTER_SECS: u64 = 10;
 
 /// Build an HTTP client that follows `HTTP(S)_PROXY` and, on macOS, system proxy.
 pub fn build_client() -> Client {
@@ -140,8 +147,66 @@ fn scutil_str<'a>(text: &'a str, key: &str) -> Option<&'a str> {
     None
 }
 
+/// Stringify a reqwest error without its URL (OMDb / TMDB v3 carry the API key in the query).
+pub fn reqwest_err(err: reqwest::Error) -> String {
+    err.without_url().to_string()
+}
+
+/// Send a request, retrying HTTP 429/503 with `Retry-After` or exponential backoff.
+/// A 429 that persists after retries becomes [`RATE_LIMITED`]; other statuses are
+/// returned as-is for the caller to handle.
+pub async fn send_with_retry(request: RequestBuilder) -> Result<Response, String> {
+    let mut attempt = 0;
+    loop {
+        let Some(this) = request.try_clone() else {
+            // Streaming bodies cannot be replayed: send once.
+            return finish(request.send().await.map_err(reqwest_err)?);
+        };
+        let response = this.send().await.map_err(reqwest_err)?;
+        let status = response.status().as_u16();
+        if (status != 429 && status != 503) || attempt >= MAX_RETRIES {
+            return finish(response);
+        }
+        let retry_after = response
+            .headers()
+            .get(reqwest::header::RETRY_AFTER)
+            .and_then(|v| v.to_str().ok());
+        let delay = retry_delay(attempt, retry_after);
+        tracing::debug!(status, attempt, ?delay, "scraper http retry");
+        tokio::time::sleep(delay).await;
+        attempt += 1;
+    }
+}
+
+fn finish(response: Response) -> Result<Response, String> {
+    if response.status().as_u16() == 429 {
+        return Err(RATE_LIMITED.into());
+    }
+    Ok(response)
+}
+
+/// Delay before retry `attempt` (0-based): `Retry-After` seconds (capped), else 1s/2s/4s.
+fn retry_delay(attempt: u32, retry_after: Option<&str>) -> Duration {
+    if let Some(secs) = retry_after.and_then(|v| v.trim().parse::<u64>().ok()) {
+        return Duration::from_secs(secs.min(MAX_RETRY_AFTER_SECS));
+    }
+    Duration::from_secs(1u64 << attempt.min(4))
+}
+
+/// Mask `apikey=` / `api_key=` / `key=` / `token=` query values in free-form error text.
+pub fn redact_secrets(text: &str) -> String {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    let re = RE.get_or_init(|| {
+        Regex::new(r#"(?i)\b((?:api[_-]?)?key|(?:access[_-]?)?token)=[^&\s#"')]+"#)
+            .expect("redact regex")
+    });
+    re.replace_all(text, "$1=***").into_owned()
+}
+
 /// Map raw reqwest/TMDB errors to stable i18n keys (`err.*`).
 pub fn humanize_error(err: &str) -> String {
+    let redacted = redact_secrets(err);
+    let err = redacted.as_str();
     let lower = err.to_ascii_lowercase();
 
     // Network / proxy first. Tunnel `403 Forbidden` must not become apiKey/forbidden.
@@ -234,5 +299,95 @@ mod tests {
     fn does_not_treat_year_401_as_api_key() {
         let msg = humanize_error("no match for title (401 Thieves)");
         assert_ne!(msg, "err.apiKey");
+    }
+
+    #[test]
+    fn humanize_redacts_query_keys() {
+        let msg = humanize_error(
+            "HTTP status server error (500 Internal Server Error) for url (https://www.omdbapi.com/?apikey=SECRET&t=x)",
+        );
+        assert!(!msg.contains("SECRET"), "{msg}");
+        let msg = humanize_error("decode failed for https://api.themoviedb.org/3/tv/1?api_key=SECRET");
+        assert!(!msg.contains("SECRET"), "{msg}");
+        let long = format!("{}?apikey=SECRET&t=x {}", "x".repeat(120), "y".repeat(120));
+        let msg = humanize_error(&long);
+        assert!(!msg.contains("SECRET"), "{msg}");
+        assert_eq!(
+            redact_secrets("?apikey=SECRET&t=x KEY=abc token=t0k"),
+            "?apikey=***&t=x KEY=*** token=***"
+        );
+    }
+
+    #[test]
+    fn rate_limited_marker_humanizes() {
+        assert_eq!(humanize_error(RATE_LIMITED), "err.rateLimit");
+    }
+
+    #[test]
+    fn retry_delay_honors_retry_after_then_backoff() {
+        assert_eq!(retry_delay(0, Some("2")), Duration::from_secs(2));
+        assert_eq!(retry_delay(0, Some("600")), Duration::from_secs(10));
+        assert_eq!(retry_delay(0, None), Duration::from_secs(1));
+        assert_eq!(retry_delay(1, None), Duration::from_secs(2));
+        assert_eq!(retry_delay(2, None), Duration::from_secs(4));
+        assert_eq!(
+            retry_delay(1, Some("Wed, 21 Oct 2015 07:28:00 GMT")),
+            Duration::from_secs(2)
+        );
+    }
+
+    /// Serve `responses` in order on a local socket; the thread yields the request count.
+    fn serve(responses: Vec<&'static str>) -> (String, std::thread::JoinHandle<usize>) {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = std::thread::spawn(move || {
+            for response in &responses {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut buffer = [0; 2048];
+                let _ = stream.read(&mut buffer).unwrap();
+                stream.write_all(response.as_bytes()).unwrap();
+            }
+            responses.len()
+        });
+        (format!("http://{addr}/"), handle)
+    }
+
+    const TOO_MANY: &str = "HTTP/1.1 429 Too Many Requests\r\nRetry-After: 0\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+    const OK: &str = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok";
+
+    #[tokio::test]
+    async fn retries_429_then_succeeds() {
+        let (url, server) = serve(vec![TOO_MANY, TOO_MANY, OK]);
+        let client = Client::builder().no_proxy().build().unwrap();
+        let response = send_with_retry(client.get(&url)).await.unwrap();
+        assert_eq!(response.status().as_u16(), 200);
+        assert_eq!(server.join().unwrap(), 3);
+    }
+
+    #[tokio::test]
+    async fn reqwest_err_drops_url_with_key() {
+        let (url, server) = serve(vec![
+            "HTTP/1.1 500 Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        ]);
+        let client = Client::builder().no_proxy().build().unwrap();
+        let err = send_with_retry(client.get(format!("{url}?apikey=SECRET&t=x")))
+            .await
+            .unwrap()
+            .error_for_status()
+            .map_err(reqwest_err)
+            .unwrap_err();
+        server.join().unwrap();
+        assert!(err.contains("500"), "{err}");
+        assert!(!err.contains("SECRET"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn persistent_429_becomes_rate_limited() {
+        let (url, server) = serve(vec![TOO_MANY; MAX_RETRIES as usize + 1]);
+        let client = Client::builder().no_proxy().build().unwrap();
+        let err = send_with_retry(client.get(&url)).await.unwrap_err();
+        assert_eq!(err, RATE_LIMITED);
+        assert_eq!(server.join().unwrap(), MAX_RETRIES as usize + 1);
     }
 }

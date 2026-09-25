@@ -2,6 +2,7 @@ use media_core::MediaType;
 use reqwest::Client;
 use serde::Deserialize;
 
+use crate::http::{reqwest_err, send_with_retry, RATE_LIMITED};
 use crate::matching::relevance_score;
 use crate::types::{
     parse_source_numeric_id, ArtworkUrls, ScrapedEpisode, ScrapedMetadata, ScrapedSeason,
@@ -131,10 +132,7 @@ impl TmdbScraper {
         let data = self.get_json(&url).await?;
         if uses_tv {
             let detail: TvDetail = serde_json::from_value(data).map_err(|e| e.to_string())?;
-            let seasons = self
-                .fetch_seasons(id, &detail.seasons, language)
-                .await
-                .unwrap_or_default();
+            let seasons = self.fetch_seasons(id, &detail.seasons, language).await?;
             Ok(map_tv_detail(detail, seasons))
         } else {
             let detail: MovieDetail = serde_json::from_value(data).map_err(|e| e.to_string())?;
@@ -182,8 +180,11 @@ impl TmdbScraper {
             if stub.season_number < 0 {
                 continue;
             }
-            if let Ok(season) = self.fetch_season(tv_id, stub.season_number, language).await {
-                out.push(season);
+            // Skip broken seasons, but a rate limit fails the whole fetch so it can be retried.
+            match self.fetch_season(tv_id, stub.season_number, language).await {
+                Ok(season) => out.push(season),
+                Err(err) if err == RATE_LIMITED => return Err(err),
+                Err(_) => {}
             }
         }
         Ok(out)
@@ -233,33 +234,23 @@ impl TmdbScraper {
     async fn get_json(&self, url: &str) -> Result<serde_json::Value, String> {
         let key = self.api_key.trim();
         // v4 Read Access Token (JWT) → Bearer; v3 API Key → query `api_key=`.
-        let response = if key.starts_with("eyJ") {
+        let request = if key.starts_with("eyJ") {
             self.client
                 .get(url)
                 .header("Authorization", format!("Bearer {key}"))
-                .header("Accept", "application/json")
-                .send()
-                .await
-                .map_err(|e| e.to_string())?
         } else {
             let sep = if url.contains('?') { '&' } else { '?' };
             let url = format!("{url}{sep}api_key={}", urlencoding::encode(key));
-            self.client
-                .get(&url)
-                .header("Accept", "application/json")
-                .send()
-                .await
-                .map_err(|e| e.to_string())?
+            self.client.get(url)
         };
+        // 429 after retries surfaces as `RATE_LIMITED` from `send_with_retry`.
+        let response = send_with_retry(request.header("Accept", "application/json")).await?;
         let status = response.status();
-        if status.as_u16() == 429 {
-            return Err("rateLimited".into());
-        }
         if !status.is_success() {
             let body = response.text().await.unwrap_or_default();
             return Err(format!("TMDB HTTP {status}: {body}"));
         }
-        response.json().await.map_err(|e| e.to_string())
+        response.json().await.map_err(reqwest_err)
     }
 }
 

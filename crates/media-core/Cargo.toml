@@ -20,6 +20,7 @@ roxmltree.workspace = true
 image.workspace = true
 md-5.workspace = true
 dirs.workspace = true
+same-file = "1"
 
 [dev-dependencies]
 tempfile = "3"

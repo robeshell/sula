@@ -20,13 +20,12 @@ pub fn run() {
     let logs = log_store::LogStore::new();
     init_tracing(logs.clone());
 
-    let state = AppState::bootstrap(logs.clone()).expect("failed to bootstrap sula app state");
-
     let app = tauri::Builder::default()
+        // Must stay first: a second launch exits here, before bootstrap takes the library lock.
+        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| tray::show_main_window(app)))
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_notification::init())
-        .manage(state)
         .on_window_event(|window, event| {
             if window.label() != "main" {
                 return;
@@ -34,16 +33,19 @@ pub fn run() {
             let tauri::WindowEvent::CloseRequested { api, .. } = event else {
                 return;
             };
-            let keep_running = window
-                .try_state::<AppState>()
-                .map(|state| state.keep_running_on_close.load(Ordering::Relaxed))
-                .unwrap_or(true);
-            if keep_running {
+            let Some(state) = window.try_state::<AppState>() else {
+                return;
+            };
+            // Without a tray icon only macOS (Dock reopen) can bring a hidden window back.
+            let reachable = cfg!(target_os = "macos") || state.tray_enabled.load(Ordering::Relaxed);
+            if reachable && state.keep_running_on_close.load(Ordering::Relaxed) {
                 api.prevent_close();
                 let _ = window.hide();
             }
         })
         .setup(move |app| {
+            let state = AppState::bootstrap(logs.clone()).unwrap_or_else(|error| startup_failed(app.handle(), &error));
+            app.manage(state);
             logs.attach_app(app.handle().clone());
             tray::setup(app.handle())?;
             // Windows has no Overlay titlebar; drop native chrome so content
@@ -68,8 +70,8 @@ pub fn run() {
             commands::resolve_actor_avatar,
             commands::list_media_items,
             commands::list_media_page,
-            commands::consolidate_library_shows,
-            commands::consolidate_media_items,
+            commands::plan_show_merges,
+            commands::merge_planned_shows,
             commands::get_media_detail,
             commands::resolve_poster_thumbnail,
             commands::refresh_library,
@@ -118,6 +120,30 @@ pub fn run() {
             tray::show_main_window(app);
         }
     });
+}
+
+fn startup_failed(app: &tauri::AppHandle, error: &anyhow::Error) -> ! {
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = window.hide();
+    }
+    let locale = state::app_data_dir().ok().and_then(|dir| config::peek_ui_locale(&dir.join("config.toml")));
+    let locale = locale.as_deref().and_then(ui_i18n::from_tag).unwrap_or_else(ui_i18n::system_locale);
+    let detail = format!("{error:#}");
+    let already_running = error.downcast_ref::<state::AlreadyRunning>().is_some();
+    let (level, description) = if already_running {
+        tracing::warn!(error = %detail, "another sula instance holds the library lock");
+        (rfd::MessageLevel::Info, ui_i18n::t(locale, "startup.alreadyRunning"))
+    } else {
+        tracing::error!(error = %detail, "failed to bootstrap sula app state");
+        (rfd::MessageLevel::Error, ui_i18n::tf(locale, "startup.failedBody", &[("err", &detail)]))
+    };
+    rfd::MessageDialog::new()
+        .set_level(level)
+        .set_title(if already_running { "Sula".into() } else { ui_i18n::t(locale, "startup.failedTitle") })
+        .set_description(description)
+        .set_buttons(rfd::MessageButtons::Ok)
+        .show();
+    std::process::exit(if already_running { 0 } else { 1 });
 }
 
 fn init_tracing(logs: Arc<log_store::LogStore>) {

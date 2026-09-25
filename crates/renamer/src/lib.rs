@@ -9,7 +9,7 @@ mod template;
 
 pub use execute::{execute, CompletedRename, ExecuteError, RenameSnapshot, RenameUndoManager};
 pub use media_rename::{
-    consolidate_library_duplicate_shows, consolidate_show_item, organize_season_folders,
+    consolidate_library_duplicate_shows, consolidate_show_item, merge_planned_show, organize_season_folders, plan_duplicate_show_merges,
     rename_after_scrape, rename_after_scrape_with_options, RenameError, RenameTemplates,
 };
 pub use preset::{PresetError, PresetManager};

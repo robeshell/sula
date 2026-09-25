@@ -7,6 +7,7 @@ use reqwest::Client;
 use serde::Deserialize;
 use tokio::sync::Mutex;
 
+use crate::http::{reqwest_err, send_with_retry, RATE_LIMITED};
 use crate::matching::relevance_score;
 use crate::types::{
     parse_source_numeric_id, ArtworkUrls, ScrapedEpisode, ScrapedMetadata, ScrapedSeason,
@@ -115,10 +116,16 @@ impl TvdbScraper {
             .ok_or_else(|| format!("TVDB series not found: {id}"))?;
 
         let episodes_url = format!("{BASE}/series/{id}/episodes/default?page=0");
-        let episodes_page: ApiEnvelope<EpisodesPayload> = self
+        // Episodes are best-effort, but a rate limit must fail the fetch (retryable)
+        // instead of producing a show with no seasons.
+        let episodes_page: ApiEnvelope<EpisodesPayload> = match self
             .get_json_auth(&episodes_url, &token, language)
             .await
-            .unwrap_or_else(|_| ApiEnvelope { data: None, status: None });
+        {
+            Ok(page) => page,
+            Err(err) if err == RATE_LIMITED => return Err(err),
+            Err(_) => ApiEnvelope { data: None, status: None },
+        };
         let seasons = group_episodes(episodes_page.data.and_then(|p| p.episodes).unwrap_or_default());
 
         let title = series.name.unwrap_or_else(|| format!("TVDB {id}"));
@@ -220,18 +227,14 @@ impl TvdbScraper {
             }
         }
         let body = serde_json::json!({ "apikey": self.api_key.trim() });
-        let resp: LoginResponse = self
-            .client
-            .post(format!("{BASE}/login"))
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| e.to_string())?
-            .error_for_status()
-            .map_err(|e| e.to_string())?
-            .json()
-            .await
-            .map_err(|e| e.to_string())?;
+        let resp: LoginResponse =
+            send_with_retry(self.client.post(format!("{BASE}/login")).json(&body))
+                .await?
+                .error_for_status()
+                .map_err(reqwest_err)?
+                .json()
+                .await
+                .map_err(reqwest_err)?;
         let token = resp
             .data
             .and_then(|d| d.token)
@@ -253,18 +256,18 @@ impl TvdbScraper {
         } else {
             "eng"
         };
-        self.client
+        let request = self
+            .client
             .get(url)
             .bearer_auth(token)
-            .header("Accept-Language", accept_lang)
-            .send()
-            .await
-            .map_err(|e| e.to_string())?
+            .header("Accept-Language", accept_lang);
+        send_with_retry(request)
+            .await?
             .error_for_status()
-            .map_err(|e| e.to_string())?
+            .map_err(reqwest_err)?
             .json()
             .await
-            .map_err(|e| e.to_string())
+            .map_err(reqwest_err)
     }
 }
 

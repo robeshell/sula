@@ -65,7 +65,7 @@ impl ScraperCoordinator {
         for scraper in sources {
             match self.search_one(scraper, q, media_type, language).await {
                 Ok(mut rows) => all.append(&mut rows),
-                Err(err) if err == "rateLimited" => continue,
+                // Includes `rateLimited`: an all-rate-limited search must not look like "no results".
                 Err(err) => {
                     last_error = Some(err);
                     continue;
@@ -101,7 +101,7 @@ impl ScraperCoordinator {
                     .await
                 {
                     Ok(rows) => rows,
-                    Err(err) if err == "rateLimited" => continue,
+                    // Includes `rateLimited` so the item ends `Failed(err.rateLimit)`, not Unmatched.
                     Err(err) => {
                         last_error = Some(err);
                         continue;

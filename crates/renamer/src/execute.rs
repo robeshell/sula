@@ -4,7 +4,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Utc};
-use media_core::{CollisionPolicy, FilesystemService};
+use media_core::{entry_name_exists, is_case_only_rename, CollisionPolicy, FilesystemService};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -73,20 +73,24 @@ pub enum ExecuteError {
 }
 
 /// Execute renames from preview. Skips conflict / invalid / unchanged.
-/// Saves an undo snapshot when anything moved.
+/// Saves an undo snapshot when anything moved. `on_moved` runs right after each
+/// successful move so callers can keep their own references in step, even when a
+/// later item fails.
 pub fn execute(
     previews: &[PreviewResult],
     undo: &RenameUndoManager,
+    on_moved: impl FnMut(&CompletedRename),
 ) -> Result<Vec<CompletedRename>, ExecuteError> {
     execute_with(previews, undo, |src, dst| {
         FilesystemService::new().move_item(src, dst, CollisionPolicy::Fail).map(|_| ())
-    })
+    }, on_moved)
 }
 
 fn execute_with(
     previews: &[PreviewResult],
     undo: &RenameUndoManager,
     mut move_item: impl FnMut(&Path, &Path) -> Result<(), media_core::FilesystemError>,
+    mut on_moved: impl FnMut(&CompletedRename),
 ) -> Result<Vec<CompletedRename>, ExecuteError> {
     let _guard = undo.mutation.lock().map_err(|_| ExecuteError::Poisoned)?;
     undo.recover_pending()?;
@@ -98,8 +102,12 @@ fn execute_with(
     for preview in previews.iter().filter(|p| p.is_executable()) {
         let src = PathBuf::from(&preview.path);
         let dst = preview.destination_path();
+        // The new name must stay one entry inside the source directory.
+        let mut components = Path::new(&preview.new_name).components();
+        if !matches!((components.next(), components.next()), (Some(std::path::Component::Normal(_)), None)) { continue; }
+        if !crate::preview::is_valid_file_name(&preview.original_name, &preview.new_name) { continue; }
         if !src.is_file() && !src.is_dir() { continue; }
-        if dst.exists() { continue; }
+        if dst.exists() && !is_case_only_rename(&src, &dst)? { continue; }
         let rename = CompletedRename {
             original_path: src.to_string_lossy().into_owned(),
             new_path: dst.to_string_lossy().into_owned(),
@@ -115,8 +123,10 @@ fn execute_with(
             }
             return Err(error.into());
         }
-        snapshot.renames.push(snapshot.pending.take().unwrap().rename);
+        let done = snapshot.pending.take().unwrap().rename;
+        snapshot.renames.push(done.clone());
         undo.write_snapshot(&snapshot)?;
+        on_moved(&done);
 
     }
     if snapshot.renames.is_empty() {
@@ -192,6 +202,9 @@ impl RenameUndoManager {
             let moved = match (from.try_exists()?, to.try_exists()?) {
                 (false, true) if file_identity(to)? == pending.identity => true,
                 (true, false) if file_identity(from)? == pending.identity => false,
+                // Case-only rename on an insensitive volume: both names resolve to one entry.
+                (true, true) if file_identity(to)? == pending.identity
+                    && (is_case_only_rename(from, to)? || is_case_only_rename(to, from)?) => entry_name_exists(to)?,
                 _ => return Err(ExecuteError::RecoveryConflict(format!("{} -> {}", from.display(), to.display()))),
             };
             let pending = snapshot.pending.take().unwrap();
@@ -205,6 +218,12 @@ impl RenameUndoManager {
     }
 
     pub fn undo_last(&self) -> Result<usize, ExecuteError> {
+        self.undo_last_with(|_| {})
+    }
+
+    /// Like [`undo_last`], reporting each reverse move (`original_path` is where the
+    /// entry was, `new_path` where it is restored) right after it happens.
+    pub fn undo_last_with(&self, mut on_moved: impl FnMut(&CompletedRename)) -> Result<usize, ExecuteError> {
         let _guard = self.mutation.lock().map_err(|_| ExecuteError::Poisoned)?;
         self.recover_pending()?;
         let mut all = self.load_all()?;
@@ -218,7 +237,7 @@ impl RenameUndoManager {
             if !new_path.try_exists()? {
                 return Err(ExecuteError::RecoveryConflict(format!("missing undo source: {}", new_path.display())));
             }
-            if original.try_exists()? {
+            if original.try_exists()? && !is_case_only_rename(new_path, original)? {
                 return Err(ExecuteError::RecoveryConflict(format!("undo destination exists: {}", original.display())));
             }
             latest.pending = Some(PendingRename {
@@ -228,8 +247,9 @@ impl RenameUndoManager {
             self.write_snapshot(&latest)?;
             fs.move_item(new_path, original, CollisionPolicy::Fail)?;
             latest.renames.pop();
-            latest.pending = None;
+            let reverse = latest.pending.take().unwrap().rename;
             self.write_snapshot(&latest)?;
+            on_moved(&reverse);
             n += 1;
         }
         std::fs::remove_file(self.storage_dir.join(format!("{}.json", latest.id)))?;
@@ -353,12 +373,14 @@ mod tests {
         let previews = preview(&files, &RulePipeline::new(vec![AnyRenameRule::TextReplace(TextReplace::new("old", "new"))]));
         let undo = RenameUndoManager::open(dir.path().join("snaps")).unwrap();
         let mut calls = 0;
+        let mut reported = Vec::new();
         let result = execute_with(&previews, &undo, |src, dst| {
             calls += 1;
             if calls == 2 { return Err(media_core::FilesystemError::TrashUnavailable); }
             FilesystemService::new().move_item(src, dst, CollisionPolicy::Fail).map(|_| ())
-        });
+        }, |done| reported.push(done.clone()));
         assert!(result.is_err());
+        assert_eq!(reported.len(), 1, "moves before the failure are still reported");
         assert_eq!(undo.snapshots().unwrap()[0].renames.len(), 1);
         assert_eq!(undo.undo_last().unwrap(), 1);
         assert!(dir.path().join("old_a.mkv").is_file());
@@ -380,14 +402,50 @@ mod tests {
         assert!(previews[0].is_executable());
 
         let undo = RenameUndoManager::open(dir.path().join("snaps")).unwrap();
-        let done = execute(&previews, &undo).unwrap();
+        let mut moved = Vec::new();
+        let done = execute(&previews, &undo, |r| moved.push(r.clone())).unwrap();
         assert_eq!(done.len(), 1);
+        assert_eq!(moved, done);
         assert!(!src.exists());
         assert!(dir.path().join("new_name.mkv").is_file());
 
-        let n = undo.undo_last().unwrap();
+        let mut reversed = Vec::new();
+        let n = undo.undo_last_with(|r| reversed.push(r.clone())).unwrap();
         assert_eq!(n, 1);
+        assert_eq!(reversed[0].new_path, done[0].original_path);
         assert!(src.is_file());
         assert!(!dir.path().join("new_name.mkv").exists());
+    }
+
+    #[test]
+    fn case_only_rename_executes_and_undoes() {
+        let dir = tempdir().unwrap();
+        let src = dir.path().join("andor.mkv");
+        fs::write(&src, b"x").unwrap();
+        let pipeline = RulePipeline::new(vec![AnyRenameRule::TextReplace(TextReplace::new("andor", "Andor"))]);
+        let previews = preview(&[FileEntry::new(&src)], &pipeline);
+        let undo = RenameUndoManager::open(dir.path().join("snaps")).unwrap();
+        assert_eq!(execute(&previews, &undo, |_| {}).unwrap().len(), 1);
+        assert!(entry_name_exists(&dir.path().join("Andor.mkv")).unwrap());
+        assert_eq!(undo.undo_last().unwrap(), 1);
+        assert!(entry_name_exists(&src).unwrap());
+    }
+
+    #[test]
+    fn forged_preview_cannot_leave_the_directory() {
+        let dir = tempdir().unwrap();
+        let inner = dir.path().join("inner");
+        fs::create_dir(&inner).unwrap();
+        let src = inner.join("a.mkv");
+        fs::write(&src, b"x").unwrap();
+        let undo = RenameUndoManager::open(dir.path().join("snaps")).unwrap();
+        for new_name in ["../escaped.mkv", "sub/escaped.mkv", "/tmp/escaped.mkv", ".hidden.mkv"] {
+            let forged = PreviewResult {
+                id: "1".into(), original_name: "a.mkv".into(), new_name: new_name.into(),
+                path: src.to_string_lossy().into_owned(), has_conflict: false, has_invalid_chars: false,
+            };
+            assert!(execute(&[forged], &undo, |_| {}).unwrap().is_empty(), "{new_name}");
+        }
+        assert!(src.is_file());
     }
 }

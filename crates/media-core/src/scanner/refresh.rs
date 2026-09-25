@@ -6,10 +6,34 @@ use crate::AppDatabase;
 use crate::DatabaseError;
 
 use super::incremental::{
-    canonicalize_lossy, known_directories_unchanged_cancellable, plan_directories_cancellable,
+    canonicalize_lossy, known_directories_unchanged_cancellable, offline_mount_points,
+    plan_directories_cancellable,
 };
 use super::movies::{scan_movies_under_cancellable, ScanProgress, MEDIA_EXTENSIONS};
 use super::shows::scan_shows_under_cancellable;
+
+/// Sub-mounts below a library root that are currently disconnected. Anything that
+/// used to live under them only looks deleted and must be left untouched.
+struct OfflineMounts(Vec<String>);
+
+impl OfflineMounts {
+    fn check(recorded: &[String]) -> Result<Self, RefreshError> {
+        let offline = offline_mount_points(recorded)?;
+        for mount in &offline {
+            tracing::warn!(%mount, "sub-mount offline; keeping entries below it");
+        }
+        Ok(Self(offline))
+    }
+
+    fn covers(&self, path: &str) -> bool {
+        self.0.iter().any(|mount| crate::db::path_rooted_under(path, mount))
+    }
+
+    fn error(&self, path: &str) -> RefreshError {
+        let mount = self.0.iter().find(|mount| crate::db::path_rooted_under(path, mount)).cloned().unwrap_or_default();
+        std::io::Error::other(format!("a mounted folder inside the library is offline: {mount}; reconnect it before refreshing")).into()
+    }
+}
 
 #[derive(Debug, Clone, Default)]
 pub struct RefreshReport {
@@ -55,13 +79,18 @@ pub fn refresh_library_cancellable(
     db.verify_library_root(library)?;
     let previous = db.list_scan_states(&library.id)?;
     let deep_scan_due = previous.iter().any(|s| chrono::Utc::now().signed_duration_since(s.last_scanned_at).num_hours() >= 24);
+    let recorded_mounts = db.library_mount_points(&library.id)?;
+    let offline = OfflineMounts::check(recorded_mounts.as_deref().unwrap_or_default())?;
     let mut report = RefreshReport::default();
     // Directory mtimes are not sufficient on every filesystem/NAS. Check
     // direct root files before taking the fast exit.
     let has_unindexed_root_media = has_unindexed_media_in_library_root(db, library, cancel)?;
 
     // Fast path: every known dir still present with unchanged mtime → skip WalkDir.
-    if !deep_scan_due && !has_unindexed_root_media && known_directories_unchanged_cancellable(&previous, cancel)? {
+    // Libraries never walked with mount detection take one full walk to record it.
+    if !deep_scan_due && !has_unindexed_root_media && recorded_mounts.is_some()
+        && known_directories_unchanged_cancellable(&previous, cancel)?
+    {
         tracing::info!(
             library_id = %library.id,
             dirs = previous.len(),
@@ -78,6 +107,10 @@ pub fn refresh_library_cancellable(
 
     let mut plan = plan_directories_cancellable(library, &excluded, &previous, cancel)?;
     if deep_scan_due { plan.bootstrap = true; }
+    // Keep disconnected mounts recorded until they return or their directory is removed.
+    for mount in &offline.0 {
+        if !plan.mount_points.contains(mount) { plan.mount_points.push(mount.clone()); }
+    }
     db.verify_library_root(library)?;
 
     tracing::info!(
@@ -95,6 +128,7 @@ pub fn refresh_library_cancellable(
     if plan.has_removals() {
         let mut missing = Vec::new();
         for path in &plan.removed {
+            if offline.covers(path) { continue; }
             match std::fs::metadata(path) {
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                     missing.push(path.clone())
@@ -115,7 +149,7 @@ pub fn refresh_library_cancellable(
 
     // SCAN-14: nothing added/changed (and bootstrap false) → persist plan, no file walk.
     if !plan.needs_file_scan() && !has_unindexed_root_media {
-        db.upsert_scan_states(&plan.to_scan_states(&library.id))?;
+        persist_scan_plan(db, library, &plan)?;
         report.early_exit = true;
         on_progress(ScanProgress {
             discovered_count: 0,
@@ -135,7 +169,7 @@ pub fn refresh_library_cancellable(
         }
     }
     if scan_roots.is_empty() {
-        db.upsert_scan_states(&plan.to_scan_states(&library.id))?;
+        persist_scan_plan(db, library, &plan)?;
         report.early_exit = true;
         on_progress(ScanProgress {
             discovered_count: 0,
@@ -166,7 +200,7 @@ pub fn refresh_library_cancellable(
             let mut missing = Vec::new();
             for item in db.list_media_items(&library.id)? {
                 let path = std::path::Path::new(&item.file_path);
-                if !scan_roots.iter().any(|root| path.starts_with(root)) {
+                if !scan_roots.iter().any(|root| path.starts_with(root)) || offline.covers(&item.file_path) {
                     continue;
                 }
                 match std::fs::metadata(path) {
@@ -238,7 +272,9 @@ pub fn refresh_library_cancellable(
             super::check_cancel(cancel)?;
             for item in &existing_items {
                 super::check_cancel(cancel)?;
-                if super::shows::existing_show_touched_by_roots(&item.folder_path, &scan_roots) {
+                if super::shows::existing_show_touched_by_roots(&item.folder_path, &scan_roots)
+                    && !offline.covers(&item.folder_path)
+                {
                     resync_show_episodes(db, item, &excluded, cancel)?;
                 }
             }
@@ -335,12 +371,12 @@ pub fn refresh_items_cancellable(
         .collect();
     let mut report = ItemRefreshReport::default();
 
-    let mut checked = HashSet::new();
+    let mut checked: std::collections::HashMap<String, OfflineMounts> = std::collections::HashMap::new();
     super::check_cancel(cancel)?;
     for id in item_ids {
         super::check_cancel(cancel)?;
         if let Some(item) = db.get_media_item(id)? {
-            if checked.insert(item.library_id.clone()) {
+            if !checked.contains_key(&item.library_id) {
                 let library = db.get_library(&item.library_id)?.ok_or_else(|| {
                     std::io::Error::new(std::io::ErrorKind::NotFound, "library not found")
                 })?;
@@ -349,6 +385,13 @@ pub fn refresh_items_cancellable(
                     super::check_cancel(cancel)?;
                     entry?;
                 }
+                let recorded = db.library_mount_points(&library.id)?.unwrap_or_default();
+                checked.insert(library.id.clone(), OfflineMounts::check(&recorded)?);
+            }
+            let offline = &checked[&item.library_id];
+            let primary = if item.media_type == MediaType::Movie { &item.file_path } else { &item.folder_path };
+            if offline.covers(primary) {
+                return Err(offline.error(primary));
             }
         }
     }
@@ -432,25 +475,34 @@ fn resync_show_episodes(
 
     let folder = Path::new(&item.folder_path);
     let discovered = discover_episodes_in_show_cancellable(folder, excluded, cancel)?;
+    let mut existing = Vec::new();
+    for season in db.fetch_seasons(&item.id)? {
+        for ep in db.fetch_episodes(&season.id)? {
+            existing.push((season.season_number, ep));
+        }
+    }
+    let bound: HashSet<&str> = existing.iter().map(|(_, ep)| ep.file_path.as_str()).collect();
+    // Two files claiming one season/episode (e.g. two releases of the same episode)
+    // are ambiguous: keep the file already indexed, never abort the whole refresh.
     let mut by_key = std::collections::HashMap::new();
     for episode in &discovered {
-        if by_key
-            .insert((episode.season, episode.episode), episode)
-            .is_some()
-        {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "multiple files have the same season/episode identity",
-            )
-            .into());
+        match by_key.entry((episode.season, episode.episode)) {
+            std::collections::hash_map::Entry::Vacant(slot) => { slot.insert(episode); }
+            std::collections::hash_map::Entry::Occupied(mut slot) => {
+                tracing::warn!(path = %episode.file_path, other = %slot.get().file_path, season = episode.season,
+                    episode = episode.episode, "multiple files have the same season/episode identity");
+                if bound.contains(episode.file_path.as_str()) && !bound.contains(slot.get().file_path.as_str()) {
+                    slot.insert(episode);
+                }
+            }
         }
     }
     let mut removed = Vec::new();
     let mut updated = Vec::new();
-    for season in db.fetch_seasons(&item.id)? {
-        for ep in db.fetch_episodes(&season.id)? {
+    for (season_number, ep) in existing {
+        {
             super::check_cancel(cancel)?;
-            let found = by_key.remove(&(season.season_number, ep.episode_number));
+            let found = by_key.remove(&(season_number, ep.episode_number));
             // Remote-only metadata has no local file to declare missing.
             if ep.file_path.is_empty() {
                 if let Some(found) = found {
@@ -485,6 +537,7 @@ fn persist_scan_plan(
     // Save the state observed BEFORE enumeration, never acknowledge mutations
     // arriving during the scan as if their files had already been inspected.
     db.upsert_scan_states(&plan.to_scan_states(&library.id))?;
+    db.set_library_mount_points(&library.id, &plan.mount_points)?;
     Ok(())
 }
 
@@ -505,6 +558,39 @@ mod tests {
 
     fn movie_library(root: &std::path::Path) -> Library {
         Library::new("Movies", root.display().to_string(), MediaType::Movie)
+    }
+
+    #[test]
+    fn offline_sub_mount_keeps_entries_until_its_directory_is_removed() {
+        let dir = tempdir().unwrap(); let root = dir.path().join("lib");
+        let nas = root.join("NAS");
+        std::fs::create_dir_all(nas.join("Film (2020)")).unwrap();
+        std::fs::write(nas.join("Film (2020)/Film.mkv"), "video").unwrap();
+        std::fs::create_dir_all(root.join("Local")).unwrap();
+        std::fs::write(root.join("Local/Local.mkv"), "video").unwrap();
+        let db = AppDatabase::open_in_memory().unwrap(); let lib = movie_library(&root);
+        db.insert_library(&lib).unwrap(); refresh_library(&db, &lib, &[], |_| {}).unwrap();
+        assert_eq!(db.library_mount_points(&lib.id).unwrap(), Some(vec![]));
+        // Pretend NAS was a separate mount on the last walk, then it disconnects and
+        // leaves the empty mount-point directory behind.
+        let nas_key = canonicalize_lossy(&nas);
+        db.set_library_mount_points(&lib.id, std::slice::from_ref(&nas_key)).unwrap();
+        std::fs::remove_dir_all(&nas).unwrap(); std::fs::create_dir(&nas).unwrap();
+        std::fs::write(root.join("Local/New.mkv"), "video").unwrap();
+
+        let report = refresh_library(&db, &lib, &[], |_| {}).unwrap();
+        assert_eq!(report.removed_item_count, 0);
+        assert_eq!(report.new_item_count, 1, "the rest of the library still refreshes");
+        let items = db.list_media_items(&lib.id).unwrap();
+        let film = items.iter().find(|i| i.title == "Film").unwrap().id.clone();
+        assert_eq!(items.len(), 3);
+        assert_eq!(db.library_mount_points(&lib.id).unwrap(), Some(vec![nas_key]));
+        assert!(refresh_items(&db, std::slice::from_ref(&film), &[]).is_err());
+
+        std::fs::remove_dir(&nas).unwrap(); // mount retired on purpose
+        let report = refresh_library(&db, &lib, &[], |_| {}).unwrap();
+        assert_eq!(report.removed_item_count, 1);
+        assert_eq!(db.library_mount_points(&lib.id).unwrap(), Some(vec![]));
     }
 
     #[test]
@@ -624,8 +710,39 @@ mod tests {
         let sid = db.fetch_seasons(&item.id).unwrap().remove(0).id;
         let before = db.fetch_episodes(&sid).unwrap().remove(0).file_path;
         std::fs::write(show.join("S01E01.mp4"), b"alternate").unwrap();
-        assert!(refresh_items(&db, &[item.id], &[]).is_err());
-        assert_eq!(db.fetch_episodes(&sid).unwrap().remove(0).file_path, before);
+        // Ambiguity is logged, the indexed file wins, and the refresh itself succeeds.
+        refresh_items(&db, std::slice::from_ref(&item.id), &[]).unwrap();
+        refresh_library(&db, &library, &[], |_| {}).unwrap();
+        let eps = db.fetch_episodes(&sid).unwrap();
+        assert_eq!(eps.len(), 1);
+        assert_eq!(eps[0].file_path, before);
+    }
+
+    #[test]
+    fn unnumbered_extras_do_not_take_parsed_episode_slots() {
+        let dir = tempdir().unwrap();
+        let show = dir.path().join("Show");
+        std::fs::create_dir(&show).unwrap();
+        for name in ["Behind the Scenes.mkv", "Show.S01E01.mkv", "Show.S01E02.mkv"] {
+            std::fs::write(show.join(name), b"x").unwrap();
+        }
+        let db = AppDatabase::open_in_memory().unwrap();
+        let library = Library::new("TV", dir.path().to_string_lossy(), MediaType::TvShow);
+        db.insert_library(&library).unwrap();
+        refresh_library(&db, &library, &[], |_| {}).unwrap();
+        let item = db.list_media_items(&library.id).unwrap().remove(0);
+        let sid = db.fetch_seasons(&item.id).unwrap().remove(0).id;
+        let mut eps: Vec<_> = db.fetch_episodes(&sid).unwrap().into_iter()
+            .map(|e| (e.episode_number, std::path::Path::new(&e.file_path).file_name().unwrap().to_string_lossy().into_owned()))
+            .collect();
+        eps.sort();
+        assert_eq!(eps, vec![
+            (1, "Show.S01E01.mkv".to_string()),
+            (2, "Show.S01E02.mkv".to_string()),
+            (3, "Behind the Scenes.mkv".to_string()),
+        ]);
+        refresh_items(&db, std::slice::from_ref(&item.id), &[]).unwrap();
+        assert_eq!(db.fetch_episodes(&sid).unwrap().len(), 3);
     }
 
     #[test]

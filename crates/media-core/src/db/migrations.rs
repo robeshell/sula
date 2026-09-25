@@ -2,7 +2,7 @@
 
 use rusqlite::{Connection, OptionalExtension};
 
-const SCHEMA_VERSION: i32 = 3;
+const SCHEMA_VERSION: i32 = 4;
 
 pub fn migrate(conn: &Connection) -> rusqlite::Result<()> {
     conn.execute_batch(
@@ -164,6 +164,19 @@ pub fn migrate(conn: &Connection) -> rusqlite::Result<()> {
             library_id TEXT PRIMARY KEY REFERENCES libraries(id) ON DELETE CASCADE,
             root_path TEXT NOT NULL, identity TEXT NOT NULL
         );")?;
+        tx.execute("INSERT INTO schema_migrations (version, applied_at) VALUES (?1, datetime('now'))", [3])?;
+        tx.commit()?;
+    }
+    if current < 4 {
+        // Sub-mounts under a library root: `paths` is a JSON array; no row means the
+        // library was never walked with mount detection yet.
+        let tx = conn.unchecked_transaction()?;
+        tx.execute_batch("CREATE TABLE library_mount_points (
+            library_id TEXT PRIMARY KEY REFERENCES libraries(id) ON DELETE CASCADE,
+            paths TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_tv_seasons_media_item ON tv_seasons(mediaItemId);
+        CREATE INDEX IF NOT EXISTS idx_tv_episodes_season ON tv_episodes(seasonId);")?;
         tx.execute("INSERT INTO schema_migrations (version, applied_at) VALUES (?1, datetime('now'))", [SCHEMA_VERSION])?;
         tx.commit()?;
     }
@@ -178,7 +191,7 @@ mod tests {
     #[test]
     fn root_identity_upgrade_rolls_back_and_retries() {
         let conn = Connection::open_in_memory().unwrap(); migrate(&conn).unwrap();
-        conn.execute_batch("DROP TABLE library_root_identity; DELETE FROM schema_migrations WHERE version=3;
+        conn.execute_batch("DROP TABLE library_mount_points; DROP TABLE library_root_identity; DELETE FROM schema_migrations WHERE version>=3;
             CREATE TRIGGER fail_v3 BEFORE INSERT ON schema_migrations WHEN NEW.version=3 BEGIN SELECT RAISE(ABORT, 'injected'); END;").unwrap();
         assert!(migrate(&conn).is_err());
         let count: i64 = conn.query_row("SELECT COUNT(*) FROM sqlite_master WHERE name='library_root_identity'", [], |r| r.get(0)).unwrap();
@@ -190,7 +203,7 @@ mod tests {
     fn journal_upgrade_rolls_back_and_retries_from_v1() {
         let conn = Connection::open_in_memory().unwrap();
         migrate(&conn).unwrap();
-        conn.execute_batch("DROP TABLE library_root_identity; DROP TABLE media_operation_journal; DELETE FROM schema_migrations WHERE version>=2;
+        conn.execute_batch("DROP TABLE library_mount_points; DROP TABLE library_root_identity; DROP TABLE media_operation_journal; DELETE FROM schema_migrations WHERE version>=2;
             CREATE TRIGGER fail_v2 BEFORE INSERT ON schema_migrations WHEN NEW.version=2 BEGIN SELECT RAISE(ABORT, 'injected'); END;").unwrap();
         assert!(migrate(&conn).is_err());
         let count: i64 = conn.query_row("SELECT COUNT(*) FROM sqlite_master WHERE name='media_operation_journal'", [], |r| r.get(0)).unwrap();
@@ -214,6 +227,17 @@ mod tests {
     }
 
     #[test]
+    fn mount_points_upgrade_rolls_back_and_retries() {
+        let conn = Connection::open_in_memory().unwrap(); migrate(&conn).unwrap();
+        conn.execute_batch("DROP TABLE library_mount_points; DROP INDEX idx_tv_seasons_media_item; DELETE FROM schema_migrations WHERE version=4;
+            CREATE TRIGGER fail_v4 BEFORE INSERT ON schema_migrations WHEN NEW.version=4 BEGIN SELECT RAISE(ABORT, 'injected'); END;").unwrap();
+        assert!(migrate(&conn).is_err());
+        let count: i64 = conn.query_row("SELECT COUNT(*) FROM sqlite_master WHERE name IN ('library_mount_points','idx_tv_seasons_media_item')", [], |r| r.get(0)).unwrap();
+        assert_eq!(count, 0);
+        conn.execute_batch("DROP TRIGGER fail_v4").unwrap(); migrate(&conn).unwrap();
+    }
+
+    #[test]
     fn migrates_empty_database() {
         let conn = Connection::open_in_memory().unwrap();
         migrate(&conn).unwrap();
@@ -224,7 +248,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(version, 3);
+        assert_eq!(version, 4);
 
         let table_count: i32 = conn
             .query_row(

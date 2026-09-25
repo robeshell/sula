@@ -152,7 +152,19 @@ struct DiskConfig {
 pub struct ConfigStore {
     path: PathBuf,
     credential_ref: Option<String>,
+    /// Keychain read failed at load; `credential_ref` is kept until the user enters new keys.
+    keys_unloaded: bool,
     pub config: AppConfig,
+}
+
+/// Reads only `uiLocale` so startup errors can be localized even when full loading fails.
+pub fn peek_ui_locale(path: &Path) -> Option<String> {
+    let raw = fs::read_to_string(path).ok()?;
+    raw.parse::<toml::Table>().ok()?.get("uiLocale")?.as_str().map(str::to_owned)
+}
+
+fn load_api_keys(id: &str) -> anyhow::Result<ApiKeysConfig> {
+    Ok(serde_json::from_str(&crate::credentials::get(id)?)?)
 }
 
 impl ConfigStore {
@@ -160,12 +172,21 @@ impl ConfigStore {
         let path = path.as_ref().to_path_buf();
         let mut credential_ref = None;
         let mut needs_save = false;
+        let mut keys_unloaded = false;
         let config = match fs::read_to_string(&path) {
             Ok(raw) => match toml::from_str::<DiskConfig>(&raw) {
                 Ok(mut disk) => {
                     credential_ref = disk.credential_ref;
                     if let Some(id) = &credential_ref {
-                        disk.config.api_keys = serde_json::from_str(&crate::credentials::get(id)?)?;
+                        match load_api_keys(id) {
+                            Ok(keys) => disk.config.api_keys = keys,
+                            Err(error) => {
+                                tracing::warn!(%error, "stored API keys unavailable; continuing without them");
+                                keys_unloaded = true;
+                                disk.config.api_keys = ApiKeysConfig::default();
+                                disk.config.config_notice = Some("err.credentialsUnavailable".into());
+                            }
+                        }
                     } else if disk.config.api_keys != ApiKeysConfig::default() { needs_save = true; }
                     disk.config
                 }
@@ -180,14 +201,16 @@ impl ConfigStore {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => { needs_save = true; AppConfig::default() },
             Err(e) => return Err(e.into()),
         };
-        let mut store = Self { path, config, credential_ref };
+        let mut store = Self { path, config, credential_ref, keys_unloaded };
         if needs_save { store.save()?; }
         Ok(store)
     }
 
     pub fn save(&mut self) -> anyhow::Result<()> {
         if let Some(parent) = self.path.parent() { fs::create_dir_all(parent)?; }
-        let next_ref = if self.config.api_keys != ApiKeysConfig::default() {
+        // Keys that never loaded are still empty placeholders; keep the stored record untouched.
+        let keep_ref = self.keys_unloaded && self.config.api_keys == ApiKeysConfig::default();
+        let next_ref = if keep_ref { self.credential_ref.clone() } else if self.config.api_keys != ApiKeysConfig::default() {
             let id = uuid::Uuid::new_v4().to_string();
             crate::credentials::set(&id, &serde_json::to_string(&self.config.api_keys)?)?;
             Some(id)
@@ -209,14 +232,16 @@ impl ConfigStore {
             Ok(())
         })();
         if let Err(error) = result {
-            if let Some(id) = next_ref { crate::credentials::remove(&id); }
+            if !keep_ref { if let Some(id) = next_ref { crate::credentials::remove(&id); } }
             return Err(error);
         }
+        if keep_ref { return Ok(()); }
         // The old record remains valid until the new file reference is committed.
         if let Some(old) = self.credential_ref.take() {
             crate::credentials::remove(&old);
         }
         self.credential_ref = next_ref;
+        self.keys_unloaded = false;
         Ok(())
     }
 }
@@ -270,5 +295,59 @@ mod storage_tests {
         assert_eq!(ConfigStore::load_or_default(&path).unwrap().config.api_keys.tmdb, "old-test-key");
         crate::credentials::remove(&old); fs::remove_dir_all(dir).unwrap();
     }
-
+    fn dangling_ref_config(dir: &Path) -> (PathBuf, String) {
+        let path = dir.join("config.toml"); let id = format!("missing-{}", uuid::Uuid::new_v4());
+        let config = AppConfig { ui_locale: "en".into(), ..AppConfig::default() };
+        fs::write(&path, toml::to_string(&DiskConfig { config, credential_ref: Some(id.clone()) }).unwrap()).unwrap();
+        (path, id)
+    }
+    #[test]
+    fn unavailable_credentials_degrade_without_touching_disk() {
+        let dir = folder(); let (path, id) = dangling_ref_config(&dir);
+        let original = fs::read(&path).unwrap();
+        let store = ConfigStore::load_or_default(&path).unwrap();
+        assert_eq!(store.config.api_keys, ApiKeysConfig::default());
+        assert!(store.keys_unloaded);
+        assert_eq!(store.credential_ref.as_deref(), Some(id.as_str()));
+        assert_eq!(store.config.config_notice.as_deref(), Some("err.credentialsUnavailable"));
+        assert_eq!(fs::read(&path).unwrap(), original);
+        fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
+    fn saving_other_settings_keeps_unloaded_credential_ref() {
+        let dir = folder(); let (path, id) = dangling_ref_config(&dir);
+        let mut store = ConfigStore::load_or_default(&path).unwrap();
+        store.config.scrape_concurrency = 2; store.save().unwrap();
+        assert!(crate::credentials::get(&id).is_err());
+        assert_eq!(store.credential_ref.as_deref(), Some(id.as_str()));
+        let disk: DiskConfig = toml::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(disk.credential_ref.as_deref(), Some(id.as_str()));
+        assert_eq!(disk.config.scrape_concurrency, 2);
+        assert!(disk.config.config_notice.is_none());
+        // Keychain comes back on a later launch: the original keys are still reachable.
+        crate::credentials::set(&id, &serde_json::to_string(&ApiKeysConfig { tmdb: "restored-test-key".into(), ..Default::default() }).unwrap()).unwrap();
+        let reloaded = ConfigStore::load_or_default(&path).unwrap();
+        assert_eq!(reloaded.config.api_keys.tmdb, "restored-test-key");
+        assert!(!reloaded.keys_unloaded);
+        crate::credentials::remove(&id); fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
+    fn entering_keys_after_unavailable_load_replaces_ref() {
+        let dir = folder(); let (path, id) = dangling_ref_config(&dir);
+        let mut store = ConfigStore::load_or_default(&path).unwrap();
+        store.config.api_keys.tmdb = "fresh-test-key".into(); store.save().unwrap();
+        let next = store.credential_ref.clone().unwrap();
+        assert_ne!(next, id);
+        assert!(!store.keys_unloaded);
+        assert_eq!(ConfigStore::load_or_default(&path).unwrap().config.api_keys.tmdb, "fresh-test-key");
+        crate::credentials::remove(&next); fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
+    fn peek_ui_locale_reads_camel_case_key() {
+        let dir = folder(); let path = dir.join("config.toml");
+        assert_eq!(peek_ui_locale(&path), None);
+        fs::write(&path, "uiLocale = \"ja\"\nscrapeConcurrency = \"broken\"\n").unwrap();
+        assert_eq!(peek_ui_locale(&path).as_deref(), Some("ja"));
+        fs::remove_dir_all(dir).unwrap();
+    }
 }

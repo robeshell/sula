@@ -22,7 +22,19 @@ pub struct AppState {
     pub logs: Arc<LogStore>,
     pub data_dir: PathBuf,
     pub keep_running_on_close: AtomicBool,
+    pub tray_enabled: AtomicBool,
 }
+
+#[derive(Debug)]
+pub struct AlreadyRunning;
+
+impl std::fmt::Display for AlreadyRunning {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("another Sula instance is using this library database")
+    }
+}
+
+impl std::error::Error for AlreadyRunning {}
 
 impl AppState {
     pub fn bootstrap(logs: Arc<LogStore>) -> anyhow::Result<Self> {
@@ -30,7 +42,7 @@ impl AppState {
         std::fs::create_dir_all(&data_dir)?;
 
         let instance_lock = std::fs::OpenOptions::new().read(true).write(true).create(true).truncate(false).open(data_dir.join("application.lock"))?;
-        instance_lock.try_lock().map_err(|_| anyhow::anyhow!("another Sula instance is using this library database"))?;
+        instance_lock.try_lock().map_err(|_| AlreadyRunning)?;
         let db_path = data_dir.join("sula.sqlite3");
         let db = Arc::new(AppDatabase::open(&db_path)?);
         tracing::info!(path = %db_path.display(), "database opened");
@@ -38,6 +50,7 @@ impl AppState {
         let config_path = data_dir.join("config.toml");
         let config_store = ConfigStore::load_or_default(&config_path)?;
         let keep_running_on_close = AtomicBool::new(config_store.config.keep_running_on_close);
+        let tray_enabled = AtomicBool::new(config_store.config.tray_enabled);
         let config = Arc::new(Mutex::new(config_store));
 
         if let Err(error) = renamer::recover_media_operations(&db) {
@@ -64,11 +77,12 @@ impl AppState {
             logs,
             data_dir,
             keep_running_on_close,
+            tray_enabled,
         })
     }
 }
 
-fn app_data_dir() -> anyhow::Result<PathBuf> {
+pub fn app_data_dir() -> anyhow::Result<PathBuf> {
     let base = dirs::data_dir().ok_or_else(|| anyhow::anyhow!("no data directory"))?;
     Ok(base.join("sula"))
 }

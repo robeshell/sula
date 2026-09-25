@@ -4,6 +4,7 @@ use media_core::MediaType;
 use reqwest::Client;
 use serde::Deserialize;
 
+use crate::http::{reqwest_err, send_with_retry};
 use crate::matching::relevance_score;
 use crate::types::{parse_source_numeric_id, ArtworkUrls, ScrapedMetadata, SearchResult};
 
@@ -44,17 +45,13 @@ impl OmdbScraper {
             urlencoding::encode(self.api_key.trim()),
             urlencoding::encode(query)
         );
-        let data: SearchResponse = self
-            .client
-            .get(&url)
-            .send()
-            .await
-            .map_err(|e| e.to_string())?
+        let data: SearchResponse = send_with_retry(self.client.get(&url))
+            .await?
             .error_for_status()
-            .map_err(|e| e.to_string())?
+            .map_err(reqwest_err)?
             .json()
             .await
-            .map_err(|e| e.to_string())?;
+            .map_err(reqwest_err)?;
         if data.response.eq_ignore_ascii_case("false") {
             return Ok(Vec::new());
         }
@@ -106,17 +103,13 @@ impl OmdbScraper {
             urlencoding::encode(self.api_key.trim()),
             urlencoding::encode(imdb)
         );
-        let data: DetailResponse = self
-            .client
-            .get(&url)
-            .send()
-            .await
-            .map_err(|e| e.to_string())?
+        let data: DetailResponse = send_with_retry(self.client.get(&url))
+            .await?
             .error_for_status()
-            .map_err(|e| e.to_string())?
+            .map_err(reqwest_err)?
             .json()
             .await
-            .map_err(|e| e.to_string())?;
+            .map_err(reqwest_err)?;
         if data.response.as_deref().unwrap_or("").eq_ignore_ascii_case("false") {
             return Err(data
                 .error

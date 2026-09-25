@@ -43,6 +43,14 @@ type FileEntry = {
   path: string;
 };
 
+type CompletedRename = { originalPath: string; newPath: string };
+
+type RenamerOutcome = {
+  renames: CompletedRename[];
+  error: string | null;
+  indexSyncFailures: number;
+};
+
 type PreviewResult = {
   id: string;
   originalName: string;
@@ -104,6 +112,9 @@ export function RenamerPage() {
   const [selectedPreset, setSelectedPreset] = useState("");
   const [presetName, setPresetName] = useState("");
   const [rulesReady, setRulesReady] = useState(false);
+  // Execution recomputes names from `files` + `rules` on the backend; only allow it
+  // once the visible preview reflects exactly those inputs.
+  const [previewCurrent, setPreviewCurrent] = useState(true);
 
   const executableCount = useMemo(
     () => previews.filter(isExecutable).length,
@@ -141,10 +152,14 @@ export function RenamerPage() {
 
   useEffect(() => {
     let cancelled = false;
+    setPreviewCurrent(false);
     const timer = window.setTimeout(() => {
       void (async () => {
         if (files.length === 0) {
-          if (!cancelled) setPreviews([]);
+          if (!cancelled) {
+            setPreviews([]);
+            setPreviewCurrent(true);
+          }
           return;
         }
         try {
@@ -152,7 +167,10 @@ export function RenamerPage() {
             files,
             pipeline: { rules },
           });
-          if (!cancelled) setPreviews(out);
+          if (!cancelled) {
+            setPreviews(out);
+            setPreviewCurrent(true);
+          }
         } catch (err) {
           if (!cancelled) setMessage(String(err));
         }
@@ -194,28 +212,33 @@ export function RenamerPage() {
     }
   }
 
+  async function applyOutcome(outcome: RenamerOutcome, doneKey: string) {
+    const lines = [t(doneKey, { count: outcome.renames.length })];
+    if (outcome.indexSyncFailures > 0) {
+      lines.push(t("renamer.indexSyncFailed", { count: outcome.indexSyncFailures }));
+    }
+    if (outcome.error) lines.push(outcome.error);
+    setMessage(lines.join(" "));
+    setSnapshotCount(await invoke<number>("renamer_snapshot_count"));
+    if (outcome.renames.length === 0) return;
+    // Follow moved entries so the list and preview keep pointing at real files.
+    const moved = new Map(outcome.renames.map((r) => [r.originalPath, r.newPath]));
+    if (!files.some((f) => moved.has(f.path))) return;
+    const refreshed = await invoke<FileEntry[]>("renamer_collect_files", {
+      paths: files.map((f) => moved.get(f.path) ?? f.path),
+    });
+    setFiles(refreshed);
+  }
+
   async function runExecute() {
     setMessage(null);
     try {
       setBusy(true);
-      const done = await invoke<{ originalPath: string; newPath: string }[]>(
-        "renamer_execute",
-        { previews },
-      );
-      const count = await invoke<number>("renamer_snapshot_count");
-      setSnapshotCount(count);
-      setMessage(t("renamer.executed", { count: done.length }));
-      // Refresh entries from new paths.
-      const nextPaths = previews.map((p) => {
-        if (!isExecutable(p)) return p.path;
-        const parent = p.path.replace(/[/\\][^/\\]+$/, "");
-        const sep = p.path.includes("\\") ? "\\" : "/";
-        return `${parent}${sep}${p.newName}`;
+      const outcome = await invoke<RenamerOutcome>("renamer_execute", {
+        files,
+        pipeline: { rules },
       });
-      const refreshed = await invoke<FileEntry[]>("renamer_collect_files", {
-        paths: nextPaths,
-      });
-      setFiles(refreshed);
+      await applyOutcome(outcome, "renamer.executed");
     } catch (err) {
       setMessage(String(err));
     } finally {
@@ -227,10 +250,8 @@ export function RenamerPage() {
     setMessage(null);
     try {
       setBusy(true);
-      const n = await invoke<number>("renamer_undo_last");
-      const count = await invoke<number>("renamer_snapshot_count");
-      setSnapshotCount(count);
-      setMessage(t("renamer.undone", { count: n }));
+      const outcome = await invoke<RenamerOutcome>("renamer_undo_last");
+      await applyOutcome(outcome, "renamer.undone");
     } catch (err) {
       setMessage(String(err));
     } finally {
@@ -330,7 +351,7 @@ export function RenamerPage() {
           </Button>
           <Button variant="default" size="sm"
             type="button"
-            disabled={busy || executableCount === 0}
+            disabled={busy || !previewCurrent || executableCount === 0}
             onClick={() => void runExecute()}
           >
             {t("renamer.execute")} ({executableCount})

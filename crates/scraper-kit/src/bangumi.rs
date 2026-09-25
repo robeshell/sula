@@ -3,6 +3,7 @@ use reqwest::Client;
 use serde::Deserialize;
 use serde_json::Value;
 
+use crate::http::{reqwest_err, send_with_retry, RATE_LIMITED};
 use crate::matching::relevance_score;
 use crate::types::{
     parse_source_numeric_id, ArtworkUrls, ScrapedEpisode, ScrapedMetadata, ScrapedSeason,
@@ -107,7 +108,12 @@ impl BangumiScraper {
         let url = format!("{BASE}/v0/subjects/{id}");
         let detail: SubjectDetail = serde_json::from_value(self.get_json(&url).await?)
             .map_err(|e| e.to_string())?;
-        let episodes = self.fetch_episodes(id).await.unwrap_or_default();
+        // Episodes are best-effort, except a rate limit (retryable) fails the fetch.
+        let episodes = match self.fetch_episodes(id).await {
+            Ok(episodes) => episodes,
+            Err(err) if err == RATE_LIMITED => return Err(err),
+            Err(_) => Vec::new(),
+        };
         let title = detail
             .name_cn
             .clone()
@@ -220,16 +226,14 @@ impl BangumiScraper {
         if !self.api_key.trim().is_empty() {
             req = req.header("Authorization", format!("Bearer {}", self.api_key.trim()));
         }
-        let response = req.send().await.map_err(|e| e.to_string())?;
+        // 429 after retries surfaces as `RATE_LIMITED` from `send_with_retry`.
+        let response = send_with_retry(req).await?;
         let status = response.status();
-        if status.as_u16() == 429 {
-            return Err("rateLimited".into());
-        }
         if !status.is_success() {
             let body = response.text().await.unwrap_or_default();
             return Err(format!("Bangumi HTTP {status}: {body}"));
         }
-        response.json().await.map_err(|e| e.to_string())
+        response.json().await.map_err(reqwest_err)
     }
 }
 

@@ -204,17 +204,29 @@ pub fn scan_shows_under_cancellable(
             status,
         );
 
-        let mut episodes = Vec::new();
-        for (idx, file) in files.into_iter().enumerate() {
-            let season = file.season_from_dir.or(file.parsed.season).unwrap_or(1);
-            let episode = file.parsed.episode.unwrap_or((idx + 1) as i32);
-            episodes.push(ScannedEpisode {
-                season,
-                episode,
-                file_path: canonicalize_lossy(&file.path),
-                title: file.parsed.title,
-            });
-        }
+        let episodes = number_episodes(
+            files
+                .into_iter()
+                .map(|file| NumberedFile {
+                    season: file.season_from_dir.or(file.parsed.season).unwrap_or(1),
+                    episode: file.parsed.episode,
+                    file_path: canonicalize_lossy(&file.path),
+                    title: file.parsed.title,
+                })
+                .collect(),
+        );
+        let mut seen_keys = HashSet::new();
+        let episodes = episodes
+            .into_iter()
+            .filter(|ep| {
+                let unique = seen_keys.insert((ep.season, ep.episode));
+                if !unique {
+                    tracing::warn!(path = %ep.file_path, season = ep.season, episode = ep.episode,
+                        "another file already has this season/episode; not indexed");
+                }
+                unique
+            })
+            .collect();
 
         episodes_map.insert(item.id.clone(), episodes);
         new_items.push(item);
@@ -385,17 +397,43 @@ pub fn discover_episodes_in_show_cancellable(
             .and_then(|n| n.to_str())
             .unwrap_or_default();
         let parsed = FileNameParser::parse(file_name);
-        let season = season_from_dir.or(parsed.season).unwrap_or(1);
-        let episode = parsed.episode.unwrap_or((files.len() + 1) as i32);
-        files.push(ScannedEpisode {
-            season,
-            episode,
+        files.push(NumberedFile {
+            season: season_from_dir.or(parsed.season).unwrap_or(1),
+            episode: parsed.episode,
             file_path: absolute,
             title: parsed.title,
         });
     }
     super::check_cancel(cancel)?;
-    Ok(files)
+    Ok(number_episodes(files))
+}
+
+struct NumberedFile {
+    season: i32,
+    episode: Option<i32>,
+    file_path: String,
+    title: String,
+}
+
+/// Files without a parsed episode number (extras, oddly named releases) take the
+/// next free number in their season in discovery order, so they never land on the
+/// slot of an episode that was parsed explicitly.
+fn number_episodes(files: Vec<NumberedFile>) -> Vec<ScannedEpisode> {
+    let mut used: HashSet<(i32, i32)> = files
+        .iter()
+        .filter_map(|file| file.episode.map(|episode| (file.season, episode)))
+        .collect();
+    files
+        .into_iter()
+        .map(|file| {
+            let episode = file.episode.unwrap_or_else(|| {
+                let next = (1..).find(|n| !used.contains(&(file.season, *n))).unwrap();
+                used.insert((file.season, next));
+                next
+            });
+            ScannedEpisode { season: file.season, episode, file_path: file.file_path, title: file.title }
+        })
+        .collect()
 }
 
 fn resolve_show_root(file_parent: &Path, library_root: &Path) -> (PathBuf, Option<i32>) {

@@ -1,6 +1,6 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState, useSyncExternalStore } from "react";
 
-import { resolvePosterSrc, POSTER_THUMB } from "../lib/posterLoadQueue";
+import { resolvePosterSrc, POSTER_THUMB, subscribePosterCache, posterCacheVersion } from "../lib/posterLoadQueue";
 
 type PosterThumbProps = {
   folderPath: string;
@@ -29,6 +29,7 @@ export function PosterThumb({
   className = "",
   fallbackLabel,
 }: PosterThumbProps) {
+  const cacheVersion = useSyncExternalStore(subscribePosterCache, posterCacheVersion);
   const rootRef = useRef<HTMLDivElement>(null);
   const [visible, setVisible] = useState(false);
   /** undefined = not loaded yet, null = missing, string = url */
@@ -86,7 +87,7 @@ export function PosterThumb({
     return () => {
       cancelled = true;
     };
-  }, [visible, folderPath, posterPath, candidatesKey, width, height, allowFallbacks, posterCandidates]);
+  }, [visible, folderPath, posterPath, candidatesKey, width, height, allowFallbacks, cacheVersion]);
 
   return (
     <div ref={rootRef} className={className}>

@@ -1,3 +1,11 @@
+import { confirmAction } from "../lib/confirmation";
+import { motion } from "motion/react";
+import { NativeSelect } from "./ui/native-select";
+import { Switch } from "./ui/switch";
+import { Tabs, TabsContent, TabsList, TabsTrigger } from "./ui/tabs";
+import { Button } from "./ui/button";
+import { Input } from "./ui/input";
+import { invalidatePosterCache } from "../lib/posterLoadQueue";
 import { useEffect, useState, type CSSProperties, type ReactNode } from "react";
 import { useTranslation } from "react-i18next";
 import { invoke } from "@tauri-apps/api/core";
@@ -13,7 +21,7 @@ import {
 } from "../lib/appearance";
 import { useAppStore, type Library, type MediaType } from "../store/appStore";
 
-/** In-app settings page (brand settings-page — not a floating dialog). */
+/** In-app settings page. */
 export function SettingsPage({ onClose }: { onClose: () => void }) {
   const { t } = useTranslation();
 
@@ -26,50 +34,55 @@ export function SettingsPage({ onClose }: { onClose: () => void }) {
   }, [onClose]);
 
   return (
-    <div className="kg-settings-page min-h-0 flex-1 overflow-auto">
-      <div className="kg-page-shell">
+    <motion.div initial={{ opacity: 0, y: 4 }} animate={{ opacity: 1, y: 0 }} className="kg-settings-page min-h-0 flex-1 overflow-auto">
+      <Tabs defaultValue="appearance" className="kg-page-shell w-full">
         <header className="kg-page-header">
           <div className="min-w-0 flex-1">
             <h2 className="kg-page-header-title">{t("settings.title")}</h2>
           </div>
         </header>
 
-        <section className="kg-settings-section">
+        <TabsList className="mb-6 h-auto flex-wrap justify-start">
+          {[["appearance", "appearanceLang"], ["library", "library"], ["scrape", "scrape"], ["rename", "rename"], ["system", "system"]].map(([value, label]) => <TabsTrigger key={value} value={value}>{t(`settings.section.${label}`)}</TabsTrigger>)}
+        </TabsList>
+
+        <TabsContent value="appearance" className="kg-settings-section mt-0">
           <p className="kg-section-label">{t("settings.section.appearanceLang")}</p>
           <div className="kg-settings-group">
             <AppearanceBlock />
             <LanguageRow />
           </div>
-        </section>
+        </TabsContent>
 
-        <section className="kg-settings-section">
+        <TabsContent value="library" className="kg-settings-section mt-0">
           <p className="kg-section-label">{t("settings.section.library")}</p>
           <LibrarySection />
           <p className="kg-section-label mt-3">{t("settings.block.exclusions")}</p>
           <ScrapeExclusionsSection />
-        </section>
+        </TabsContent>
 
-        <section className="kg-settings-section">
+        <TabsContent value="scrape" className="kg-settings-section mt-0">
           <p className="kg-section-label">{t("settings.section.scrape")}</p>
           <ApiKeysSection />
           <p className="kg-section-label mt-3">{t("settings.block.nfo")}</p>
           <NfoSection />
-        </section>
+        </TabsContent>
 
-        <section className="kg-settings-section">
+        <TabsContent value="rename" className="kg-settings-section mt-0">
           <p className="kg-section-label">{t("settings.section.rename")}</p>
           <RenameSection />
-        </section>
+        </TabsContent>
 
-        <section className="kg-settings-section">
+        <TabsContent value="system" className="kg-settings-section mt-0">
           <p className="kg-section-label">{t("settings.section.system")}</p>
           <div className="kg-settings-group">
+            <KeepRunningOnCloseRow />
             <TrayRow />
             <CacheRow />
           </div>
-        </section>
-      </div>
-    </div>
+        </TabsContent>
+      </Tabs>
+    </motion.div>
   );
 }
 
@@ -77,25 +90,17 @@ export function SettingsPage({ onClose }: { onClose: () => void }) {
 export const SettingsModal = SettingsPage;
 
 function KgSwitch({
+  label,
   checked,
   disabled,
   onChange,
 }: {
+  label: string;
   checked: boolean;
   disabled?: boolean;
   onChange: (next: boolean) => void;
 }) {
-  return (
-    <label className="kg-switch">
-      <input
-        type="checkbox"
-        checked={checked}
-        disabled={disabled}
-        onChange={(e) => onChange(e.target.checked)}
-      />
-      <span className="kg-switch-track" aria-hidden />
-    </label>
-  );
+  return <Switch aria-label={label} checked={checked} disabled={disabled} onCheckedChange={onChange} />;
 }
 
 function SettingsRow({
@@ -181,14 +186,15 @@ function AppearanceBlock() {
       </div>
       <div>
         <p className="kg-settings-block-label">{t("settings.appearance.accent")}</p>
-        <div className="kg-accent-strip" role="listbox" aria-label={t("settings.appearance.accent")}>
+        <div className="kg-accent-strip" role="group" aria-label={t("settings.appearance.accent")}>
           {ACCENT_PRESETS.map((opt) => (
-            <button
+            <Button variant="plain" size="none"
               key={opt.id}
               type="button"
               className="kg-accent-swatch"
               style={{ ["--swatch" as string]: opt.color }}
               data-selected={accent === opt.id}
+              aria-pressed={accent === opt.id}
               disabled={saving}
               aria-label={t(`settings.appearance.accent.${opt.id}`)}
               title={t(`settings.appearance.accent.${opt.id}`)}
@@ -216,11 +222,12 @@ function SkinCard({
 }) {
   if (id === "system") {
     return (
-      <button
+      <Button variant="plain" size="none"
         type="button"
         className="kg-skin-card"
         data-variant="system"
         data-selected={selected}
+      aria-pressed={selected}
         disabled={disabled}
         onClick={onSelect}
       >
@@ -259,7 +266,7 @@ function SkinCard({
           </div>
         </div>
         <span className="kg-skin-card-label">{label}</span>
-      </button>
+      </Button>
     );
   }
 
@@ -283,7 +290,7 @@ function SkinCard({
             lineMuted: "rgb(255 255 255 / 0.32)",
           }
         : {
-            // Brand default skin canvas / elevated (kai-brand-design skins.json)
+            // Application light theme preview.
             canvas: "#f7f9fc",
             elevated: "#ffffff",
             border: "rgb(0 0 0 / 0.08)",
@@ -293,10 +300,11 @@ function SkinCard({
           };
 
   return (
-    <button
+    <Button variant="plain" size="none"
       type="button"
       className="kg-skin-card"
       data-selected={selected}
+      aria-pressed={selected}
       disabled={disabled}
       onClick={onSelect}
     >
@@ -318,7 +326,7 @@ function SkinCard({
         <MiniChrome />
       </div>
       <span className="kg-skin-card-label">{label}</span>
-    </button>
+    </Button>
   );
 }
 
@@ -370,8 +378,7 @@ function LanguageRow() {
     <SettingsRow
       title={t("settings.language.label")}
       trailing={
-        <select
-          className="kg-select kg-field-compact"
+        <NativeSelect
           value={locale}
           disabled={saving}
           onChange={(e) => void save(e.target.value)}
@@ -379,7 +386,7 @@ function LanguageRow() {
           <option value="zh-Hans">{t("lang.zh")}</option>
           <option value="en">{t("lang.en")}</option>
           <option value="ja">{t("lang.ja")}</option>
-        </select>
+        </NativeSelect>
       }
     />
   );
@@ -394,6 +401,7 @@ function CacheRow() {
     setClearing(true);
     try {
       const n = await invoke<number>("clear_thumbnail_cache");
+      invalidatePosterCache();
       showToast(t("settings.cache.cleared", { count: n }));
     } catch (err) {
       showToast(String(err));
@@ -406,14 +414,14 @@ function CacheRow() {
     <SettingsRow
       title={t("settings.cache.thumbs")}
       trailing={
-        <button
+        <Button variant="ghost" size="sm"
           type="button"
-          className="kg-btn kg-btn-toolbar shrink-0"
+          className="shrink-0"
           disabled={clearing}
           onClick={() => void clearThumbs()}
         >
           {t("settings.cache.clear")}
-        </button>
+        </Button>
       }
     />
   );
@@ -455,7 +463,63 @@ function TrayRow() {
   return (
     <SettingsRow
       title={t("settings.tray.enabled")}
-      trailing={<KgSwitch checked={trayEnabled} disabled={saving} onChange={(v) => void save(v)} />}
+      trailing={
+        <KgSwitch
+          label={t("settings.tray.enabled")}
+          checked={trayEnabled}
+          disabled={saving}
+          onChange={(v) => void save(v)}
+        />
+      }
+    />
+  );
+}
+
+function KeepRunningOnCloseRow() {
+  const { t } = useTranslation();
+  const showToast = useAppStore((s) => s.showToast);
+  const [keepRunning, setKeepRunning] = useState(true);
+  const [saving, setSaving] = useState(false);
+
+  useEffect(() => {
+    void (async () => {
+      const config = await invoke<{ keepRunningOnClose?: boolean }>("get_config");
+      setKeepRunning(config.keepRunningOnClose ?? true);
+    })();
+  }, []);
+
+  const save = async (next: boolean) => {
+    setKeepRunning(next);
+    setSaving(true);
+    try {
+      const config = await invoke<Record<string, unknown>>("get_config");
+      await invoke("save_config", {
+        config: {
+          ...config,
+          keepRunningOnClose: next,
+        },
+      });
+      showToast(t("settings.background.saved"));
+    } catch (err) {
+      setKeepRunning(!next);
+      showToast(String(err));
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  return (
+    <SettingsRow
+      title={t("settings.background.keepRunning")}
+      subtitle={t("settings.background.keepRunningHint")}
+      trailing={
+        <KgSwitch
+          label={t("settings.background.keepRunning")}
+          checked={keepRunning}
+          disabled={saving}
+          onChange={(v) => void save(v)}
+        />
+      }
     />
   );
 }
@@ -557,12 +621,24 @@ function RenameSection() {
       <div className="kg-settings-group">
         <SettingsRow
           title={t("settings.rename.auto")}
-          trailing={<KgSwitch checked={autoRename} onChange={setAutoRename} />}
+          trailing={
+            <KgSwitch
+              label={t("settings.rename.auto")}
+              checked={autoRename}
+              onChange={setAutoRename}
+            />
+          }
         />
         <SettingsRow
           title={t("settings.rename.createSeasons")}
           subtitle={t("settings.rename.createSeasonsHint")}
-          trailing={<KgSwitch checked={createSeasons} onChange={setCreateSeasons} />}
+          trailing={
+            <KgSwitch
+              label={t("settings.rename.createSeasons")}
+              checked={createSeasons}
+              onChange={setCreateSeasons}
+            />
+          }
         />
         <TemplateField
           label={t("settings.rename.movieFolder")}
@@ -591,9 +667,9 @@ function RenameSection() {
         />
       </div>
       <div className="kg-settings-actions">
-        <button type="button" className="kg-btn kg-btn-toolbar" onClick={resetDefaults}>
+        <Button variant="ghost" size="sm" type="button" onClick={resetDefaults}>
           {t("settings.rename.reset")}
-        </button>
+        </Button>
       </div>
     </>
   );
@@ -611,8 +687,8 @@ function TemplateField({
   return (
     <label className="kg-settings-field">
       <span className="kg-settings-block-label">{label}</span>
-      <input
-        className="kg-field kg-field-compact font-mono"
+      <Input
+        className="font-mono"
         value={value}
         onChange={(e) => onChange(e.target.value)}
       />
@@ -701,19 +777,17 @@ function ApiKeysSection() {
       />
       <label className="kg-settings-field">
         <span className="kg-settings-block-label">{t("settings.api.concurrency")}</span>
-        <input
+        <Input
           type="number"
           min={1}
           max={8}
-          className="kg-field kg-field-compact"
           value={concurrency}
           onChange={(e) => setConcurrency(Number(e.target.value) || 4)}
         />
       </label>
       <label className="kg-settings-field">
         <span className="kg-settings-block-label">{t("settings.api.language")}</span>
-        <input
-          className="kg-field kg-field-compact"
+        <Input
           value={language}
           onChange={(e) => setLanguage(e.target.value)}
         />
@@ -736,8 +810,7 @@ function ApiField({
   return (
     <label className="kg-settings-field">
       <span className="kg-settings-block-label">{label}</span>
-      <input
-        className="kg-field kg-field-compact"
+      <Input
         value={value}
         onChange={(e) => onChange(e.target.value)}
         placeholder={placeholder}
@@ -783,15 +856,14 @@ function NfoSection() {
       <SettingsRow
         title={t("settings.nfoFormat")}
         trailing={
-          <select
-            className="kg-select kg-field-compact"
+          <NativeSelect
             value={nfoFormat}
             disabled={saving}
             onChange={(e) => void save(e.target.value)}
           >
             <option value="kodi">{t("settings.nfo.kodi")}</option>
             <option value="emby">{t("settings.nfo.emby")}</option>
-          </select>
+          </NativeSelect>
         }
       />
     </div>
@@ -813,7 +885,7 @@ function LibrarySection() {
       <div className="mb-3 flex flex-wrap items-center gap-2">
         <div className="kg-chip-strip">
           {(["movie", "tvShow", "anime"] as MediaType[]).map((type) => (
-            <button
+            <Button variant="plain" size="none"
               key={type}
               type="button"
               data-selected={mediaType === type}
@@ -821,12 +893,12 @@ function LibrarySection() {
               className="kg-chip"
             >
               {typeLabel(type)}
-            </button>
+            </Button>
           ))}
         </div>
-        <button type="button" onClick={() => void addLibrary(mediaType)} className="kg-btn ml-auto">
+        <Button variant="default" size="sm" type="button" onClick={() => void addLibrary(mediaType)} className="ml-auto">
           {t("action.addLibrary")}
-        </button>
+        </Button>
       </div>
 
       <div className="kg-settings-group">
@@ -877,7 +949,7 @@ function LibraryRow({
   };
 
   const remove = async () => {
-    if (!window.confirm(t("settings.library.removeConfirm", { name: library.name }))) return;
+    if (!(await confirmAction({ title: t("action.deleteLibrary"), description: t("settings.library.removeConfirm", { name: library.name }) }))) return;
     await invoke("delete_library", { id: library.id });
     onChanged();
   };
@@ -902,17 +974,17 @@ function LibraryRow({
     <div className="kg-settings-row" style={{ minHeight: 64 }}>
       {renaming ? (
         <div className="flex w-full items-center gap-2 py-1">
-          <input
+          <Input
             value={name}
             onChange={(e) => setName(e.target.value)}
-            className="kg-field kg-field-compact flex-1"
+            className="flex-1"
           />
-          <button type="button" onClick={() => void rename()} className="kg-btn">
+          <Button variant="default" size="sm" type="button" onClick={() => void rename()}>
             {t("common.save")}
-          </button>
-          <button type="button" onClick={() => setRenaming(false)} className="kg-btn kg-btn-toolbar">
+          </Button>
+          <Button variant="ghost" size="sm" type="button" onClick={() => setRenaming(false)}>
             {t("common.cancel")}
-          </button>
+          </Button>
         </div>
       ) : (
         <>
@@ -927,16 +999,16 @@ function LibraryRow({
           </div>
           <div className="flex shrink-0 gap-1">
             {!rootExists ? (
-              <button type="button" onClick={() => void rebind()} className="kg-btn">
+              <Button variant="default" size="sm" type="button" onClick={() => void rebind()}>
                 {t("settings.library.rebind")}
-              </button>
+              </Button>
             ) : null}
-            <button type="button" onClick={() => setRenaming(true)} className="kg-btn kg-btn-toolbar">
+            <Button variant="ghost" size="sm" type="button" onClick={() => setRenaming(true)}>
               {t("common.rename")}
-            </button>
-            <button type="button" onClick={() => void remove()} className="kg-btn kg-btn-destructive">
+            </Button>
+            <Button variant="destructive" size="sm" type="button" onClick={() => void remove()}>
               {t("common.remove")}
-            </button>
+            </Button>
           </div>
         </>
       )}
@@ -1004,26 +1076,26 @@ function ScrapeExclusionsSection() {
           folders.map((name) => (
             <div key={name} className="kg-settings-row" style={{ minHeight: 54 }}>
               <span className="font-mono kg-type-body-secondary text-fg">{name}</span>
-              <button type="button" onClick={() => remove(name)} className="kg-btn kg-btn-destructive">
+              <Button variant="destructive" size="sm" type="button" onClick={() => remove(name)}>
                 {t("common.remove")}
-              </button>
+              </Button>
             </div>
           ))
         )}
       </div>
       <div className="mt-3 flex gap-2">
-        <input
+        <Input
           value={draft}
           onChange={(e) => setDraft(e.target.value)}
           onKeyDown={(e) => {
             if (e.key === "Enter") add();
           }}
           placeholder={t("settings.exclusions.placeholder")}
-          className="kg-field kg-field-compact flex-1"
+          className="flex-1"
         />
-        <button type="button" disabled={saving} onClick={add} className="kg-btn">
+        <Button variant="default" size="sm" type="button" disabled={saving} onClick={add}>
           {t("common.add")}
-        </button>
+        </Button>
       </div>
       {message ? <p className="mt-2 kg-type-caption text-fg-secondary">{message}</p> : null}
     </>

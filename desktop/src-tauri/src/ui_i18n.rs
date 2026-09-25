@@ -43,9 +43,9 @@ pub fn tf(locale: &str, key: &str, pairs: &[(&str, &str)]) -> String {
 fn lookup(locale: &str, key: &str) -> Option<String> {
     Some(match (locale, key) {
         // Brand / tray idle
-        ("en", "tray.idle") => "Kaigua · Idle".into(),
-        ("ja", "tray.idle") => "开刮 · 待機".into(),
-        (_, "tray.idle") => "开刮 · 空闲".into(),
+        ("en", "tray.idle") => "Sula · Idle".into(),
+        ("ja", "tray.idle") => "Sula · 待機".into(),
+        (_, "tray.idle") => "Sula · 空闲".into(),
 
         ("en", "tray.noTask") => "No active task".into(),
         ("ja", "tray.noTask") => "実行中のタスクなし".into(),
@@ -59,9 +59,9 @@ fn lookup(locale: &str, key: &str) -> Option<String> {
         ("ja", "tray.cancel") => "現在のタスクをキャンセル".into(),
         (_, "tray.cancel") => "取消当前任务".into(),
 
-        ("en", "tray.quit") => "Quit Kaigua".into(),
-        ("ja", "tray.quit") => "开刮を終了".into(),
-        (_, "tray.quit") => "退出开刮".into(),
+        ("en", "tray.quit") => "Quit Sula".into(),
+        ("ja", "tray.quit") => "Sulaを終了".into(),
+        (_, "tray.quit") => "退出Sula".into(),
 
         ("en", "tray.done") => "Done".into(),
         ("ja", "tray.done") => "完了".into(),
@@ -103,13 +103,13 @@ fn lookup(locale: &str, key: &str) -> Option<String> {
         ("ja", "tray.running") => "{{kind}}中".into(),
         (_, "tray.running") => "{{kind}}中".into(),
 
-        ("en", "tray.doneTip") => "Kaigua · Done\n{{task}}".into(),
-        ("ja", "tray.doneTip") => "开刮 · 完了\n{{task}}".into(),
-        (_, "tray.doneTip") => "开刮 · 已完成\n{{task}}".into(),
+        ("en", "tray.doneTip") => "Sula · Done\n{{task}}".into(),
+        ("ja", "tray.doneTip") => "Sula · 完了\n{{task}}".into(),
+        (_, "tray.doneTip") => "Sula · 已完成\n{{task}}".into(),
 
-        ("en", "tray.cancelledTip") => "Kaigua · Cancelled\n{{task}}".into(),
-        ("ja", "tray.cancelledTip") => "开刮 · キャンセル\n{{task}}".into(),
-        (_, "tray.cancelledTip") => "开刮 · 已取消\n{{task}}".into(),
+        ("en", "tray.cancelledTip") => "Sula · Cancelled\n{{task}}".into(),
+        ("ja", "tray.cancelledTip") => "Sula · キャンセル\n{{task}}".into(),
+        (_, "tray.cancelledTip") => "Sula · 已取消\n{{task}}".into(),
 
         ("en", "kind.refresh") => "Scan".into(),
         ("ja", "kind.refresh") => "スキャン".into(),

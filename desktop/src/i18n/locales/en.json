@@ -1,6 +1,7 @@
 {
+  "list.sort": "Sort",
   "app.title": "Library",
-  "app.brand": "开刮",
+  "app.brand": "Sula",
   "action.refresh": "Refresh",
   "action.refreshing": "Scanning…",
   "action.scrapeAll": "Scrape All",
@@ -151,6 +152,9 @@
   "settings.appearance.saved": "Appearance saved",
   "settings.tray.enabled": "Show menu bar / tray icon",
   "settings.tray.saved": "Tray setting saved",
+  "settings.background.keepRunning": "Keep running after closing the window",
+  "settings.background.keepRunningHint": "Reopen from the Dock, menu bar, or system tray.",
+  "settings.background.saved": "Background setting saved",
   "settings.rename.auto": "Auto-rename after scrape",
   "settings.rename.createSeasons": "Create Season folders when renaming",
   "settings.rename.createSeasonsHint": "TV/anime: move episodes into Season XX (template)",
@@ -165,7 +169,7 @@
   "delete.message": "Delete “{{title}}”?",
   "delete.multiTitle": "{{count}} items",
   "delete.alsoTrash": "Also delete local files",
-  "delete.alsoTrashHint": "Removes the media folder; permanently deletes if trash is unavailable",
+  "delete.alsoTrashHint": "Move exclusive folders to trash; in shared folders, move only the selected movie file. Stop if trash is unavailable.",
   "delete.confirm": "Delete",
   "lang.zh": "中文",
   "lang.en": "English",
@@ -321,5 +325,7 @@
   "action.more": "More",
   "detail.close": "Close details",
   "settings.language.label": "Interface language",
-  "settings.language.saved": "Language settings saved"
+  "settings.language.saved": "Language settings saved",
+  "err.configRecovered": "Your settings file was damaged. A backup was kept and defaults restored.",
+  "tasks.result": "Succeeded {{success}} · Unmatched {{unmatched}} · Failed {{failed}}"
 }

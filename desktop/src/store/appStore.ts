@@ -1,3 +1,4 @@
+import { confirmAction } from "../lib/confirmation";
 import { create } from "zustand";
 import { invoke } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
@@ -10,7 +11,7 @@ import {
 } from "../lib/mediaList";
 import { localizeUserMessage } from "../lib/localizeMessage";
 import { notifyTaskDone } from "../lib/notify";
-import { POSTER_THUMB, resolvePosterSrc } from "../lib/posterLoadQueue";
+import { POSTER_THUMB, resolvePosterSrc, invalidatePosterCache } from "../lib/posterLoadQueue";
 
 export type AppConfig = {
   scrapeConcurrency: number;
@@ -27,6 +28,7 @@ export type AppConfig = {
   appearance: string;
   accent: string;
   trayEnabled: boolean;
+  keepRunningOnClose: boolean;
   uiLocale: string;
   apiKeys: {
     tmdb: string;
@@ -183,6 +185,7 @@ export type TaskSnapshot = {
     stageKey?: string;
   } | null;
   errorMessage?: string | null;
+  result?: { success: number; unmatched: number; failed: number } | null;
   targetId?: string | null;
   createdAt: string;
   updatedAt: string;
@@ -261,6 +264,9 @@ export type ResidualCandidate = {
 
 let toastTimer: ReturnType<typeof setTimeout> | null = null;
 
+let libraryRequest = 0;
+let detailRequest = 0;
+
 export const useAppStore = create<AppStore>((set, get) => ({
   status: null,
   libraries: [],
@@ -309,6 +315,7 @@ export const useAppStore = create<AppStore>((set, get) => ({
   },
 
   refreshLibraries: async () => {
+    invalidatePosterCache();
     try {
       const libraries = await invoke<Library[]>("list_libraries");
       const selected = get().selectedLibraryId;
@@ -339,8 +346,13 @@ export const useAppStore = create<AppStore>((set, get) => ({
   },
 
   selectLibrary: async (id) => {
+    const request = ++libraryRequest;
+    ++detailRequest;
     set({
       selectedLibraryId: id,
+      mediaItems: [],
+      metadataById: {},
+      showStatsById: {},
       selectedMediaId: null,
       selectedMediaIds: [],
       detail: null,
@@ -352,21 +364,23 @@ export const useAppStore = create<AppStore>((set, get) => ({
       return;
     }
     try {
-      const page = await invoke<{
-        items: MediaItem[];
-        metadata: MediaMetaSummary[];
-        showStats: ShowListStats[];
-      }>("list_media_page", { libraryId: id });
+      let offset: number | null = 0;
+      const items = new Map<string, MediaItem>();
       const metadataById: Record<string, MediaMetaSummary> = {};
-      for (const meta of page.metadata) {
-        metadataById[meta.mediaItemId] = meta;
-      }
       const showStatsById: Record<string, ShowListStats> = {};
-      for (const stats of page.showStats ?? []) {
-        showStatsById[stats.mediaItemId] = stats;
+      while (offset !== null) {
+        const page: { items: MediaItem[]; metadata: MediaMetaSummary[]; showStats: ShowListStats[]; nextOffset?: number | null } = await invoke("list_media_page", { libraryId: id, offset, limit: 256 });
+        if (request !== libraryRequest || get().selectedLibraryId !== id) return;
+        for (const item of page.items) items.set(item.id, item);
+        for (const meta of page.metadata) metadataById[meta.mediaItemId] = meta;
+        for (const stats of page.showStats ?? []) showStatsById[stats.mediaItemId] = stats;
+        set({ mediaItems: [...items.values()], metadataById: {...metadataById}, showStatsById: {...showStatsById} });
+        const next: number | null = page.nextOffset ?? null;
+        if (next !== null && next <= offset) throw new Error("invalid media page cursor");
+        offset = next;
       }
-      set({ mediaItems: page.items, metadataById, showStatsById });
     } catch (err) {
+      if (request !== libraryRequest || get().selectedLibraryId !== id) return;
       const message = String(err);
       set({ error: message });
       get().showToast(message);
@@ -374,6 +388,7 @@ export const useAppStore = create<AppStore>((set, get) => ({
   },
 
   selectMedia: async (id) => {
+    const request = ++detailRequest;
     set({
       selectedMediaId: id,
       selectedMediaIds: id ? [id] : [],
@@ -394,7 +409,7 @@ export const useAppStore = create<AppStore>((set, get) => ({
             height: POSTER_THUMB.height,
           })
             .then((url) => {
-              if (get().selectedMediaId !== id) return;
+              if (request !== detailRequest || get().selectedMediaId !== id) return;
               set({ posterUrl: url });
             })
             .catch(() => {
@@ -407,7 +422,7 @@ export const useAppStore = create<AppStore>((set, get) => ({
         invoke<MediaDetail>("get_media_detail", { id }),
         posterPromise,
       ]);
-      if (get().selectedMediaId !== id) return;
+      if (request !== detailRequest || get().selectedMediaId !== id) return;
       set({ detail, detailLoading: false });
       // If list metadata had no posterPath, resolve from detail.
       if (!posterHint) {
@@ -419,12 +434,12 @@ export const useAppStore = create<AppStore>((set, get) => ({
             width: POSTER_THUMB.width,
             height: POSTER_THUMB.height,
           });
-          if (get().selectedMediaId !== id) return;
+          if (request !== detailRequest || get().selectedMediaId !== id) return;
           set({ posterUrl: url });
         }
       }
     } catch (err) {
-      if (get().selectedMediaId !== id) return;
+      if (request !== detailRequest || get().selectedMediaId !== id) return;
       const message = String(err);
       set({ error: message, detailLoading: false });
       get().showToast(message);
@@ -503,7 +518,7 @@ export const useAppStore = create<AppStore>((set, get) => ({
     if (!id) return;
     const lib = get().libraries.find((l) => l.id === id);
     if (!lib) return;
-    if (!window.confirm(tt("toast.libraryDeleteConfirm", { name: lib.name }))) {
+    if (!(await confirmAction({title: tt("action.deleteLibrary"), description: tt("toast.libraryDeleteConfirm", { name: lib.name })}))) {
       return;
     }
     try {
@@ -626,11 +641,9 @@ export const useAppStore = create<AppStore>((set, get) => ({
     if (!(await ensureScrapeKeys(get))) return;
     get().showToast(tt("toast.scrapeSeasonStarted", { n: seasonNumber }), 60_000);
     try {
-      await invoke("scrape_season", { mediaItemId, seasonNumber });
-      get().showToast(tt("toast.scrapeSeasonDone", { n: seasonNumber }), 2800);
-      if (get().selectedMediaId === mediaItemId) {
-        await get().selectMedia(mediaItemId);
-      }
+      const task = await invoke<TaskSnapshot>("scrape_season", { mediaItemId, seasonNumber });
+      get().upsertTask(task);
+      get().showToast(tt("toast.scrapeSeasonStarted", { n: seasonNumber }), 2800);
     } catch (err) {
       const message = localizeUserMessage(String(err));
       set({ error: message });
@@ -882,6 +895,7 @@ export const useAppStore = create<AppStore>((set, get) => ({
       prev &&
       prev.status === task.status &&
       prev.errorMessage === task.errorMessage &&
+      JSON.stringify(prev.result) === JSON.stringify(task.result) &&
       prev.progress?.completed === task.progress?.completed &&
       prev.progress?.total === task.progress?.total &&
       prev.progress?.current === task.progress?.current &&

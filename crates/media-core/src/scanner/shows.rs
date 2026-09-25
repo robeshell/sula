@@ -59,8 +59,20 @@ pub fn scan_shows_under(
     roots: &[PathBuf],
     existing_show_paths: &HashSet<String>,
     excluded_folders: &HashSet<String>,
-    mut on_progress: impl FnMut(ScanProgress),
+    on_progress: impl FnMut(ScanProgress),
 ) -> Result<ShowScanResult, std::io::Error> {
+    scan_shows_under_cancellable(library, roots, existing_show_paths, excluded_folders, on_progress, &std::sync::atomic::AtomicBool::new(false))
+}
+
+pub fn scan_shows_under_cancellable(
+    library: &Library,
+    roots: &[PathBuf],
+    existing_show_paths: &HashSet<String>,
+    excluded_folders: &HashSet<String>,
+    mut on_progress: impl FnMut(ScanProgress),
+    cancel: &std::sync::atomic::AtomicBool,
+) -> Result<ShowScanResult, std::io::Error> {
+    super::check_cancel(cancel)?;
     let library_root = PathBuf::from(&library.root_path);
     let root_canon = canonicalize_lossy(&library_root);
 
@@ -91,6 +103,7 @@ pub fn scan_shows_under(
             });
 
         for entry in walker {
+            super::check_cancel(cancel)?;
             let entry = entry?;
             if !entry.file_type().is_file() {
                 continue;
@@ -140,6 +153,7 @@ pub fn scan_shows_under(
         }
     }
 
+    super::check_cancel(cancel)?;
     let title_overrides = merge_flat_season_groups(&mut show_groups, Path::new(&root_canon));
 
     let mut new_items = Vec::new();
@@ -316,13 +330,13 @@ pub fn existing_show_touched_by_roots(folder_path: &str, scan_roots: &[PathBuf])
 }
 
 /// Discover episode media files under an existing show folder (SCAN-15).
-pub fn discover_episodes_in_show(
+pub fn discover_episodes_in_show_cancellable(
     show_folder: &Path,
     excluded_folders: &HashSet<String>,
+    cancel: &std::sync::atomic::AtomicBool,
 ) -> Result<Vec<ScannedEpisode>, std::io::Error> {
-    if !show_folder.is_dir() {
-        return Ok(Vec::new());
-    }
+    super::check_cancel(cancel)?;
+    std::fs::read_dir(show_folder)?;
     let show_canon = canonicalize_lossy(show_folder);
     let mut files = Vec::new();
     let mut seen: HashSet<String> = HashSet::new();
@@ -346,6 +360,7 @@ pub fn discover_episodes_in_show(
         });
 
     for entry in walker {
+            super::check_cancel(cancel)?;
         let entry = entry?;
         if !entry.file_type().is_file() {
             continue;
@@ -379,6 +394,7 @@ pub fn discover_episodes_in_show(
             title: parsed.title,
         });
     }
+    super::check_cancel(cancel)?;
     Ok(files)
 }
 

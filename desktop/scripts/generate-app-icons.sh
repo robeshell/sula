@@ -3,8 +3,8 @@ set -euo pipefail
 
 desktop_dir="$(cd "$(dirname "$0")/.." && pwd)"
 icons_dir="$desktop_dir/src-tauri/icons"
-composer_dir="$icons_dir/Kaigua.icon"
-work_dir="$(mktemp -d /tmp/kaigua-iconcomposer.XXXXXX)"
+composer_dir="$icons_dir/Sula.icon"
+work_dir="$(mktemp -d /tmp/sula-iconcomposer.XXXXXX)"
 
 cleanup() {
   rm -rf "$work_dir"
@@ -13,7 +13,7 @@ trap cleanup EXIT
 
 (
   cd "$desktop_dir"
-  pnpm tauri icon "$icons_dir/kaigua_master-v3.png" --output "$work_dir/tauri"
+  pnpm tauri icon "$icons_dir/sula_master-v3.png" --output "$work_dir/tauri"
 )
 
 for filename in \
@@ -41,10 +41,10 @@ xcrun actool \
   --compile "$work_dir/output" \
   --platform macosx \
   --minimum-deployment-target 12.0 \
-  --app-icon Kaigua \
+  --app-icon Sula \
   --output-partial-info-plist "$work_dir/info.plist" \
   --target-device mac \
   "$composer_dir" >/dev/null
 
-cp "$work_dir/output/Kaigua.icns" "$icons_dir/icon.icns"
+cp "$work_dir/output/Sula.icns" "$icons_dir/icon.icns"
 echo "Generated Tauri icons and Icon Composer macOS icon."

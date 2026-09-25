@@ -215,7 +215,7 @@ impl BangumiScraper {
         let mut req = self
             .client
             .get(url)
-            .header("User-Agent", "kaigua/0.1.0")
+            .header("User-Agent", "sula/0.1.0")
             .header("Accept", "application/json");
         if !self.api_key.trim().is_empty() {
             req = req.header("Authorization", format!("Bearer {}", self.api_key.trim()));

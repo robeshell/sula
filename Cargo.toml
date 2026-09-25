@@ -10,7 +10,7 @@ members = [
 [workspace.package]
 edition = "2021"
 license = "Proprietary"
-version = "0.1.0"
+version = "1.0.1"
 
 [workspace.dependencies]
 anyhow = "1"
@@ -33,3 +33,12 @@ urlencoding = "2"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp", "gif"] }
 md-5 = "0.10"
 dirs = "6"
+
+# Keep source locations in backtraces without full type/variable debug data.
+[profile.dev]
+debug = "line-tables-only"
+
+# Third-party dependencies dominate debug output; enable their debug data only
+# when stepping into dependency internals. Workspace crates keep the setting above.
+[profile.dev.package."*"]
+debug = false

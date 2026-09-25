@@ -25,6 +25,14 @@ impl AppDatabase {
         })
     }
 
+    pub fn list_media_items_page(&self, library_id: &str, offset: u32, limit: u32) -> Result<Vec<MediaItem>, DatabaseError> {
+        self.with_conn(|conn| {
+            let mut stmt = conn.prepare("SELECT id,type,title,originalTitle,year,folderPath,filePath,bookmarkData,status,scrapeIssue,libraryId,addedAt FROM media_items WHERE libraryId=?1 ORDER BY title COLLATE NOCASE ASC,id ASC LIMIT ?2 OFFSET ?3")?;
+            let rows = stmt.query_map(params![library_id, limit, offset], map_media_item)?;
+            Ok(rows.collect::<Result<Vec<_>, _>>()?)
+        })
+    }
+
     pub fn list_media_file_paths(&self, library_id: &str) -> Result<Vec<String>, DatabaseError> {
         self.with_conn(|conn| {
             let mut stmt =
@@ -212,4 +220,26 @@ fn map_media_item(row: &rusqlite::Row<'_>) -> rusqlite::Result<MediaItem> {
             .map(|dt| dt.with_timezone(&Utc))
             .unwrap_or_else(|_| Utc::now()),
     })
+}
+
+#[cfg(test)]
+mod paging_tests {
+    use super::*;
+    use crate::models::Library;
+    #[test]
+    fn pages_with_equal_titles_have_stable_order_and_library_scope() {
+        let db = AppDatabase::open_in_memory().unwrap();
+        let library = Library::new("A", "/fixture/a", MediaType::TvShow);
+        let other = Library::new("B", "/fixture/b", MediaType::TvShow);
+        db.insert_library(&library).unwrap(); db.insert_library(&other).unwrap();
+        for (id, library_id) in [("c", &library.id), ("b", &library.id), ("a", &library.id), ("x", &other.id)] {
+            let mut item = MediaItem::new_show(MediaType::TvShow, "same", None, "/fixture", library_id.clone(), ScrapedStatus::Scraped);
+            item.id = id.into(); db.insert_media_items(&[item]).unwrap();
+        }
+        let first = db.list_media_items_page(&library.id, 0, 2).unwrap();
+        let second = db.list_media_items_page(&library.id, 2, 2).unwrap();
+        assert_eq!(first.iter().map(|i| i.id.as_str()).collect::<Vec<_>>(), ["a", "b"]);
+        assert_eq!(second[0].id, "c"); assert_eq!(second.len(), 1);
+        assert!(db.list_media_items_page(&library.id, 3, 2).unwrap().is_empty());
+    }
 }

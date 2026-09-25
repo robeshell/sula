@@ -1,13 +1,13 @@
 [package]
-name = "kaigua"
+name = "sula"
 version.workspace = true
-description = "kaigua desktop shell (Tauri)"
-authors = ["kaigua"]
+description = "Sula desktop shell (Tauri)"
+authors = ["sula"]
 edition.workspace = true
 license.workspace = true
 
 [lib]
-name = "kaigua_lib"
+name = "sula_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
 [build-dependencies]
@@ -34,3 +34,5 @@ dirs = "6"
 chrono = { workspace = true }
 tauri-plugin-dialog = "2.7.2"
 tauri-plugin-notification = "2"
+
+keyring = { version = "3.6.3", features = ["apple-native", "windows-native", "sync-secret-service", "crypto-rust"] }

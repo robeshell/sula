@@ -1,4 +1,4 @@
-import { useEffect, useLayoutEffect, useRef, useState } from "react";
+import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigger } from "./ui/dropdown-menu";
 import { useTranslation } from "react-i18next";
 
 export type MediaContextMenuTarget = {
@@ -58,154 +58,101 @@ export function MediaContextMenu({
   onDelete,
 }: MediaContextMenuProps) {
   const { t } = useTranslation();
-  const rootRef = useRef<HTMLDivElement>(null);
-  const [pos, setPos] = useState({ left: menu.x, top: menu.y });
-
-  useEffect(() => {
-    const onDoc = (e: MouseEvent) => {
-      if (!rootRef.current?.contains(e.target as Node)) onClose();
-    };
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") onClose();
-    };
-    document.addEventListener("mousedown", onDoc);
-    document.addEventListener("keydown", onKey);
-    return () => {
-      document.removeEventListener("mousedown", onDoc);
-      document.removeEventListener("keydown", onKey);
-    };
-  }, [onClose]);
-
-  useLayoutEffect(() => {
-    const el = rootRef.current;
-    if (!el) return;
-    const rect = el.getBoundingClientRect();
-    const pad = 8;
-    setPos({
-      left: Math.max(pad, Math.min(menu.x, window.innerWidth - rect.width - pad)),
-      top: Math.max(pad, Math.min(menu.y, window.innerHeight - rect.height - pad)),
-    });
-  }, [menu.x, menu.y, canScrapeAuto, canRescrape, canManualMatch, canRename, canOrganize, canMergeDuplicates, canCleanResiduals, canDelete]);
-
   const run = (action: () => void) => {
     onAction();
     action();
   };
 
   return (
-    <div
-      ref={rootRef}
-      className="kg-menu fixed z-[80]"
-      style={pos}
-      role="menu"
-    >
+    <DropdownMenu open modal={false} onOpenChange={open => { if (!open) onClose(); }}>
+      <DropdownMenuTrigger asChild><span aria-hidden style={{ position: 'fixed', left: menu.x, top: menu.y, width: 1, height: 1 }} /></DropdownMenuTrigger>
+      <DropdownMenuContent align="start" sideOffset={0} collisionPadding={8} onCloseAutoFocus={e => e.preventDefault()}>
       {canManualMatch ? (
-        <button
-          type="button"
-          role="menuitem"
-          className="kg-menu-item"
-          onClick={() => run(onScrapeConfirm)}
+        <DropdownMenuItem
+
+          onSelect={() => run(onScrapeConfirm)}
         >
           {t("action.scrapeItem")}
-        </button>
+        </DropdownMenuItem>
       ) : null}
       {canScrapeAuto ? (
-        <button
-          type="button"
-          role="menuitem"
-          className="kg-menu-item"
-          onClick={() => run(onScrapeAuto)}
+        <DropdownMenuItem
+
+          onSelect={() => run(onScrapeAuto)}
         >
           {t("action.scrapeAuto")}
-        </button>
+        </DropdownMenuItem>
       ) : null}
       {canRescrape ? (
-        <button
-          type="button"
-          role="menuitem"
-          className="kg-menu-item"
-          onClick={() => run(onRescrape)}
+        <DropdownMenuItem
+
+          onSelect={() => run(onRescrape)}
         >
           {t("action.rescrape")}
-        </button>
+        </DropdownMenuItem>
       ) : null}
       {canManualMatch ? (
-        <button
-          type="button"
-          role="menuitem"
-          className="kg-menu-item"
-          onClick={() => run(onManualMatch)}
+        <DropdownMenuItem
+
+          onSelect={() => run(onManualMatch)}
         >
           {t("action.manualMatch")}
-        </button>
+        </DropdownMenuItem>
       ) : null}
       {canRename ? (
-        <button
-          type="button"
-          role="menuitem"
-          className="kg-menu-item"
-          onClick={() => run(onRename)}
+        <DropdownMenuItem
+
+          onSelect={() => run(onRename)}
         >
           {t("action.applyRename")}
-        </button>
+        </DropdownMenuItem>
       ) : null}
       {canOrganize ? (
-        <button
-          type="button"
-          role="menuitem"
-          className="kg-menu-item"
-          onClick={() => run(onOrganize)}
+        <DropdownMenuItem
+
+          onSelect={() => run(onOrganize)}
         >
           {t("action.organizeSeasons")}
-        </button>
+        </DropdownMenuItem>
       ) : null}
       {canMergeDuplicates ? (
-        <button
-          type="button"
-          role="menuitem"
-          className="kg-menu-item"
-          onClick={() => run(onMergeDuplicates)}
+        <DropdownMenuItem
+
+          onSelect={() => run(onMergeDuplicates)}
         >
           {t("action.mergeDuplicates")}
-        </button>
+        </DropdownMenuItem>
       ) : null}
       {canCleanResiduals ? (
-        <button
-          type="button"
-          role="menuitem"
-          className="kg-menu-item"
-          onClick={() => run(onCleanResiduals)}
+        <DropdownMenuItem
+
+          onSelect={() => run(onCleanResiduals)}
         >
           {t("action.cleanResiduals")}
-        </button>
+        </DropdownMenuItem>
       ) : null}
-      <button
-        type="button"
-        role="menuitem"
-        className="kg-menu-item"
-        onClick={() => run(onRefreshFromDisk)}
+      <DropdownMenuItem
+
+        onSelect={() => run(onRefreshFromDisk)}
       >
         {t("action.refreshFromDisk")}
-      </button>
-      <button
-        type="button"
-        role="menuitem"
-        className="kg-menu-item"
-        onClick={() => run(onReveal)}
+      </DropdownMenuItem>
+      <DropdownMenuItem
+
+        onSelect={() => run(onReveal)}
       >
         {t("action.revealInFinder")}
-      </button>
+      </DropdownMenuItem>
       {canDelete ? (
-        <button
-          type="button"
-          role="menuitem"
-          className="kg-menu-item"
-          data-destructive="true"
-          onClick={() => run(onDelete)}
+        <DropdownMenuItem
+
+          variant="destructive"
+          onSelect={() => run(onDelete)}
         >
           {t("action.deleteItem")}
-        </button>
+        </DropdownMenuItem>
       ) : null}
-    </div>
+      </DropdownMenuContent>
+    </DropdownMenu>
   );
 }

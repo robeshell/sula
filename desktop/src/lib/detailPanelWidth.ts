@@ -1,4 +1,4 @@
-const STORAGE_KEY = "kaigua.detailPanelWidth";
+const STORAGE_KEY = "sula.detailPanelWidth";
 
 /** Detail panel width bounds (px). */
 export const DETAIL_WIDTH_MIN = 280;

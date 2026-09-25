@@ -176,7 +176,7 @@ impl FilesystemService {
         }
 
         if options.atomic {
-            let tmp = destination.with_extension("tmp-kaigua");
+            let tmp = destination.with_extension("tmp-sula");
             fs::write(&tmp, data).map_err(|source| FilesystemError::Io {
                 path: tmp.clone(),
                 source,
@@ -227,7 +227,7 @@ impl FilesystemService {
     }
 
     /// Move path to the platform trash / recycle bin when available.
-    /// Falls back to `TrashUnavailable` so callers can hard-delete after confirmation.
+    /// Unavailable recycle services fail closed; callers must not permanently delete.
     pub fn trash_item(&self, path: impl AsRef<Path>) -> Result<FilesystemChangeSet, FilesystemError> {
         let path = path.as_ref();
         if !path.exists() {
@@ -256,9 +256,8 @@ impl FilesystemService {
 
         #[cfg(target_os = "windows")]
         {
-            // Windows recycle-bin API lands with a dedicated crate in M6; fail closed for now.
-            let _ = path;
-            return Err(FilesystemError::TrashUnavailable);
+            trash_windows(path)?;
+            return Ok(FilesystemChangeSet { removed_paths: vec![path_string(path)], ..Default::default() });
         }
 
         #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
@@ -296,6 +295,21 @@ fn trash_macos(path: &Path) -> Result<(), FilesystemError> {
             source: std::io::Error::other(format!("Finder trash failed: {stderr}")),
         })
     }
+}
+
+#[cfg(target_os = "windows")]
+fn trash_windows(path: &Path) -> Result<(), FilesystemError> {
+    // The path is data in an environment variable, never PowerShell source.
+    let script = r#"$ErrorActionPreference = 'Stop'; Add-Type -AssemblyName Microsoft.VisualBasic;
+$p = $env:SULA_TRASH_PATH;
+if ([System.IO.Directory]::Exists($p)) {
+ [Microsoft.VisualBasic.FileIO.FileSystem]::DeleteDirectory($p, 'OnlyErrorDialogs', 'SendToRecycleBin', 'ThrowException')
+} else {
+ [Microsoft.VisualBasic.FileIO.FileSystem]::DeleteFile($p, 'OnlyErrorDialogs', 'SendToRecycleBin', 'ThrowException')
+}"#;
+    let output = std::process::Command::new("powershell.exe").args(["-NoProfile", "-NonInteractive", "-Command", script])
+        .env("SULA_TRASH_PATH", path).output().map_err(|source| FilesystemError::Io { path: path.into(), source })?;
+    if output.status.success() { Ok(()) } else { Err(FilesystemError::Io { path: path.into(), source: std::io::Error::other(String::from_utf8_lossy(&output.stderr).into_owned()) }) }
 }
 
 #[cfg(target_os = "linux")]

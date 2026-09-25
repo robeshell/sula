@@ -8,17 +8,17 @@ use reqwest::{Client, Proxy};
 /// Build an HTTP client that follows `HTTP(S)_PROXY` and, on macOS, system proxy.
 pub fn build_client() -> Client {
     let mut builder = Client::builder()
-        .user_agent("kaigua/0.1.0")
+        .user_agent("sula/0.1.0")
         .timeout(Duration::from_secs(30));
 
     if let Some(proxy_url) = detect_proxy_url() {
         match Proxy::all(&proxy_url) {
             Ok(proxy) => {
                 builder = builder.proxy(proxy);
-                tracing::info!(%proxy_url, "scraper http client using proxy");
+                tracing::info!("scraper http client using configured proxy");
             }
-            Err(err) => {
-                tracing::warn!(%proxy_url, %err, "invalid proxy url, continuing without");
+            Err(_) => {
+                tracing::warn!("invalid proxy url, continuing without explicit proxy");
             }
         }
     }

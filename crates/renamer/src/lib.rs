@@ -23,3 +23,6 @@ pub use template::TemplateEngine;
 pub fn crate_name() -> &'static str {
     "renamer"
 }
+
+mod media_journal;
+pub use media_journal::recover_media_operations;

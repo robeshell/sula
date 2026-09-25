@@ -1,3 +1,5 @@
+import { NativeSelect } from "./ui/native-select";
+import { Button } from "./ui/button";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { invoke } from "@tauri-apps/api/core";
@@ -78,8 +80,7 @@ export function LogPanel({ onClose }: { onClose: () => void }) {
             <h2 className="kg-page-header-title">{t("logs.title")}</h2>
           </div>
           <div className="kg-page-header-actions">
-            <select
-              className="kg-select kg-field-compact"
+            <NativeSelect
               value={filter}
               onChange={(e) => setFilter(e.target.value as LogLevel | "all")}
             >
@@ -88,10 +89,10 @@ export function LogPanel({ onClose }: { onClose: () => void }) {
               <option value="info">{t("logs.filter.info")}</option>
               <option value="warning">{t("logs.filter.warning")}</option>
               <option value="error">{t("logs.filter.error")}</option>
-            </select>
-            <button type="button" className="kg-btn kg-btn-toolbar" onClick={() => void clear()}>
+            </NativeSelect>
+            <Button variant="ghost" size="sm" type="button" onClick={() => void clear()}>
               {t("logs.clear")}
-            </button>
+            </Button>
           </div>
         </header>
 

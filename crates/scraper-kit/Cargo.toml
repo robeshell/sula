@@ -3,7 +3,7 @@ name = "scraper-kit"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "kaigua scrapers and matching engine"
+description = "sula scrapers and matching engine"
 
 [dependencies]
 anyhow.workspace = true
@@ -20,4 +20,5 @@ urlencoding.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
+tempfile = "3"
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }

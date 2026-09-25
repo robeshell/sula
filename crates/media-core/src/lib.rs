@@ -1,4 +1,4 @@
-//! kaigua media domain core.
+//! sula media domain core.
 //!
 //! M0: models, SQLite schema/migrations, filesystem mutation layer.
 //! M1: library CRUD, scanning, NFO import-on-refresh.
@@ -7,6 +7,7 @@ pub mod cleanup;
 pub mod db;
 pub mod filesystem;
 pub mod models;
+pub mod media_files;
 pub mod nfo;
 pub mod scanner;
 pub mod avatar;
@@ -29,7 +30,7 @@ pub use nfo::{
     import_nfo_for_item, write_emby_nfo, write_kodi_nfo, write_nfo, NfoParsedData, NfoReader,
 };
 pub use scanner::{
-    refresh_items, refresh_library, FileNameParser, ItemRefreshReport, RefreshReport, ScanProgress,
+    refresh_items, refresh_items_cancellable, refresh_library, refresh_library_cancellable, FileNameParser, ItemRefreshReport, RefreshReport, ScanProgress,
     ScannedEpisode,
 };
 pub use thumbnail::{

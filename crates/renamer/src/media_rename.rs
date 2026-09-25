@@ -5,8 +5,8 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use media_core::{
-    companion_suffix, AppDatabase, CollisionPolicy, FileNameParser, FilesystemService, MediaItem,
-    MediaType, ScannedEpisode, ScrapedStatus, TvEpisode, TvSeason, COMPANION_EXTENSIONS,
+    companion_suffix, AppDatabase, FileNameParser, FilesystemService, MediaItem,
+    MediaType, ScrapedStatus, TvEpisode, TvSeason, COMPANION_EXTENSIONS,
 };
 use thiserror::Error;
 
@@ -224,95 +224,183 @@ fn merge_show_into(
     target: &MediaItem,
     templates: &RenameTemplates,
 ) -> Result<(), RenameError> {
+    crate::recover_media_operations(db).map_err(RenameError::Filesystem)?;
     if source.id == target.id {
         return Ok(());
+    }
+    if !media_core::media_files::owns_folder(db, source)
+        .map_err(|e| RenameError::Filesystem(e.to_string()))?
+    {
+        return Err(RenameError::Filesystem(
+            "cannot organize a shared show folder".into(),
+        ));
+    }
+    if !media_core::media_files::owns_folder(db, target)
+        .map_err(|e| RenameError::Filesystem(e.to_string()))?
+    {
+        return Err(RenameError::Filesystem(
+            "cannot organize a shared show folder".into(),
+        ));
     }
     let target_root = PathBuf::from(&target.folder_path);
     if !target_root.is_dir() {
         return Err(RenameError::NotFound(target_root));
     }
-    let fs = FilesystemService::new();
-    let mut to_insert: Vec<ScannedEpisode> = Vec::new();
-
-    let seasons = db
-        .fetch_seasons(&source.id)
-        .map_err(|e| RenameError::Database(e.to_string()))?;
-    for season in seasons {
-        let episodes = db
+    // Reject duplicate episode identities or destination files before moving anything.
+    let mut target_keys = std::collections::HashSet::new();
+    for season in db
+        .fetch_seasons(&target.id)
+        .map_err(|e| RenameError::Database(e.to_string()))?
+    {
+        for episode in db
             .fetch_episodes(&season.id)
-            .map_err(|e| RenameError::Database(e.to_string()))?;
-        let mut season_values = HashMap::new();
-        season_values.insert("season".into(), season.season_number.to_string());
-        let season_folder_name = TemplateEngine::sanitize_filename(&TemplateEngine::render(
-            &templates.season_folder,
-            &season_values,
-        ));
-        let dest_season = if season_folder_name.is_empty() {
-            target_root.clone()
-        } else {
-            let dir = target_root.join(&season_folder_name);
-            if !dir.exists() {
-                fs.create_directory(&dir)
-                    .map_err(|e| RenameError::Filesystem(e.to_string()))?;
-            }
-            dir
-        };
-
-        for ep in episodes {
-            if ep.file_path.is_empty() {
-                continue;
-            }
-            let src = PathBuf::from(&ep.file_path);
-            if !src.is_file() {
-                continue;
-            }
-            let file_name = src
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or("")
-                .to_string();
-            if file_name.is_empty() {
-                continue;
-            }
-            let stem = src
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .unwrap_or("")
-                .to_string();
-            let from_dir = src
-                .parent()
-                .map(Path::to_path_buf)
-                .unwrap_or_else(|| dest_season.clone());
-            let dest = dest_season.join(&file_name);
-            if src != dest {
-                if dest.exists() {
-                    continue;
-                }
-                fs.move_item(&src, &dest, CollisionPolicy::Fail)
-                    .map_err(|e| RenameError::Filesystem(e.to_string()))?;
-                move_companions(&fs, &from_dir, &dest_season, &stem);
-            }
-            to_insert.push(ScannedEpisode {
-                season: season.season_number,
-                episode: ep.episode_number,
-                file_path: dest.to_string_lossy().into_owned(),
-                title: ep.title.clone().unwrap_or_default(),
-            });
+            .map_err(|e| RenameError::Database(e.to_string()))?
+        {
+            target_keys.insert((season.season_number, episode.episode_number));
         }
     }
-
-    if !to_insert.is_empty() {
-        db.insert_show_episodes(&target.id, &to_insert)
-            .map_err(|e| RenameError::Database(e.to_string()))?;
+    for season in db
+        .fetch_seasons(&source.id)
+        .map_err(|e| RenameError::Database(e.to_string()))?
+    {
+        let mut values = HashMap::new();
+        values.insert("season".into(), season.season_number.to_string());
+        let name = TemplateEngine::sanitize_filename(&TemplateEngine::render(
+            &templates.season_folder,
+            &values,
+        ));
+        for episode in db
+            .fetch_episodes(&season.id)
+            .map_err(|e| RenameError::Database(e.to_string()))?
+        {
+            if episode.file_path.is_empty() {
+                continue;
+            }
+            let source_path = Path::new(&episode.file_path);
+            if !source_path.is_file() {
+                return Err(RenameError::NotFound(source_path.into()));
+            }
+            let file_name = source_path
+                .file_name()
+                .ok_or_else(|| RenameError::NotFound(source_path.into()))?;
+            let destination = target_root.join(&name).join(file_name);
+            if target_keys.contains(&(season.season_number, episode.episode_number))
+                || destination.exists()
+            {
+                return Err(RenameError::DestinationExists(destination));
+            }
+        }
     }
-    db.delete_media_item(&source.id)
-        .map_err(|e| RenameError::Database(e.to_string()))?;
-    remove_merged_source_folder(&fs, source, target);
+    let fs = FilesystemService::new();
+    let mut journal = crate::media_journal::MergeJournal::begin(db).map_err(RenameError::Filesystem)?;
+    let mut moved_paths = Vec::new();
+    let mut moved_files: Vec<(PathBuf, PathBuf)> = Vec::new();
+    let result = (|| -> Result<(), RenameError> {
+        let seasons = db
+            .fetch_seasons(&source.id)
+            .map_err(|e| RenameError::Database(e.to_string()))?;
+        for season in seasons {
+            let episodes = db
+                .fetch_episodes(&season.id)
+                .map_err(|e| RenameError::Database(e.to_string()))?;
+            let mut season_values = HashMap::new();
+            season_values.insert("season".into(), season.season_number.to_string());
+            let season_folder_name = TemplateEngine::sanitize_filename(&TemplateEngine::render(
+                &templates.season_folder,
+                &season_values,
+            ));
+            let dest_season = if season_folder_name.is_empty() {
+                target_root.clone()
+            } else {
+                let dir = target_root.join(&season_folder_name);
+                if !dir.exists() {
+                    fs.create_directory(&dir)
+                        .map_err(|e| RenameError::Filesystem(e.to_string()))?;
+                }
+                dir
+            };
+
+            for ep in episodes {
+                if ep.file_path.is_empty() {
+                    continue;
+                }
+                let src = PathBuf::from(&ep.file_path);
+                if !src.is_file() {
+                    return Err(RenameError::NotFound(src));
+                }
+                let file_name = src
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("")
+                    .to_string();
+                if file_name.is_empty() {
+                    continue;
+                }
+                let stem = src
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("")
+                    .to_string();
+                let from_dir = src
+                    .parent()
+                    .map(Path::to_path_buf)
+                    .unwrap_or_else(|| dest_season.clone());
+                let dest = dest_season.join(&file_name);
+                if src != dest {
+                    if dest.exists() {
+                        return Err(RenameError::DestinationExists(dest));
+                    }
+                    journal.move_file(&src, &dest)
+                        .map_err(|e| RenameError::Filesystem(e.to_string()))?;
+                    moved_files.push((src.clone(), dest.clone()));
+                    for entry in std::fs::read_dir(&from_dir)
+                        .map_err(|e| RenameError::Filesystem(e.to_string()))?
+                    {
+                        let path = entry
+                            .map_err(|e| RenameError::Filesystem(e.to_string()))?
+                            .path();
+                        if !path.is_file() {
+                            continue;
+                        }
+                        let ext = path
+                            .extension()
+                            .and_then(|v| v.to_str())
+                            .unwrap_or("")
+                            .to_ascii_lowercase();
+                        let file_stem = path.file_stem().and_then(|v| v.to_str()).unwrap_or("");
+                        if !COMPANION_EXTENSIONS.contains(&ext.as_str())
+                            || companion_suffix(file_stem, &stem).is_none()
+                        {
+                            continue;
+                        }
+                        let destination = dest_season.join(path.file_name().unwrap());
+                        journal.move_file(&path, &destination)
+                            .map_err(|e| RenameError::Filesystem(e.to_string()))?;
+                        moved_files.push((path, destination));
+                    }
+                }
+                moved_paths.push((ep.id, dest.to_string_lossy().into_owned()));
+            }
+        }
+
+        db.merge_show_records(&source.id, &target.id, &moved_paths, &moved_files, &journal.id)
+            .map_err(|e| RenameError::Database(e.to_string()))?;
+        Ok(())
+    })();
+    if let Err(error) = result {
+        return match crate::recover_media_operations(db) {
+            Ok(()) => Err(error),
+            Err(recovery) => Err(RenameError::Filesystem(format!("{error}; recovery pending: {recovery}"))),
+        };
+    }
+    // A cleanup failure must never roll back an already committed merge.
+    crate::recover_media_operations(db).map_err(RenameError::Filesystem)?;
+    remove_merged_source_folder(source, target);
     Ok(())
 }
 
-/// Trash (fallback hard-delete) the absorbed show folder after episodes were moved.
-fn remove_merged_source_folder(fs: &FilesystemService, source: &MediaItem, target: &MediaItem) {
+/// Remove empty directories only. Unmoved sidecars and unknown files stay on disk.
+fn remove_merged_source_folder(source: &MediaItem, target: &MediaItem) {
     let source_root = PathBuf::from(&source.folder_path);
     let target_root = PathBuf::from(&target.folder_path);
     if !source_root.is_dir() {
@@ -325,10 +413,15 @@ fn remove_merged_source_folder(fs: &FilesystemService, source: &MediaItem, targe
     {
         return;
     }
-    // Prefer trash; always fall back to hard delete so leftovers don't linger.
-    if fs.trash_item(&source_root).is_err() {
-        let _ = fs.remove_item(&source_root);
+    fn remove_empty(path: &Path) {
+        if let Ok(entries) = std::fs::read_dir(path) {
+            for entry in entries.flatten() {
+                if entry.file_type().is_ok_and(|kind| kind.is_dir()) { remove_empty(&entry.path()); }
+            }
+        }
+        let _ = std::fs::remove_dir(path);
     }
+    remove_empty(&source_root);
 }
 
 fn normalize_show_title(title: &str) -> String {
@@ -368,325 +461,127 @@ fn show_root_score(item: &MediaItem) -> i32 {
     score
 }
 
-fn rename_movie(
-    db: &AppDatabase,
-    item: &MediaItem,
-    templates: &RenameTemplates,
-) -> Result<(), RenameError> {
-    let values = build_values(db, item);
-    let new_folder_name = TemplateEngine::sanitize_filename(&TemplateEngine::render(
-        &templates.movie_folder,
-        &values,
-    ));
-    let new_file_stem = TemplateEngine::sanitize_filename(&TemplateEngine::render(
-        &templates.movie_file,
-        &values,
-    ));
-    if new_folder_name.is_empty() || new_file_stem.is_empty() {
-        return Err(RenameError::EmptyTarget);
+fn rename_movie(db: &AppDatabase, item: &MediaItem, templates: &RenameTemplates) -> Result<(), RenameError> {
+    rename_planned(db, item, templates, false)
+}
+fn rename_tv_show(db: &AppDatabase, item: &MediaItem, templates: &RenameTemplates, create_season_folders: bool) -> Result<(), RenameError> {
+    rename_planned(db, item, templates, create_season_folders)
+}
+
+/// Plan final paths before moving anything; every file is moved at most once.
+fn rename_planned(db: &AppDatabase, item: &MediaItem, templates: &RenameTemplates, create_seasons: bool) -> Result<(), RenameError> {
+    crate::recover_media_operations(db).map_err(RenameError::Filesystem)?;
+    let root = PathBuf::from(&item.folder_path);
+    let exclusive = media_core::media_files::owns_folder(db, item).map_err(|e| RenameError::Filesystem(e.to_string()))?;
+    let movie = item.media_type == MediaType::Movie;
+    if !movie && !exclusive { return Err(RenameError::Filesystem("cannot organize a shared show folder".into())); }
+    let values = build_values(db, item).map_err(RenameError::Database)?;
+    let render = |template: &str, values: &HashMap<String,String>| -> Result<String, RenameError> {
+        let name = TemplateEngine::sanitize_filename(&TemplateEngine::render(template, values));
+        if name.is_empty() { Err(RenameError::EmptyTarget) } else { Ok(name) }
+    };
+    let folder_name = render(if movie { &templates.movie_folder } else { &templates.tv_show_folder }, &values)?;
+    let mut new_root = if exclusive { root.parent().ok_or_else(|| RenameError::NotFound(root.clone()))?.join(folder_name) } else { root.clone() };
+    if new_root != root && new_root.exists() {
+        if movie { return Err(RenameError::DestinationExists(new_root)); }
+        new_root = root.clone(); // Existing show target: organize within current root.
     }
-
-    let fs = FilesystemService::new();
-    let folder = PathBuf::from(&item.folder_path);
-    if !folder.exists() {
-        return Err(RenameError::NotFound(folder));
+    let mut all_files = Vec::new();
+    collect_files(&root, exclusive, &mut all_files)?;
+    let mut destinations: HashMap<PathBuf, PathBuf> = HashMap::new();
+    if exclusive {
+        for path in &all_files { destinations.insert(path.clone(), new_root.join(path.strip_prefix(&root).unwrap())); }
     }
-
-    let mut current_folder = folder.clone();
-    let parent = folder
-        .parent()
-        .ok_or_else(|| RenameError::NotFound(folder.clone()))?;
-
-    if folder.file_name().and_then(|n| n.to_str()).unwrap_or("") != new_folder_name {
-        let dest = parent.join(&new_folder_name);
-        if dest.exists() {
-            return Err(RenameError::DestinationExists(dest));
-        }
-        fs.move_item(&folder, &dest, CollisionPolicy::Fail)
-            .map_err(|e| RenameError::Filesystem(e.to_string()))?;
-        current_folder = dest;
-    }
-
-    let mut new_file_path = item.file_path.clone();
-    if !item.file_path.is_empty() {
-        let old_video = PathBuf::from(&item.file_path);
-        let ext = old_video
-            .extension()
-            .and_then(|e| e.to_str())
-            .unwrap_or("mkv");
-        let old_stem = old_video
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or("")
-            .to_string();
-        let old_name = old_video
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("")
-            .to_string();
-        let current_video = current_folder.join(&old_name);
-        let new_video_name = format!("{new_file_stem}.{ext}");
-        let new_video = current_folder.join(&new_video_name);
-
-        if current_video.file_name() != new_video.file_name() {
-            if !new_video.exists() && current_video.exists() {
-                fs.move_item(&current_video, &new_video, CollisionPolicy::Fail)
-                    .map_err(|e| RenameError::Filesystem(e.to_string()))?;
+    let mut videos = Vec::new();
+    if movie {
+        let video = PathBuf::from(&item.file_path);
+        let stem = render(&templates.movie_file, &values)?;
+        let ext = video.extension().and_then(|s| s.to_str()).unwrap_or("mkv");
+        videos.push((video.clone(), new_root.join(format!("{stem}.{ext}"))));
+    } else {
+        for season in db.fetch_seasons(&item.id).map_err(|e| RenameError::Database(e.to_string()))? {
+            let mut season_values = values.clone();
+            season_values.insert("season".into(), season.season_number.to_string());
+            season_values.insert("seasonTitle".into(), season.title.clone().unwrap_or_default());
+            let name = render(&templates.season_folder, &season_values)?;
+            for ep in db.fetch_episodes(&season.id).map_err(|e| RenameError::Database(e.to_string()))? {
+                if ep.file_path.is_empty() { continue; }
+                let video = PathBuf::from(&ep.file_path);
+                let relative = video.strip_prefix(&root).map_err(|_| RenameError::Filesystem("episode outside exclusive show root".into()))?;
+                let old_parent = video.parent().unwrap();
+                let directory = if create_seasons || old_parent.parent() == Some(root.as_path()) { new_root.join(&name) }
+                    else { new_root.join(relative.parent().unwrap_or(Path::new(""))) };
+                // Move season artwork and other files with a renamed direct season folder.
+                if old_parent != root && old_parent.parent() == Some(root.as_path()) {
+                    for path in &all_files {
+                        if let Ok(rel) = path.strip_prefix(old_parent) { destinations.insert(path.clone(), directory.join(rel)); }
+                    }
+                }
+                let stem = render(&templates.episode_file, &build_episode_values(&values, &season, &ep))?;
+                let ext = video.extension().and_then(|s| s.to_str()).unwrap_or("mkv");
+                videos.push((video.clone(), directory.join(format!("{stem}.{ext}"))));
             }
-            rename_companions(&fs, &current_folder, &old_stem, &new_file_stem);
         }
-        new_file_path = new_video.to_string_lossy().into_owned();
     }
-
-    db.update_media_paths(
-        &item.id,
-        &current_folder.to_string_lossy(),
-        &new_file_path,
-    )
-    .map_err(|e| RenameError::Database(e.to_string()))?;
-
+    for (video, destination) in &videos {
+        if !video.is_file() { return Err(RenameError::NotFound(video.clone())); }
+        destinations.insert(video.clone(), destination.clone());
+        let old_stem = video.file_stem().and_then(|v| v.to_str()).unwrap_or("");
+        let new_stem = destination.file_stem().and_then(|v| v.to_str()).unwrap_or("");
+        for path in &all_files {
+            if path.parent() != video.parent() { continue; }
+            let ext = path.extension().and_then(|v| v.to_str()).unwrap_or("").to_ascii_lowercase();
+            if !COMPANION_EXTENSIONS.contains(&ext.as_str()) { continue; }
+            let stem = path.file_stem().and_then(|v| v.to_str()).unwrap_or("");
+            // Longest matching video stem owns a sidecar, including loose movies.
+            let owner = all_files.iter().filter(|p| p.parent() == video.parent() && p.extension().and_then(|v| v.to_str()).is_some_and(|v| media_core::scanner::MEDIA_EXTENSIONS.contains(&v.to_ascii_lowercase().as_str())))
+                .filter_map(|p| p.file_stem().and_then(|v| v.to_str())).filter(|v| companion_suffix(stem, v).is_some()).max_by_key(|v| v.len());
+            if owner != Some(old_stem) { continue; }
+            if let Some(name) = companion_dest_name(path.file_name().unwrap().to_str().unwrap_or(""), old_stem, new_stem) {
+                destinations.insert(path.clone(), destination.parent().unwrap().join(name));
+            }
+        }
+    }
+    let mut files: Vec<_> = destinations.into_iter().collect();
+    files.sort_by(|a,b| a.0.cmp(&b.0));
+    let mut targets = std::collections::HashSet::new();
+    for (from, to) in &files {
+        if !targets.insert(to.clone()) || (from != to && to.try_exists().map_err(|e| RenameError::Filesystem(e.to_string()))?) { return Err(RenameError::DestinationExists(to.clone())); }
+    }
+    let new_file = if movie { videos[0].1.to_string_lossy().into_owned() } else { new_root.to_string_lossy().into_owned() };
+    let mut journal = crate::media_journal::MergeJournal::begin(db).map_err(RenameError::Filesystem)?;
+    let result = (|| {
+        for (from,to) in &files { journal.move_file(from,to).map_err(RenameError::Filesystem)?; }
+        db.commit_media_paths(&item.id, &root, &new_root, &new_file, &files, &journal.id).map_err(|e| RenameError::Database(e.to_string()))
+    })();
+    if let Err(error) = result {
+        return match crate::recover_media_operations(db) { Ok(()) => Err(error), Err(recovery) => Err(RenameError::Filesystem(format!("{error}; recovery pending: {recovery}"))) };
+    }
+    crate::recover_media_operations(db).map_err(RenameError::Filesystem)?;
+    if exclusive && root != new_root { remove_empty_directories(&root); }
     Ok(())
 }
 
-fn rename_tv_show(
-    db: &AppDatabase,
-    item: &MediaItem,
-    templates: &RenameTemplates,
-    create_season_folders: bool,
-) -> Result<(), RenameError> {
-    let show_values = build_values(db, item);
-    let seasons = db
-        .fetch_seasons(&item.id)
-        .map_err(|e| RenameError::Database(e.to_string()))?;
-
-    let new_show_folder_name = TemplateEngine::sanitize_filename(&TemplateEngine::render(
-        &templates.tv_show_folder,
-        &show_values,
-    ));
-    if new_show_folder_name.is_empty() {
-        return Err(RenameError::EmptyTarget);
+fn collect_files(root: &Path, recursive: bool, out: &mut Vec<PathBuf>) -> Result<(), RenameError> {
+    for entry in std::fs::read_dir(root).map_err(|e| RenameError::Filesystem(e.to_string()))? {
+        let entry = entry.map_err(|e| RenameError::Filesystem(e.to_string()))?;
+        let kind = entry.file_type().map_err(|e| RenameError::Filesystem(e.to_string()))?;
+        if kind.is_symlink() { return Err(RenameError::Filesystem("symlink in rename plan".into())); }
+        if kind.is_dir() && recursive { collect_files(&entry.path(), true, out)?; }
+        else if kind.is_file() { out.push(entry.path()); }
     }
-
-    let fs = FilesystemService::new();
-    let show_folder = PathBuf::from(&item.folder_path);
-    if !show_folder.exists() {
-        return Err(RenameError::NotFound(show_folder));
-    }
-
-    let mut current_show = show_folder.clone();
-    if show_folder
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("")
-        != new_show_folder_name
-    {
-        let parent = show_folder
-            .parent()
-            .ok_or_else(|| RenameError::NotFound(show_folder.clone()))?;
-        let dest = parent.join(&new_show_folder_name);
-        if dest.exists() {
-            // Do not abort: still rename episodes / create Season XX under the
-            // current folder. Aborting here skipped organize entirely (silent Ok).
-        } else {
-            fs.move_item(&show_folder, &dest, CollisionPolicy::Fail)
-                .map_err(|e| RenameError::Filesystem(e.to_string()))?;
-            current_show = dest;
-        }
-    }
-
-    for season in &seasons {
-        let episodes = db
-            .fetch_episodes(&season.id)
-            .map_err(|e| RenameError::Database(e.to_string()))?;
-        let Some(first) = episodes.iter().find(|e| !e.file_path.is_empty()) else {
-            continue;
-        };
-
-        let old_ep_path = PathBuf::from(&first.file_path);
-        let old_season_dir = old_ep_path
-            .parent()
-            .map(Path::to_path_buf)
-            .unwrap_or_else(|| show_folder.clone());
-
-        let relative_season = old_season_dir
-            .strip_prefix(&show_folder)
-            .ok()
-            .map(|p| p.to_path_buf());
-
-        let mut current_season = if let Some(rel) = &relative_season {
-            current_show.join(rel)
-        } else {
-            current_show.clone()
-        };
-
-        let mut season_values = show_values.clone();
-        season_values.insert("season".into(), season.season_number.to_string());
-        season_values.insert(
-            "seasonTitle".into(),
-            season.title.clone().unwrap_or_default(),
-        );
-
-        let new_season_folder_name = TemplateEngine::sanitize_filename(&TemplateEngine::render(
-            &templates.season_folder,
-            &season_values,
-        ));
-
-        // Create / rename into Season XX when requested (RENAME-T-06).
-        if create_season_folders && !new_season_folder_name.is_empty() {
-            let target_season = current_show.join(&new_season_folder_name);
-            if current_season != target_season {
-                if !target_season.exists() {
-                    fs.create_directory(&target_season)
-                        .map_err(|e| RenameError::Filesystem(e.to_string()))?;
-                }
-                // Move episode files (and companions) from current_season into target.
-                for ep in &episodes {
-                    if ep.file_path.is_empty() {
-                        continue;
-                    }
-                    let old_ep = PathBuf::from(&ep.file_path);
-                    let old_name = old_ep
-                        .file_name()
-                        .and_then(|n| n.to_str())
-                        .unwrap_or("")
-                        .to_string();
-                    if old_name.is_empty() {
-                        continue;
-                    }
-                    let old_stem = old_ep
-                        .file_stem()
-                        .and_then(|s| s.to_str())
-                        .unwrap_or("")
-                        .to_string();
-                    let src = if old_ep.starts_with(&show_folder) {
-                        let rel = old_ep.strip_prefix(&show_folder).unwrap_or(&old_ep);
-                        current_show.join(rel)
-                    } else if old_ep.exists() {
-                        old_ep.clone()
-                    } else {
-                        current_season.join(&old_name)
-                    };
-                    let from_dir = src
-                        .parent()
-                        .map(Path::to_path_buf)
-                        .unwrap_or_else(|| current_season.clone());
-                    let dest = target_season.join(&old_name);
-                    if src != dest && src.exists() && !dest.exists() {
-                        fs.move_item(&src, &dest, CollisionPolicy::Fail)
-                            .map_err(|e| RenameError::Filesystem(e.to_string()))?;
-                    }
-                    // Bring sidecars even if a previous partial run already moved the video.
-                    move_companions(&fs, &from_dir, &target_season, &old_stem);
-                    if from_dir != current_season {
-                        move_companions(&fs, &current_season, &target_season, &old_stem);
-                    }
-                    let new_ep_path = dest.to_string_lossy().into_owned();
-                    if new_ep_path != ep.file_path {
-                        let _ = db.update_episode_file_path(&ep.id, &new_ep_path);
-                    }
-                    sync_episode_still_path(
-                        db,
-                        ep,
-                        &current_show,
-                        &target_season,
-                        &old_stem,
-                        &old_stem,
-                    );
-                }
-                current_season = target_season;
-            }
-        } else if !new_season_folder_name.is_empty()
-            && current_season
-                .parent()
-                .map(|p| p == current_show.as_path())
-                .unwrap_or(false)
-            && current_season
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or("")
-                != new_season_folder_name
-        {
-            // Rename season folder only when it is a direct child of the show folder.
-            let new_season = current_show.join(&new_season_folder_name);
-            if !new_season.exists() && current_season.exists() {
-                fs.move_item(&current_season, &new_season, CollisionPolicy::Fail)
-                    .map_err(|e| RenameError::Filesystem(e.to_string()))?;
-                current_season = new_season;
-            }
-        }
-
-        // Re-fetch episode paths after possible organize moves.
-        let episodes = db
-            .fetch_episodes(&season.id)
-            .map_err(|e| RenameError::Database(e.to_string()))?;
-
-        for ep in &episodes {
-            if ep.file_path.is_empty() {
-                continue;
-            }
-            let ep_values = build_episode_values(&show_values, season, ep);
-            let new_ep_stem = TemplateEngine::sanitize_filename(&TemplateEngine::render(
-                &templates.episode_file,
-                &ep_values,
-            ));
-            if new_ep_stem.is_empty() {
-                continue;
-            }
-
-            let old_ep = PathBuf::from(&ep.file_path);
-            let ext = old_ep
-                .extension()
-                .and_then(|e| e.to_str())
-                .unwrap_or("mkv");
-            let old_stem = old_ep
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .unwrap_or("")
-                .to_string();
-            let old_name = old_ep
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or("")
-                .to_string();
-
-            let current_ep = if old_ep.exists() {
-                old_ep.clone()
-            } else {
-                current_season.join(&old_name)
-            };
-            let dest_dir = current_ep
-                .parent()
-                .map(Path::to_path_buf)
-                .unwrap_or_else(|| current_season.clone());
-            let new_ep_name = format!("{new_ep_stem}.{ext}");
-            let new_ep = dest_dir.join(&new_ep_name);
-
-            if current_ep.file_name() != new_ep.file_name() {
-                if !new_ep.exists() && current_ep.exists() {
-                    fs.move_item(&current_ep, &new_ep, CollisionPolicy::Fail)
-                        .map_err(|e| RenameError::Filesystem(e.to_string()))?;
-                }
-                rename_companions(&fs, &dest_dir, &old_stem, &new_ep_stem);
-            }
-
-            let new_ep_path = new_ep.to_string_lossy().into_owned();
-            if new_ep_path != ep.file_path {
-                let _ = db.update_episode_file_path(&ep.id, &new_ep_path);
-            }
-            sync_episode_still_path(db, ep, &current_show, &dest_dir, &old_stem, &new_ep_stem);
-        }
-    }
-
-    let show_path = current_show.to_string_lossy().into_owned();
-    db.update_media_paths(&item.id, &show_path, &show_path)
-        .map_err(|e| RenameError::Database(e.to_string()))?;
-
     Ok(())
 }
+fn remove_empty_directories(root: &Path) {
+    if let Ok(entries) = std::fs::read_dir(root) {
+        for entry in entries.flatten() { if entry.file_type().is_ok_and(|k| k.is_dir()) { remove_empty_directories(&entry.path()); } }
+    }
+    let _ = std::fs::remove_dir(root);
+}
 
-fn build_values(db: &AppDatabase, item: &MediaItem) -> HashMap<String, String> {
+fn build_values(db: &AppDatabase, item: &MediaItem) -> Result<HashMap<String, String>, String> {
     let mut values = HashMap::new();
-    let meta = db.fetch_metadata(&item.id).ok().flatten();
+    let meta = db.fetch_metadata(&item.id).map_err(|e| e.to_string())?;
     values.insert("title".into(), item.title.clone());
     if let Some(ot) = &item.original_title {
         values.insert("originalTitle".into(), ot.clone());
@@ -735,7 +630,7 @@ fn build_values(db: &AppDatabase, item: &MediaItem) -> HashMap<String, String> {
             values.insert("tmdbId".into(), t);
         }
     }
-    values
+    Ok(values)
 }
 
 fn build_episode_values(
@@ -763,88 +658,6 @@ fn build_episode_values(
     v
 }
 
-fn rename_companions(fs: &FilesystemService, dir: &Path, old_stem: &str, new_stem: &str) {
-    if old_stem == new_stem || old_stem.is_empty() {
-        return;
-    }
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if !path.is_file() {
-            continue;
-        }
-        let ext = path
-            .extension()
-            .and_then(|e| e.to_str())
-            .unwrap_or("")
-            .to_ascii_lowercase();
-        if !COMPANION_EXTENSIONS.contains(&ext.as_str()) {
-            continue;
-        }
-        let stem = path
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or("")
-            .to_string();
-        let Some(suffix) = companion_suffix(&stem, old_stem) else {
-            continue;
-        };
-        let new_name = format!("{new_stem}{suffix}.{ext}");
-        let dest = dir.join(new_name);
-        if !dest.exists() {
-            let _ = fs.move_item(&path, &dest, CollisionPolicy::Fail);
-        }
-    }
-}
-
-/// Move companion files that share `stem` from `from_dir` into `to_dir` (keep names).
-fn move_companions(fs: &FilesystemService, from_dir: &Path, to_dir: &Path, stem: &str) {
-    if from_dir == to_dir || stem.is_empty() {
-        return;
-    }
-    let Ok(entries) = std::fs::read_dir(from_dir) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if !path.is_file() {
-            continue;
-        }
-        let ext = path
-            .extension()
-            .and_then(|e| e.to_str())
-            .unwrap_or("")
-            .to_ascii_lowercase();
-        if !COMPANION_EXTENSIONS.contains(&ext.as_str()) {
-            continue;
-        }
-        let file_stem = path
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or("")
-            .to_string();
-        if companion_suffix(&file_stem, stem).is_none() {
-            continue;
-        }
-        let name = path
-            .file_name()
-            .map(|n| n.to_owned())
-            .unwrap_or_default();
-        let dest = to_dir.join(name);
-        if !dest.exists() {
-            let _ = fs.move_item(&path, &dest, CollisionPolicy::Fail);
-        }
-    }
-}
-
-fn relative_to_show(path: &Path, show_root: &Path) -> String {
-    path.strip_prefix(show_root)
-        .map(|p| p.to_string_lossy().replace('\\', "/"))
-        .unwrap_or_else(|_| path.to_string_lossy().into_owned())
-}
-
 fn companion_dest_name(file_name: &str, old_stem: &str, new_stem: &str) -> Option<String> {
     let path = Path::new(file_name);
     let stem = path.file_stem()?.to_str()?;
@@ -853,57 +666,6 @@ fn companion_dest_name(file_name: &str, old_stem: &str, new_stem: &str) -> Optio
     Some(format!("{new_stem}{suffix}.{ext}"))
 }
 
-fn sync_episode_still_path(
-    db: &AppDatabase,
-    ep: &TvEpisode,
-    show_root: &Path,
-    dest_dir: &Path,
-    old_stem: &str,
-    new_stem: &str,
-) {
-    let Some(still) = ep.still_path.as_deref() else {
-        // Discover scraped still left next to the episode after move/rename.
-        for candidate in [
-            format!("{new_stem}-thumb.jpg"),
-            format!("{new_stem}_thumb.jpg"),
-            format!("{old_stem}-thumb.jpg"),
-            format!("{old_stem}_thumb.jpg"),
-        ] {
-            let abs = dest_dir.join(&candidate);
-            if abs.is_file() {
-                let rel = relative_to_show(&abs, show_root);
-                let _ = db.update_episode_still_path(&ep.id, &rel);
-                return;
-            }
-        }
-        return;
-    };
-
-    let old_name = Path::new(still)
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("");
-    if old_name.is_empty() {
-        return;
-    }
-    let new_name =
-        companion_dest_name(old_name, old_stem, new_stem).unwrap_or_else(|| old_name.to_string());
-    let new_abs = dest_dir.join(&new_name);
-    if new_abs.is_file() {
-        let rel = relative_to_show(&new_abs, show_root);
-        if rel != still {
-            let _ = db.update_episode_still_path(&ep.id, &rel);
-        }
-        return;
-    }
-    let alt = dest_dir.join(old_name);
-    if alt.is_file() {
-        let rel = relative_to_show(&alt, show_root);
-        if rel != still {
-            let _ = db.update_episode_still_path(&ep.id, &rel);
-        }
-    }
-}
 
 #[cfg(test)]
 mod tests {
@@ -911,6 +673,180 @@ mod tests {
     use media_core::scanner::ScannedEpisode;
     use media_core::{Library, MediaType, ScrapedStatus};
     use tempfile::tempdir;
+
+    #[test]
+    fn template_commit_failure_restores_video_sidecar_and_database() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().join("Old");
+        std::fs::create_dir(&root).unwrap();
+        let video = root.join("Old.mkv");
+        std::fs::write(&video, "video").unwrap();
+        std::fs::write(root.join("Old.srt"), "subtitle").unwrap();
+        let db = AppDatabase::open_in_memory().unwrap();
+        let lib = Library::new("Movies", dir.path().to_string_lossy(), MediaType::Movie);
+        db.insert_library(&lib).unwrap();
+        let item = MediaItem::new_movie("New", None, root.to_string_lossy(), video.to_string_lossy(), lib.id, ScrapedStatus::Scraped);
+        db.insert_media_items(&[item.clone()]).unwrap();
+        db.with_conn(|c| { c.execute_batch("CREATE TRIGGER fail_paths BEFORE UPDATE OF folderPath ON media_items BEGIN SELECT RAISE(ABORT, 'injected'); END;")?; Ok(()) }).unwrap();
+        let templates = RenameTemplates { movie_folder: "New".into(), movie_file: "New".into(), ..Default::default() };
+        assert!(rename_after_scrape(&db, &item, &templates).is_err());
+        assert!(video.is_file());
+        assert!(root.join("Old.srt").is_file());
+        assert_eq!(db.get_media_item(&item.id).unwrap().unwrap().file_path, item.file_path);
+        assert!(db.media_operations().unwrap().is_empty());
+        assert!(!dir.path().join("New").exists());
+        db.with_conn(|c| { c.execute_batch("DROP TRIGGER fail_paths")?; Ok(()) }).unwrap();
+        rename_after_scrape(&db, &item, &templates).unwrap();
+        assert!(dir.path().join("New/New.mkv").is_file());
+        assert!(dir.path().join("New/New.srt").is_file());
+    }
+
+    #[test]
+    fn template_duplicate_destinations_are_rejected_before_any_move() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().join("Old");
+        std::fs::create_dir(&root).unwrap();
+        let db = AppDatabase::open_in_memory().unwrap();
+        let lib = Library::new("TV", dir.path().to_string_lossy(), MediaType::TvShow);
+        db.insert_library(&lib).unwrap();
+        let item = MediaItem::new_show(MediaType::TvShow, "New", None, root.to_string_lossy(), lib.id, ScrapedStatus::Scraped);
+        db.insert_media_items(&[item.clone()]).unwrap();
+        for number in 1..=2 {
+            let path = root.join(format!("S01E0{number}.mkv"));
+            std::fs::write(&path, "video").unwrap();
+            db.insert_show_episodes(&item.id, &[ScannedEpisode { season:1, episode:number, title:String::new(), file_path:path.to_string_lossy().into_owned() }]).unwrap();
+        }
+        let templates = RenameTemplates { tv_show_folder: "New".into(), episode_file: "same".into(), ..Default::default() };
+        assert!(rename_after_scrape(&db, &item, &templates).is_err());
+        assert!(root.join("S01E01.mkv").is_file());
+        assert!(root.join("S01E02.mkv").is_file());
+        assert!(!dir.path().join("New").exists());
+    }
+
+    #[test]
+    fn merge_database_failure_rolls_back_video_and_sidecars_then_retry_preserves_metadata() {
+        let dir = tempdir().unwrap();
+        let db = AppDatabase::open_in_memory().unwrap();
+        let lib = Library::new("TV", dir.path().to_string_lossy(), MediaType::TvShow);
+        db.insert_library(&lib).unwrap();
+        let mut shows = Vec::new();
+        for (name, season) in [("Target", 1), ("Source", 2)] {
+            let folder = dir.path().join(name);
+            std::fs::create_dir(&folder).unwrap();
+            let video = folder.join(format!("S0{season}E01.mkv"));
+            std::fs::write(&video, name).unwrap();
+            let show = MediaItem::new_show(
+                MediaType::TvShow,
+                "Show",
+                None,
+                folder.to_string_lossy(),
+                lib.id.clone(),
+                ScrapedStatus::Scraped,
+            );
+            db.insert_media_items(&[show.clone()]).unwrap();
+            db.insert_show_episodes(
+                &show.id,
+                &[ScannedEpisode {
+                    season,
+                    episode: 1,
+                    file_path: video.to_string_lossy().into_owned(),
+                    title: "Title".into(),
+                }],
+            )
+            .unwrap();
+            shows.push(show);
+        }
+        let target = &shows[0];
+        let source = &shows[1];
+        let source_season = db.fetch_seasons(&source.id).unwrap().remove(0);
+        let mut original = db.fetch_episodes(&source_season.id).unwrap().remove(0);
+        original.overview = Some("Keep overview".into());
+        original.rating = Some(8.5);
+        original.still_path = Some("S02E01-thumb.jpg".into());
+        db.upsert_episode(&original).unwrap();
+        let subtitle = dir.path().join("Source/S02E01.zh.srt");
+        std::fs::write(&subtitle, "subtitle").unwrap();
+        std::fs::write(dir.path().join("Source/S02E01-thumb.jpg"), "image").unwrap();
+        db.with_conn(|conn| { conn.execute_batch("CREATE TRIGGER fail_merge BEFORE DELETE ON media_items BEGIN SELECT RAISE(ABORT, 'injected'); END;")?; Ok(()) }).unwrap();
+        assert!(merge_show_into(&db, source, target, &RenameTemplates::default()).is_err());
+        assert!(std::path::Path::new(&original.file_path).exists());
+        assert!(subtitle.exists());
+        assert!(!dir.path().join("Target/Season 02/S02E01.mkv").exists());
+        assert!(db.get_media_item(&source.id).unwrap().is_some());
+        assert_eq!(
+            db.fetch_episodes(&source_season.id).unwrap()[0].file_path,
+            original.file_path
+        );
+        assert_eq!(db.fetch_seasons(&target.id).unwrap().len(), 1);
+        db.with_conn(|conn| {
+            conn.execute_batch("DROP TRIGGER fail_merge")?;
+            Ok(())
+        })
+        .unwrap();
+        merge_show_into(&db, source, target, &RenameTemplates::default()).unwrap();
+        let merged_season = db
+            .fetch_seasons(&target.id)
+            .unwrap()
+            .into_iter()
+            .find(|s| s.season_number == 2)
+            .unwrap();
+        let merged = db.fetch_episodes(&merged_season.id).unwrap().remove(0);
+        assert_eq!(merged.id, original.id);
+        assert_eq!(merged.overview, original.overview);
+        assert_eq!(merged.rating, original.rating);
+        assert!(Path::new(merged.still_path.as_ref().unwrap()).is_file());
+        assert!(Path::new(&merged.file_path).is_file());
+        assert!(db.get_media_item(&source.id).unwrap().is_none());
+    }
+
+    #[test]
+    fn conflicting_episode_merge_preserves_both_sources_and_records() {
+        let dir = tempdir().unwrap();
+        let db = AppDatabase::open_in_memory().unwrap();
+        let lib = Library::new("TV", dir.path().to_string_lossy(), MediaType::TvShow);
+        db.insert_library(&lib).unwrap();
+        let mut shows = Vec::new();
+        for name in ["Main", "Duplicate"] {
+            let folder = dir.path().join(name);
+            std::fs::create_dir(&folder).unwrap();
+            let video = folder.join("S01E01.mkv");
+            std::fs::write(&video, name).unwrap();
+            let item = MediaItem::new_show(MediaType::TvShow, "Show", Some(2020), folder.to_string_lossy(), lib.id.clone(), ScrapedStatus::Scraped);
+            db.insert_media_items(&[item.clone()]).unwrap();
+            db.insert_show_episodes(&item.id, &[ScannedEpisode {
+                season: 1, episode: 1, file_path: video.to_string_lossy().into_owned(), title: "Episode".into(),
+            }]).unwrap();
+            shows.push(item);
+        }
+        assert!(merge_show_into(&db, &shows[1], &shows[0], &RenameTemplates::default()).is_err());
+        assert_eq!(db.list_media_items(&lib.id).unwrap().len(), 2);
+        assert_eq!(std::fs::read_to_string(dir.path().join("Main/S01E01.mkv")).unwrap(), "Main");
+        assert_eq!(std::fs::read_to_string(dir.path().join("Duplicate/S01E01.mkv")).unwrap(), "Duplicate");
+    }
+
+    #[test]
+    fn loose_movie_rename_preserves_library_root_and_other_movies() {
+        let dir = tempdir().unwrap();
+        let video = dir.path().join("Old.mkv");
+        std::fs::write(&video, b"a").unwrap();
+        std::fs::write(dir.path().join("Other.mkv"), b"b").unwrap();
+        std::fs::write(dir.path().join("Old.zh.srt"), b"own subtitle").unwrap();
+        std::fs::write(dir.path().join("Old.Extended.mkv"), b"other movie").unwrap();
+        std::fs::write(dir.path().join("Old.Extended.srt"), b"other subtitle").unwrap();
+        let db = AppDatabase::open_in_memory().unwrap();
+        let lib = Library::new("Movies", dir.path().to_string_lossy(), MediaType::Movie);
+        db.insert_library(&lib).unwrap();
+        let item = MediaItem::new_movie("New", Some(2020), dir.path().to_string_lossy(), video.to_string_lossy(), lib.id, ScrapedStatus::Scraped);
+        db.insert_media_items(&[item.clone()]).unwrap();
+        let templates = RenameTemplates { movie_file: "New".into(), movie_folder: "MustNotMoveRoot".into(), ..Default::default() };
+        rename_after_scrape(&db, &item, &templates).unwrap();
+        assert!(dir.path().join("New.mkv").is_file());
+        assert!(dir.path().join("Other.mkv").is_file());
+        assert!(dir.path().join("New.zh.srt").is_file());
+        assert!(dir.path().join("Old.Extended.srt").is_file());
+        assert!(!dir.path().join("New.Extended.srt").exists());
+        assert_eq!(db.get_media_item(&item.id).unwrap().unwrap().folder_path, item.folder_path);
+    }
 
     #[test]
     fn organizes_flat_episodes_into_season_xx() {

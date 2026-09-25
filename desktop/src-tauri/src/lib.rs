@@ -6,10 +6,10 @@ mod task_queue;
 mod tray;
 mod ui_i18n;
 
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use state::AppState;
-#[cfg(target_os = "windows")]
 use tauri::Manager;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
@@ -20,13 +20,29 @@ pub fn run() {
     let logs = log_store::LogStore::new();
     init_tracing(logs.clone());
 
-    let state = AppState::bootstrap(logs.clone()).expect("failed to bootstrap kaigua app state");
+    let state = AppState::bootstrap(logs.clone()).expect("failed to bootstrap sula app state");
 
-    tauri::Builder::default()
+    let app = tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_notification::init())
         .manage(state)
+        .on_window_event(|window, event| {
+            if window.label() != "main" {
+                return;
+            }
+            let tauri::WindowEvent::CloseRequested { api, .. } = event else {
+                return;
+            };
+            let keep_running = window
+                .try_state::<AppState>()
+                .map(|state| state.keep_running_on_close.load(Ordering::Relaxed))
+                .unwrap_or(true);
+            if keep_running {
+                api.prevent_close();
+                let _ = window.hide();
+            }
+        })
         .setup(move |app| {
             logs.attach_app(app.handle().clone());
             tray::setup(app.handle())?;
@@ -89,8 +105,19 @@ pub fn run() {
             commands::list_directory,
             commands::reveal_in_file_manager,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running kaigua");
+        .build(tauri::generate_context!())
+        .expect("error while building sula");
+
+    app.run(|app, event| {
+        #[cfg(target_os = "macos")]
+        if let tauri::RunEvent::Reopen {
+            has_visible_windows: false,
+            ..
+        } = event
+        {
+            tray::show_main_window(app);
+        }
+    });
 }
 
 fn init_tracing(logs: Arc<log_store::LogStore>) {
@@ -104,5 +131,7 @@ fn init_tracing(logs: Arc<log_store::LogStore>) {
         )
         .with(log_store::AppLogLayer::new(logs))
         .init();
-    tracing::info!("kaigua tracing initialized");
+    tracing::info!("sula tracing initialized");
 }
+
+mod credentials;

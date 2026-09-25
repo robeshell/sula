@@ -3,7 +3,7 @@ name = "media-core"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "kaigua domain: models, SQLite, filesystem, scanning primitives"
+description = "sula domain: models, SQLite, filesystem, scanning primitives"
 
 [dependencies]
 anyhow.workspace = true

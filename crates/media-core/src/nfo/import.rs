@@ -23,12 +23,25 @@ pub fn import_nfo_for_item(db: &AppDatabase, item: &MediaItem) -> Result<bool, D
         return Ok(false);
     }
 
-    let Some(parsed) = find_and_parse_nfo(item, &folder) else {
+    // Avoid an ownership/database walk for the common scan case with no NFO.
+    let has_nfo = fs::read_dir(&folder)?.any(|entry| entry.ok().is_some_and(|entry| {
+        entry.path().extension().and_then(|e| e.to_str()).is_some_and(|e| e.eq_ignore_ascii_case("nfo"))
+    }));
+    if !has_nfo { return Ok(false); }
+    let exclusive = crate::media_files::owns_folder(db, item)
+        .map_err(|e| std::io::Error::other(e.to_string()))?;
+    let Some(parsed) = find_and_parse_nfo(item, &folder, exclusive) else {
         return Ok(false);
     };
 
-    let poster_path = detect_artwork(&folder, &["poster", "cover", "folder"]);
-    let fanart_path = detect_artwork(&folder, &["fanart", "backdrop", "background"]);
+    let movie_stem = Path::new(&item.file_path).file_stem().and_then(|v| v.to_str());
+    let artwork = |suffix: &str, fallbacks: &[&str]| {
+        let specific = movie_stem.filter(|_| item.media_type == MediaType::Movie)
+            .and_then(|stem| detect_artwork(&folder, &[&format!("{stem}-{suffix}")]));
+        specific.or_else(|| if exclusive { detect_artwork(&folder, fallbacks) } else { None })
+    };
+    let poster_path = artwork("poster", &["poster", "cover", "folder"]);
+    let fanart_path = artwork("fanart", &["fanart", "backdrop", "background"]);
 
     let metadata = MediaMetadata {
         media_item_id: item.id.clone(),
@@ -84,13 +97,16 @@ pub fn import_nfo_for_item(db: &AppDatabase, item: &MediaItem) -> Result<bool, D
     Ok(true)
 }
 
-fn find_and_parse_nfo(item: &MediaItem, folder: &Path) -> Option<NfoParsedData> {
+fn find_and_parse_nfo(item: &MediaItem, folder: &Path, exclusive: bool) -> Option<NfoParsedData> {
     let mut candidate_names = Vec::new();
     if !item.file_path.is_empty() {
         let video = Path::new(&item.file_path);
         if let Some(stem) = video.file_stem().and_then(|s| s.to_str()) {
             candidate_names.push(format!("{stem}.nfo"));
         }
+    }
+    if !exclusive {
+        return candidate_names.iter().find_map(|name| try_parse_file(&folder.join(name), item.media_type));
     }
     if let Some(folder_name) = folder.file_name().and_then(|n| n.to_str()) {
         candidate_names.push(format!("{folder_name}.nfo"));

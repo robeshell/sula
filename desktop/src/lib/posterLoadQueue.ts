@@ -9,6 +9,19 @@ export const EPISODE_STILL = { width: 160, height: 90 } as const;
 
 /** Cap concurrent thumbnail IPC/decode so a full grid does not stall the UI. */
 const MAX_CONCURRENT = 6;
+const MAX_CACHE_ENTRIES = 512;
+let generation = 0;
+const listeners = new Set<() => void>();
+export const posterCacheVersion = () => generation;
+export function subscribePosterCache(listener: () => void): () => void {
+  listeners.add(listener);
+  return () => { listeners.delete(listener); };
+}
+export function invalidatePosterCache() {
+  generation += 1;
+  cache.clear();
+  listeners.forEach((listener) => listener());
+}
 
 let active = 0;
 const waiters: Array<() => void> = [];
@@ -58,11 +71,17 @@ function cacheKey(opts: ResolvePosterOptions): string {
 export function resolvePosterSrc(opts: ResolvePosterOptions): Promise<string | null> {
   const key = cacheKey(opts);
   const hit = cache.get(key);
-  if (hit) return hit;
+  if (hit) {
+    cache.delete(key);
+    cache.set(key, hit);
+    return hit;
+  }
+  const version = generation;
 
   const job = (async () => {
     await acquire();
     try {
+      if (version !== generation) return null;
       const posterPath = opts.posterPath?.trim() || "poster.jpg";
       const cachePath = await invoke<string | null>("resolve_poster_thumbnail", {
         folderPath: opts.folderPath,
@@ -71,7 +90,7 @@ export function resolvePosterSrc(opts: ResolvePosterOptions): Promise<string | n
         height: opts.height ?? POSTER_THUMB.height,
         allowFallbacks: opts.allowFallbacks ?? true,
       });
-      return cachePath ? convertFileSrc(cachePath) : null;
+      return cachePath && version === generation ? convertFileSrc(cachePath) : null;
     } catch {
       return null;
     } finally {
@@ -80,5 +99,10 @@ export function resolvePosterSrc(opts: ResolvePosterOptions): Promise<string | n
   })();
 
   cache.set(key, job);
+  while (cache.size > MAX_CACHE_ENTRIES) cache.delete(cache.keys().next().value!);
+  void job.then((value) => {
+    // Missing/error results are retryable, and an old request must not evict a new one.
+    if (!value && cache.get(key) === job) cache.delete(key);
+  });
   return job;
 }

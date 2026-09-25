@@ -46,8 +46,20 @@ pub fn scan_movies_under(
     roots: &[PathBuf],
     existing_file_paths: &HashSet<String>,
     excluded_folders: &HashSet<String>,
-    mut on_progress: impl FnMut(ScanProgress),
+    on_progress: impl FnMut(ScanProgress),
 ) -> Result<MovieScanResult, std::io::Error> {
+    scan_movies_under_cancellable(library, roots, existing_file_paths, excluded_folders, on_progress, &std::sync::atomic::AtomicBool::new(false))
+}
+
+pub fn scan_movies_under_cancellable(
+    library: &Library,
+    roots: &[PathBuf],
+    existing_file_paths: &HashSet<String>,
+    excluded_folders: &HashSet<String>,
+    mut on_progress: impl FnMut(ScanProgress),
+    cancel: &std::sync::atomic::AtomicBool,
+) -> Result<MovieScanResult, std::io::Error> {
+    super::check_cancel(cancel)?;
     let mut items = Vec::new();
     let mut discovered = 0u32;
     let mut seen_files: HashSet<String> = HashSet::new();
@@ -72,6 +84,7 @@ pub fn scan_movies_under(
         });
 
         for entry in walker {
+            super::check_cancel(cancel)?;
             let entry = entry?;
             if !entry.file_type().is_file() {
                 continue;
@@ -131,6 +144,7 @@ pub fn scan_movies_under(
         }
     }
 
+    super::check_cancel(cancel)?;
     Ok(MovieScanResult { new_items: items })
 }
 

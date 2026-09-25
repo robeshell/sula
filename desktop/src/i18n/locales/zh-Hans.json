@@ -1,6 +1,7 @@
 {
+  "list.sort": "排序",
   "app.title": "资料库",
-  "app.brand": "开刮",
+  "app.brand": "Sula",
   "action.refresh": "刷新",
   "action.refreshing": "扫描中…",
   "action.scrapeAll": "全部刮削",
@@ -151,6 +152,9 @@
   "settings.appearance.saved": "外观设置已保存",
   "settings.tray.enabled": "显示菜单栏 / 托盘图标",
   "settings.tray.saved": "托盘设置已保存",
+  "settings.background.keepRunning": "关闭窗口后继续在后台运行",
+  "settings.background.keepRunningHint": "可从 Dock 或菜单栏 / 托盘图标再次打开。",
+  "settings.background.saved": "后台运行设置已保存",
   "settings.rename.auto": "刮削后自动改名",
   "settings.rename.createSeasons": "改名时创建 Season 文件夹",
   "settings.rename.createSeasonsHint": "剧集/动漫：把集文件整理进 Season XX（模板可改）",
@@ -165,7 +169,7 @@
   "delete.message": "确认删除「{{title}}」？",
   "delete.multiTitle": "{{count}} 个条目",
   "delete.alsoTrash": "同时删除本地文件",
-  "delete.alsoTrashHint": "将删除媒体文件夹；废纸篓不可用时会永久删除",
+  "delete.alsoTrashHint": "独占文件夹会整体移到废纸篓；共享文件夹只移走所选电影文件。废纸篓不可用时停止。",
   "delete.confirm": "删除",
   "lang.zh": "中文",
   "lang.en": "English",
@@ -321,5 +325,7 @@
   "action.more": "更多",
   "detail.close": "关闭详情",
   "settings.language.label": "界面语言",
-  "settings.language.saved": "语言设置已保存"
+  "settings.language.saved": "语言设置已保存",
+  "err.configRecovered": "设置文件损坏，已保留备份并恢复默认设置。",
+  "tasks.result": "成功 {{success}} · 未匹配 {{unmatched}} · 失败 {{failed}}"
 }

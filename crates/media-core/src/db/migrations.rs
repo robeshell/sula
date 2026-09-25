@@ -2,7 +2,7 @@
 
 use rusqlite::{Connection, OptionalExtension};
 
-const SCHEMA_VERSION: i32 = 1;
+const SCHEMA_VERSION: i32 = 3;
 
 pub fn migrate(conn: &Connection) -> rusqlite::Result<()> {
     conn.execute_batch(
@@ -26,7 +26,8 @@ pub fn migrate(conn: &Connection) -> rusqlite::Result<()> {
         .unwrap_or(0);
 
     if current < 1 {
-        conn.execute_batch(
+        let tx = conn.unchecked_transaction()?;
+        tx.execute_batch(
             "
             CREATE TABLE libraries (
                 id TEXT PRIMARY KEY NOT NULL,
@@ -140,12 +141,32 @@ pub fn migrate(conn: &Connection) -> rusqlite::Result<()> {
             ",
         )?;
 
-        conn.execute(
+        tx.execute(
             "INSERT INTO schema_migrations (version, applied_at) VALUES (?1, datetime('now'))",
-            [SCHEMA_VERSION],
+            [1],
         )?;
+        tx.commit()?;
     }
 
+    if current < 2 {
+        let tx = conn.unchecked_transaction()?;
+        tx.execute_batch("CREATE TABLE media_operation_journal (
+            id TEXT PRIMARY KEY NOT NULL,
+            payload TEXT NOT NULL,
+            committed INTEGER NOT NULL DEFAULT 0
+        );")?;
+        tx.execute("INSERT INTO schema_migrations (version, applied_at) VALUES (?1, datetime('now'))", [2])?;
+        tx.commit()?;
+    }
+    if current < 3 {
+        let tx = conn.unchecked_transaction()?;
+        tx.execute_batch("CREATE TABLE library_root_identity (
+            library_id TEXT PRIMARY KEY REFERENCES libraries(id) ON DELETE CASCADE,
+            root_path TEXT NOT NULL, identity TEXT NOT NULL
+        );")?;
+        tx.execute("INSERT INTO schema_migrations (version, applied_at) VALUES (?1, datetime('now'))", [SCHEMA_VERSION])?;
+        tx.commit()?;
+    }
     Ok(())
 }
 
@@ -153,6 +174,44 @@ pub fn migrate(conn: &Connection) -> rusqlite::Result<()> {
 mod tests {
     use super::*;
     use rusqlite::Connection;
+
+    #[test]
+    fn root_identity_upgrade_rolls_back_and_retries() {
+        let conn = Connection::open_in_memory().unwrap(); migrate(&conn).unwrap();
+        conn.execute_batch("DROP TABLE library_root_identity; DELETE FROM schema_migrations WHERE version=3;
+            CREATE TRIGGER fail_v3 BEFORE INSERT ON schema_migrations WHEN NEW.version=3 BEGIN SELECT RAISE(ABORT, 'injected'); END;").unwrap();
+        assert!(migrate(&conn).is_err());
+        let count: i64 = conn.query_row("SELECT COUNT(*) FROM sqlite_master WHERE name='library_root_identity'", [], |r| r.get(0)).unwrap();
+        assert_eq!(count, 0);
+        conn.execute_batch("DROP TRIGGER fail_v3").unwrap(); migrate(&conn).unwrap();
+    }
+
+    #[test]
+    fn journal_upgrade_rolls_back_and_retries_from_v1() {
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        conn.execute_batch("DROP TABLE library_root_identity; DROP TABLE media_operation_journal; DELETE FROM schema_migrations WHERE version>=2;
+            CREATE TRIGGER fail_v2 BEFORE INSERT ON schema_migrations WHEN NEW.version=2 BEGIN SELECT RAISE(ABORT, 'injected'); END;").unwrap();
+        assert!(migrate(&conn).is_err());
+        let count: i64 = conn.query_row("SELECT COUNT(*) FROM sqlite_master WHERE name='media_operation_journal'", [], |r| r.get(0)).unwrap();
+        assert_eq!(count, 0);
+        conn.execute_batch("DROP TRIGGER fail_v2").unwrap();
+        migrate(&conn).unwrap();
+        migrate(&conn).unwrap();
+    }
+
+    #[test]
+    fn failed_migration_rolls_back_ddl_and_can_retry() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE schema_migrations(version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL);
+            CREATE TRIGGER fail_version BEFORE INSERT ON schema_migrations BEGIN SELECT RAISE(ABORT, 'injected'); END;").unwrap();
+        assert!(migrate(&conn).is_err());
+        let count: i64 = conn.query_row("SELECT COUNT(*) FROM sqlite_master WHERE name = 'libraries'", [], |r| r.get(0)).unwrap();
+        assert_eq!(count, 0);
+        conn.execute_batch("DROP TRIGGER fail_version").unwrap();
+        migrate(&conn).unwrap();
+        migrate(&conn).unwrap();
+    }
 
     #[test]
     fn migrates_empty_database() {
@@ -165,7 +224,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(version, 1);
+        assert_eq!(version, 3);
 
         let table_count: i32 = conn
             .query_row(

@@ -93,7 +93,7 @@ impl ThumbnailCache {
                 "no cache directory",
             ))
         })?;
-        Self::open(caches.join("kaigua").join("thumbnails"))
+        Self::open(caches.join("sula").join("thumbnails"))
     }
 
     pub fn open(dir: impl Into<PathBuf>) -> Result<Self, ThumbnailError> {

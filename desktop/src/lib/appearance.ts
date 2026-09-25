@@ -1,4 +1,4 @@
-/** Brand skins × accents (kai-brand-design tokens/skins + accents.kaigua). */
+/** Application appearance preferences. */
 
 export type SkinPreference = "system" | "default" | "pure" | "deep-night";
 export type ResolvedSkin = "default" | "pure" | "deep-night";
@@ -7,7 +7,7 @@ export type AccentId = "indigo" | "teal" | "sky" | "slate";
 /** @deprecated legacy appearance values — migrated on load */
 type LegacyAppearance = "light" | "dark";
 
-/** Colors match kai-brand-design tokens/accents.json (kaigua). */
+/** Accent choices maintained alongside styles/appearance.css. */
 export const ACCENT_PRESETS: { id: AccentId; color: string }[] = [
   { id: "indigo", color: "#5A66B8" },
   { id: "teal", color: "#3F9E98" },
@@ -90,10 +90,14 @@ export function watchAppearance(appearance: string, accent?: string): () => void
     applyTheme(lastAppearance, lastAccent);
   };
   mediaQuery.addEventListener("change", mediaListener);
+  const subscribedQuery = mediaQuery;
+  const subscribedListener = mediaListener;
   return () => {
-    mediaQuery?.removeEventListener("change", mediaListener!);
-    mediaListener = null;
-    mediaQuery = null;
+    subscribedQuery.removeEventListener("change", subscribedListener);
+    if (mediaListener === subscribedListener) {
+      mediaListener = null;
+      mediaQuery = null;
+    }
   };
 }
 

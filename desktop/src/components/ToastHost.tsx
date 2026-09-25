@@ -1,13 +1,11 @@
-import { useAppStore } from "../store/appStore";
-
+import { AnimatePresence, motion } from 'motion/react';
+import { useAppStore } from '../store/appStore';
 export function ToastHost() {
-  const message = useAppStore((s) => s.toastMessage);
-  if (!message) return null;
-  return (
-    <div className="pointer-events-none fixed inset-x-0 bottom-9 z-50 flex justify-center px-4">
-      <div className="kg-glass min-w-[220px] max-w-[min(420px,calc(100%-2rem))] rounded-menu px-4 py-2.5 text-center kg-type-body font-medium text-fg">
-        {message}
-      </div>
-    </div>
-  );
+  const message = useAppStore(s => s.toastMessage);
+  return <div className="pointer-events-none fixed inset-x-0 bottom-12 z-[100] flex justify-center px-4" role="status" aria-live="polite">
+    <AnimatePresence mode="wait">{message && <motion.div key={message}
+      initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: 4 }}
+      className="max-w-lg rounded-lg border border-border bg-popover px-4 py-3 text-sm text-popover-foreground shadow-lg">{message}</motion.div>}
+    </AnimatePresence>
+  </div>;
 }

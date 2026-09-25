@@ -26,7 +26,7 @@ impl AvatarCache {
                 "no cache directory",
             ))
         })?;
-        Self::open(caches.join("kaigua").join("avatars"))
+        Self::open(caches.join("sula").join("avatars"))
     }
 
     pub fn open(dir: impl Into<PathBuf>) -> Result<Self, AvatarError> {

@@ -1,40 +1,78 @@
-# 开刮 / kaigua
+# Sula · 苏拉
 
-跨平台媒体库刮削桌面端。扫描本机电影 / 剧集 / 动漫资料库，匹配 TMDB · Bangumi · TVDB · OMDb 元数据，整理季文件夹与文件名，并写入 NFO / 海报。
+**把散落的影视文件，整理成清晰的私人资料库。**
 
-## 功能
+Sula 是一款本地优先的桌面影视资料库整理工具。它扫描电影、剧集和动漫目录，匹配元数据与海报，写入 NFO，并帮助你整理季目录、文件名和重复条目。
 
-- 资料库扫描与增量刷新
-- 自动 / 手动刮削，支持单部与单季
-- 重复剧集合并（同 TMDB / 同名同年）
-- 季文件夹整理、模板改名、批量重命名
-- 残余文件清理、缩略图缓存
-- 中 / 英 / 日界面
+它管理你已经拥有的媒体文件；不提供影视资源下载，也不承担媒体服务器或流媒体播放服务的职责。
 
-## 技术栈
+## 可以做什么
 
-| 层 | 选型 |
-|----|------|
-| 桌面壳 | Tauri 2 |
-| 前端 | React + Tailwind |
-| 核心 | Rust（`media-core` / `scraper-kit` / `renamer`） |
+- **建立资料库**：添加本地或已挂载的媒体目录，按电影、剧集、动漫分类浏览；支持搜索、状态筛选、排序、海报和列表视图。
+- **补全影视信息**：接入 TMDB、TVDB、OMDb、Bangumi，自动匹配或手动选择候选，保存详情、NFO 与图片。可用数据源取决于凭据及媒体类型。
+- **维护剧集结构**：浏览季和分集、刮削单季、合并重复剧集条目。
+- **整理文件**：按模板整理媒体路径，或在独立的批量重命名窗口中组合规则、预览并执行。
+- **持续维护**：增量刷新、残余文件清理、缩略图缓存管理，以及任务进度、取消和日志查看。
+- **按习惯使用**：中文、英文、日文界面，浅色与深色主题、强调色选择。
 
-## 开发
+文件改名、整理和清理会影响磁盘上的实际文件。首次使用可先选一个小资料库，核对匹配结果和重命名预览，再处理完整收藏。
+
+## 开始使用
+
+1. 启动 Sula，添加一个电影、剧集或动漫资料库。
+2. 扫描目录，确认条目识别和文件归属。
+3. 在设置中填写所用数据源的凭据与元数据语言。
+4. 执行刮削；未匹配的条目可手动搜索并选择候选。
+5. 按需要整理目录、预览重命名，或检查残余文件。
+
+网络存储需要先由操作系统挂载。Sula 不负责 NAS 登录与挂载；离线、权限不足及挂载目录被替换等情况会影响扫描和整理。
+
+## 本地开发
+
+需要 Rust 1.89 或更新版本、Node.js 22.12+（也支持 20.19+）、pnpm，以及当前系统的 Tauri 开发依赖。Linux 还需要 DBus 开发库和可用的 Secret Service 凭据服务。详见[开发指南](desktop/README.md)。
 
 ```bash
-cargo test -p media-core
-cargo test -p renamer
-
-cd desktop
-pnpm install
-pnpm tauri dev
+git clone https://github.com/robeshell/sula.git
+cd sula
+pnpm --dir desktop install --frozen-lockfile
+pnpm --dir desktop tauri dev
 ```
 
-打包与性能说明见 [`docs/packaging.md`](docs/packaging.md)、[`docs/perf.md`](docs/perf.md)；功能对照见 [`docs/cross-platform-migration-plan.md`](docs/cross-platform-migration-plan.md)。
+请通过 Tauri 启动完整应用。单独运行 Vite 只能提供前端页面，不能调用扫描、数据库、系统窗口和文件操作等原生能力。
 
-## 目录
+## 技术与结构
 
-- `crates/media-core` — 模型 / SQLite / 扫描 / 文件系统
-- `crates/scraper-kit` — 刮削
-- `crates/renamer` — 模板改名与批量规则
-- `desktop/` — React + Tauri 壳
+| 层 | 实现 |
+| --- | --- |
+| 桌面应用 | Tauri 2、Rust |
+| 界面 | React 19、TypeScript、Vite 7 |
+| 组件与样式 | shadcn/ui 本地源码、Radix、Tailwind CSS 4、Lucide |
+| 动效与状态 | Motion、Zustand、i18next |
+| 数据与媒体处理 | SQLite、reqwest、图片缩略图与 NFO 读写 |
+
+```text
+crates/media-core/       媒体模型、扫描、数据库、文件归属与缓存
+crates/scraper-kit/      数据源接入、匹配、元数据与图片写入
+crates/renamer/          命名模板、批量规则、执行与恢复
+desktop/src/            React 界面、状态与本地样式
+desktop/src-tauri/      原生命令、任务队列、配置、凭据与窗口
+docs/                   使用、开发和验证说明
+```
+
+样式与组件直接在项目中维护，没有外部设计 token 仓库或生成管线。边界和主要调用路径见[架构说明](docs/architecture.md)。
+
+## 数据与凭据
+
+媒体索引保存在本机 SQLite 数据库；配置、任务记录和重命名恢复数据位于系统应用数据目录下的 `sula`。API 密钥通过系统凭据库保存，配置文件保存凭据引用。运行时会访问你配置的数据源，下载元数据和图片。
+
+存储位置、备份方式及更名兼容性见[数据与迁移](docs/data.md)。
+
+## 平台与验证状态
+
+仓库提供 macOS、Windows、Linux 的构建配置。当前开发记录包含 macOS 启动、部分真实数据迁移、定向 Rust/前端测试和浏览器模拟数据检查；这些记录不等于三个平台的完整发布验收，也不保证所有数据源、NAS 和文件布局都已实测。
+
+日常开发按改动范围运行检查；打包、签名、公证和跨平台验收单独进行。操作方式见[验证指南](docs/perf.md)与[打包说明](docs/packaging.md)。
+
+## 文档与许可
+
+从[文档目录](docs/README.md)查找当前说明和历史记录。项目清单声明的许可为 `Proprietary`；第三方源码保留其各自许可，包括 [shadcn/ui 的 MIT 许可](desktop/src/components/ui/LICENSE.md)。

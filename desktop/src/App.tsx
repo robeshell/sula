@@ -1,8 +1,14 @@
+import { Plus as IconAdd, Settings as IconSettings, Logs as IconLogs, PencilLine as IconRename, RefreshCw as IconRefresh, Download as IconScrape, Ellipsis as IconMore, Film, Tv, Sparkles } from "lucide-react";
+import { Tabs, TabsList, TabsTrigger, TabsContent } from "./components/ui/tabs";
+import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigger } from "./components/ui/dropdown-menu";
+import { TasksDock } from "./components/TasksDock";
+import { Button } from "./components/ui/button";
 import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { useTranslation } from "react-i18next";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 
+import { VirtualMediaList } from "./components/VirtualMediaList";
 import { EmptyState } from "./components/EmptyState";
 import { CleanupSheet, type ResidualCandidate } from "./components/CleanupSheet";
 import { DeleteConfirmModal } from "./components/DeleteConfirmModal";
@@ -18,7 +24,8 @@ import { LogPanel } from "./components/LogPanel";
 import { FolderBrowser } from "./components/FolderBrowser";
 import { ToastHost } from "./components/ToastHost";
 import { WindowControls } from "./components/WindowControls";
-import { SORT_OPTIONS, STATUS_FILTERS } from "./lib/mediaList";
+import appIconUrl from "../src-tauri/icons/icon.png";
+import { LibraryToolbar } from "./components/LibraryToolbar";
 import { POSTER_THUMB, SEASON_THUMB, EPISODE_STILL } from "./lib/posterLoadQueue";
 import {
   clampDetailWidth,
@@ -241,15 +248,18 @@ function App() {
     void refreshStatus();
     void refreshLibraries();
     void refreshTasks();
+    let disposed = false;
     let unlistenTask: (() => void) | undefined;
     let unlistenLib: (() => void) | undefined;
     let libTimer: ReturnType<typeof setTimeout> | null = null;
     void listen("task-updated", (event) => {
+      if (disposed) return;
       upsertTask(event.payload as Parameters<typeof upsertTask>[0]);
     }).then((fn) => {
-      unlistenTask = fn;
+      if (disposed) fn(); else unlistenTask = fn;
     });
     void listen("library-updated", () => {
+      if (disposed) return;
       // Coalesce bursts so a finishing scan doesn't thrash the list.
       if (libTimer) clearTimeout(libTimer);
       libTimer = setTimeout(() => {
@@ -258,9 +268,10 @@ function App() {
         void refreshStatus();
       }, 200);
     }).then((fn) => {
-      unlistenLib = fn;
+      if (disposed) fn(); else unlistenLib = fn;
     });
     return () => {
+      disposed = true;
       unlistenTask?.();
       unlistenLib?.();
       if (libTimer) clearTimeout(libTimer);
@@ -299,8 +310,13 @@ function App() {
         onContextMenu={(e) => e.preventDefault()}
       >
         <div className="kg-rail-brand select-none">
+          <img
+            className="kg-rail-brand-logo"
+            src={appIconUrl}
+            alt=""
+            draggable={false}
+          />
           <p className="kg-rail-brand-name">{t("app.brand")}</p>
-          <p className="kg-rail-brand-sub">{t("app.title")}</p>
         </div>
 
         <div className="kg-rail-nav min-h-0 flex-1 overflow-auto select-none">
@@ -315,7 +331,7 @@ function App() {
                     const active = lib.id === selectedLibraryId;
                     return (
                       <li key={lib.id}>
-                        <button
+                        <Button variant="plain" size="none"
                           type="button"
                           onClick={() => {
                             setSettingsOpen(false);
@@ -337,7 +353,7 @@ function App() {
                               {shortLibraryPath(lib.rootPath)}
                             </span>
                           </span>
-                        </button>
+                        </Button>
                       </li>
                     );
                   })}
@@ -402,105 +418,34 @@ function App() {
                   action={
                     libraries.length === 0 ? (
                       <div className="flex flex-wrap justify-center gap-2">
-                        <button
+                        <Button variant="default" size="sm"
                           type="button"
-                          className="kg-btn"
                           onClick={() => void addLibrary("movie")}
                         >
                           {t("action.addMovie")}
-                        </button>
-                        <button
+                        </Button>
+                        <Button variant="outline" size="sm"
                           type="button"
-                          className="kg-btn kg-btn-outlined"
                           onClick={() => void addLibrary("tvShow")}
                         >
                           {t("action.addTv")}
-                        </button>
-                        <button
+                        </Button>
+                        <Button variant="outline" size="sm"
                           type="button"
-                          className="kg-btn kg-btn-outlined"
                           onClick={() => void addLibrary("anime")}
                         >
                           {t("action.addAnime")}
-                        </button>
+                        </Button>
                       </div>
                     ) : undefined
                   }
                 />
               ) : (
                 <>
-                  <div className="kg-list-toolbar">
-                    <div className="relative min-w-[10rem] flex-1">
-                      <input
-                        value={searchQuery}
-                        onChange={(e) => setSearchQuery(e.target.value)}
-                        placeholder={t("list.searchPlaceholder")}
-                        className="kg-field kg-field-compact w-full pr-8"
-                      />
-                      {searchQuery ? (
-                        <button
-                          type="button"
-                          className="absolute right-1.5 top-1/2 -translate-y-1/2 rounded-control px-1.5 py-0.5 kg-type-body-secondary font-semibold text-fg-muted hover:bg-fill-secondary/50 hover:text-fg"
-                          aria-label={t("list.clearSearch")}
-                          onClick={() => setSearchQuery("")}
-                        >
-                          ×
-                        </button>
-                      ) : null}
-                    </div>
-                    <select
-                      value={statusFilter}
-                      onChange={(e) =>
-                        setStatusFilter(
-                          e.target.value as (typeof STATUS_FILTERS)[number]["value"],
-                        )
-                      }
-                      className="kg-select kg-field-compact"
-                      aria-label={t("filter.status.all")}
-                    >
-                      {STATUS_FILTERS.map((opt) => (
-                        <option key={opt.value} value={opt.value}>
-                          {t(`filter.status.${opt.value}`, { defaultValue: opt.label })}
-                        </option>
-                      ))}
-                    </select>
-                    <select
-                      value={sortOption}
-                      onChange={(e) =>
-                        setSortOption(e.target.value as (typeof SORT_OPTIONS)[number]["value"])
-                      }
-                      className="kg-select kg-field-compact"
-                    >
-                      {SORT_OPTIONS.map((opt) => (
-                        <option key={opt.value} value={opt.value}>
-                          {t(`filter.sort.${opt.value}`, { defaultValue: opt.label })}
-                        </option>
-                      ))}
-                    </select>
-                    <div className="kg-view-toggle" role="group" aria-label={t("list.viewMode")}>
-                      <button
-                        type="button"
-                        className="kg-view-toggle-btn"
-                        data-selected={listViewMode === "poster"}
-                        aria-pressed={listViewMode === "poster"}
-                        onClick={() => setListViewMode("poster")}
-                      >
-                        {t("list.viewPoster")}
-                      </button>
-                      <button
-                        type="button"
-                        className="kg-view-toggle-btn"
-                        data-selected={listViewMode === "list"}
-                        aria-pressed={listViewMode === "list"}
-                        onClick={() => setListViewMode("list")}
-                      >
-                        {t("list.viewList")}
-                      </button>
-                    </div>
-                    <span className="kg-type-caption text-fg-muted">
-                      {visible.length}/{mediaItems.length}
-                    </span>
-                    <div className="kg-toolbar-spacer" />
+                  <LibraryToolbar title={selected.name} path={selected.rootPath}
+                    count={visible.length} total={mediaItems.length} query={searchQuery} onQuery={setSearchQuery}
+                    status={statusFilter} onStatus={setStatusFilter} sort={sortOption} onSort={setSortOption}
+                    view={listViewMode} onView={setListViewMode} actions={
                     <div className="kg-toolbar-group">
                       <TileButton
                         icon={<IconRefresh />}
@@ -544,21 +489,20 @@ function App() {
                         ]}
                       />
                     </div>
-                  </div>
+                  } />
 
                   <div className="relative min-h-0 flex-1">
                   {selectedMediaIds.length > 1 ? (
-                    <div className="kg-selection-bar">
+                    <div className="ion-bar">
                       <span className="kg-type-body-secondary font-semibold text-fg-secondary">
                         {t("list.selectedCount", { count: selectedMediaIds.length })}
                       </span>
-                      <button
+                      <Button variant="default" size="sm"
                         type="button"
-                        className="kg-btn"
                         onClick={() => void scrapeSelectedItems()}
                       >
                         {t("action.scrapeAuto")}
-                      </button>
+                      </Button>
                       <MenuButton
                         label={t("action.more")}
                         items={[
@@ -629,13 +573,12 @@ function App() {
                           },
                         ]}
                       />
-                      <button
+                      <Button variant="ghost" size="sm"
                         type="button"
-                        className="kg-btn kg-btn-toolbar"
                         onClick={() => clearMediaSelection()}
                       >
                         {t("list.clearSelection")}
-                      </button>
+                      </Button>
                     </div>
                   ) : null}
 
@@ -659,30 +602,30 @@ function App() {
                         }
                         action={
                           mediaItems.length === 0 && !isLibraryScanning ? (
-                            <button
+                            <Button variant="default" size="sm"
                               type="button"
                               onClick={() => void refreshSelectedLibrary()}
-                              className="kg-btn"
                             >
                               {t("action.refresh")}
-                            </button>
+                            </Button>
                           ) : undefined
                         }
                       />
                     ) : listViewMode === "poster" ? (
-                      <div className="kg-poster-grid">
-                        {visible.map((item) => {
+                      <VirtualMediaList items={visible} mode="poster" resetKey={`${selectedLibraryId}:${searchQuery}:${sortOption}:${statusFilter}`}>
+                        {(item) => {
                           const meta = metadataById[item.id];
                           const stats = showStatsById[item.id];
                           const active = selectedMediaIds.includes(item.id);
                           const isShow =
                             item.mediaType === "tvShow" || item.mediaType === "anime";
                           return (
-                            <button
+                            <Button variant="plain" size="none"
                               key={item.id}
                               type="button"
                               data-selected={active}
                               className="kg-poster-card"
+                              style={{ width: "100%" }}
                               onClick={(e) =>
                                 void toggleMediaSelection(item.id, e.metaKey || e.ctrlKey)
                               }
@@ -715,21 +658,21 @@ function App() {
                                       .filter(Boolean)
                                       .join(" · ")}
                               </span>
-                            </button>
+                            </Button>
                           );
-                        })}
-                      </div>
+                        }}
+                      </VirtualMediaList>
                     ) : (
-                      <ul>
-                        {visible.map((item) => {
+                      <VirtualMediaList items={visible} mode="list" resetKey={`${selectedLibraryId}:${searchQuery}:${sortOption}:${statusFilter}`}>
+                        {(item) => {
                           const meta = metadataById[item.id];
                           const stats = showStatsById[item.id];
                           const active = selectedMediaIds.includes(item.id);
                           const isShow =
                             item.mediaType === "tvShow" || item.mediaType === "anime";
                           return (
-                            <li key={item.id}>
-                              <button
+                            <div key={item.id}>
+                              <Button variant="plain" size="none"
                                 type="button"
                                 onClick={(e) =>
                                   void toggleMediaSelection(item.id, e.metaKey || e.ctrlKey)
@@ -778,11 +721,11 @@ function App() {
                                 <span className="shrink-0 kg-type-body-secondary font-medium text-fg-secondary">
                                   {t(`status.${item.status}`, { defaultValue: item.status })}
                                 </span>
-                              </button>
-                            </li>
+                              </Button>
+                            </div>
                           );
-                        })}
-                      </ul>
+                        }}
+                      </VirtualMediaList>
                     )}
                   </div>
                   </div>
@@ -820,21 +763,19 @@ function App() {
                 <div className="flex min-h-0 flex-1 flex-col">
                   <div className="kg-detail-chrome">
                     {detail.item.status === "scraped" ? (
-                      <button
+                      <Button variant="default" size="sm"
                         type="button"
-                        className="kg-btn"
                         onClick={() => void rescrapeSelectedItems()}
                       >
                         {t("action.rescrape")}
-                      </button>
+                      </Button>
                     ) : (
-                      <button
+                      <Button variant="default" size="sm"
                         type="button"
-                        className="kg-btn"
                         onClick={() => void openManualMatch()}
                       >
                         {t("action.scrapeItem")}
-                      </button>
+                      </Button>
                     )}
                     <MenuButton
                       label={t("action.more")}
@@ -906,14 +847,13 @@ function App() {
                       ]}
                     />
                     <div className="kg-detail-chrome-spacer" />
-                    <button
+                    <Button variant="ghost" size="sm"
                       type="button"
-                      className="kg-btn kg-btn-toolbar"
                       aria-label={t("detail.close")}
                       onClick={() => clearMediaSelection()}
                     >
                       {t("settings.close")}
-                    </button>
+                    </Button>
                   </div>
                   <div className="min-h-0 flex-1 overflow-auto p-4">
                     <DetailPanel detail={detail} posterUrl={posterUrl} />
@@ -998,102 +938,6 @@ function App() {
   );
 }
 
-function TasksDock({
-  open,
-  onOpenChange,
-  activeCount,
-}: {
-  open: boolean;
-  onOpenChange: (open: boolean) => void;
-  activeCount: number;
-}) {
-  const { t } = useTranslation();
-  const tasks = useAppStore((s) => s.tasks);
-  const dockRef = useRef<HTMLDivElement | null>(null);
-
-  useEffect(() => {
-    if (!open) return;
-    const onPointerDown = (e: PointerEvent) => {
-      const el = dockRef.current;
-      if (el && !el.contains(e.target as Node)) {
-        onOpenChange(false);
-      }
-    };
-    const onKeyDown = (e: KeyboardEvent) => {
-      if (e.key === "Escape") onOpenChange(false);
-    };
-    window.addEventListener("pointerdown", onPointerDown);
-    window.addEventListener("keydown", onKeyDown);
-    return () => {
-      window.removeEventListener("pointerdown", onPointerDown);
-      window.removeEventListener("keydown", onKeyDown);
-    };
-  }, [open, onOpenChange]);
-
-  return (
-    <div ref={dockRef} className="kg-tasks-dock">
-      {open ? (
-        <div
-          className="kg-tasks-panel kg-glass"
-          role="dialog"
-          aria-label={t("tasks.title")}
-        >
-          <header className="flex items-center justify-between gap-2 border-b border-hairline px-3.5 py-2.5">
-            <h2 className="min-w-0 kg-type-body font-semibold text-fg">{t("tasks.title")}</h2>
-            <button
-              type="button"
-              className="kg-btn kg-btn-toolbar"
-              onClick={() => onOpenChange(false)}
-            >
-              {t("tasks.close")}
-            </button>
-          </header>
-          <div className="min-h-0 flex-1 overflow-auto px-2 py-2">
-            {tasks.length === 0 ? (
-              <p className="px-2 py-6 text-center kg-type-caption text-fg-secondary">
-                {t("tasks.empty")}
-              </p>
-            ) : (
-              <ul className="space-y-0.5">
-                {tasks.map((task) => (
-                  <li key={task.id} className="rounded-control px-2.5 py-2 kg-type-caption">
-                    <div className="flex justify-between gap-2">
-                      <span className="min-w-0 flex-1 font-semibold text-fg">{task.title}</span>
-                      <span className="shrink-0 text-fg-muted">
-                        {t(`tasks.status.${task.status}`, { defaultValue: task.status })}
-                      </span>
-                    </div>
-                    {task.progress ? (
-                      <p className="mt-1 truncate text-fg-secondary">{task.progress.current}</p>
-                    ) : null}
-                    {task.errorMessage ? (
-                      <p className="mt-1 text-error">
-                        {localizeUserMessage(task.errorMessage)}
-                      </p>
-                    ) : null}
-                  </li>
-                ))}
-              </ul>
-            )}
-          </div>
-        </div>
-      ) : null}
-      <button
-        type="button"
-        className="kg-tasks-trigger kg-glass"
-        data-active={activeCount > 0 || open}
-        aria-expanded={open}
-        onClick={() => onOpenChange(!open)}
-      >
-        <span>{t("tasks.title")}</span>
-        {activeCount > 0 ? (
-          <span className="kg-tasks-badge">{activeCount}</span>
-        ) : null}
-      </button>
-    </div>
-  );
-}
-
 function SeasonBrowser({
   mediaItemId,
   canScrapeSeason,
@@ -1120,29 +964,12 @@ function SeasonBrowser({
     seasonId: string;
     seasonNumber: number;
   } | null>(null);
-  const seasonMenuRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
     if (!ordered.some((s) => s.id === activeId)) {
       setActiveId(ordered[0]?.id ?? "");
     }
   }, [ordered, activeId]);
-
-  useEffect(() => {
-    if (!seasonMenu) return;
-    const onDoc = (e: MouseEvent) => {
-      if (!seasonMenuRef.current?.contains(e.target as Node)) setSeasonMenu(null);
-    };
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") setSeasonMenu(null);
-    };
-    document.addEventListener("mousedown", onDoc);
-    document.addEventListener("keydown", onKey);
-    return () => {
-      document.removeEventListener("mousedown", onDoc);
-      document.removeEventListener("keydown", onKey);
-    };
-  }, [seasonMenu]);
 
   if (ordered.length === 0) {
     return (
@@ -1161,9 +988,9 @@ function SeasonBrowser({
   const local = eps.filter((e) => Boolean(e.filePath)).length;
 
   return (
-    <section>
+    <Tabs value={activeId} onValueChange={setActiveId}>
       <h3 className="kg-section-label">{t("detail.seasons")}</h3>
-      <div className="kg-season-strip" role="tablist" aria-label={t("detail.seasons")}>
+      <TabsList className="kg-season-strip h-auto group-data-[orientation=horizontal]/tabs:h-auto justify-start bg-transparent" aria-label={t("detail.seasons")}>
         {ordered.map((season) => {
           const selected = season.id === active.id;
           const seasonEps = episodes.filter((e) => e.seasonId === season.id);
@@ -1178,13 +1005,13 @@ function SeasonBrowser({
             `season${padded}-poster.png`,
           ].filter((v): v is string => Boolean(v));
           return (
-            <button
+            <TabsTrigger value={season.id}
               key={season.id}
               type="button"
               role="tab"
               aria-selected={selected}
               data-selected={selected}
-              className="kg-season-tab"
+              className="kg-season-tab h-auto flex-none"
               onClick={() => setActiveId(season.id)}
               onContextMenu={(e) => {
                 e.preventDefault();
@@ -1219,12 +1046,12 @@ function SeasonBrowser({
                   })}
                 </span>
               </span>
-            </button>
+            </TabsTrigger>
           );
         })}
-      </div>
+      </TabsList>
 
-      <div className="kg-season-panel" role="tabpanel">
+      <TabsContent value={active.id} className="kg-season-panel">
         <p className="kg-season-panel-head">
           <span className="kg-season-panel-title">
             {active.title ?? t("detail.seasonLabel", { n: active.seasonNumber })}
@@ -1282,47 +1109,17 @@ function SeasonBrowser({
             })
           )}
         </ul>
-      </div>
+      </TabsContent>
 
-      {seasonMenu ? (
-        <div
-          ref={seasonMenuRef}
-          className="kg-menu fixed z-[80]"
-          style={{
-            left: Math.max(8, Math.min(seasonMenu.x, window.innerWidth - 200)),
-            top: Math.max(8, Math.min(seasonMenu.y, window.innerHeight - 120)),
-          }}
-          role="menu"
-        >
-          <button
-            type="button"
-            role="menuitem"
-            className="kg-menu-item"
-            onClick={() => {
-              const { seasonId, seasonNumber } = seasonMenu;
-              setSeasonMenu(null);
-              void revealSeasonInFinder(folderPath, seasonId, seasonNumber, episodes);
-            }}
-          >
-            {t("action.revealInFinder")}
-          </button>
-          {canScrapeSeason ? (
-            <button
-              type="button"
-              role="menuitem"
-              className="kg-menu-item"
-              onClick={() => {
-                const n = seasonMenu.seasonNumber;
-                setSeasonMenu(null);
-                void scrapeSeason(mediaItemId, n);
-              }}
-            >
-              {t("action.scrapeSeason")}
-            </button>
-          ) : null}
-        </div>
-      ) : null}
-    </section>
+      {seasonMenu && <DropdownMenu open modal={false} onOpenChange={open => { if (!open) setSeasonMenu(null); }}>
+        <DropdownMenuTrigger asChild><span aria-hidden style={{ position:'fixed', left:seasonMenu.x, top:seasonMenu.y, width:1, height:1 }} /></DropdownMenuTrigger>
+        <DropdownMenuContent align="start" sideOffset={0} collisionPadding={8} onCloseAutoFocus={event => event.preventDefault()}>
+          <DropdownMenuItem onSelect={() => { const {seasonId,seasonNumber} = seasonMenu; setSeasonMenu(null); void revealSeasonInFinder(folderPath, seasonId, seasonNumber, episodes); }}>{t("action.revealInFinder")}</DropdownMenuItem>
+          {canScrapeSeason && <DropdownMenuItem onSelect={() => { const n=seasonMenu.seasonNumber; setSeasonMenu(null); void scrapeSeason(mediaItemId,n); }}>{t("action.scrapeSeason")}</DropdownMenuItem>}
+        </DropdownMenuContent>
+      </DropdownMenu>}
+
+    </Tabs>
   );
 }
 
@@ -1627,7 +1424,7 @@ function TileButton({
   primary?: boolean;
 }) {
   return (
-    <button
+    <Button variant={primary ? "default" : "ghost"} size="sm"
       type="button"
       className="kg-tile-btn"
       disabled={disabled}
@@ -1640,7 +1437,7 @@ function TileButton({
         {icon}
       </span>
       <span className="kg-tile-btn-label">{label}</span>
-    </button>
+    </Button>
   );
 }
 
@@ -1655,188 +1452,22 @@ function MenuButton({
   icon?: ReactNode;
   align?: "left" | "right";
 }) {
-  const [open, setOpen] = useState(false);
-  const rootRef = useRef<HTMLDivElement>(null);
-
-  useEffect(() => {
-    if (!open) return;
-    const onDoc = (e: MouseEvent) => {
-      if (!rootRef.current?.contains(e.target as Node)) setOpen(false);
-    };
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") setOpen(false);
-    };
-    document.addEventListener("mousedown", onDoc);
-    document.addEventListener("keydown", onKey);
-    return () => {
-      document.removeEventListener("mousedown", onDoc);
-      document.removeEventListener("keydown", onKey);
-    };
-  }, [open]);
-
-  if (items.length === 0) return null;
-
-  return (
-    <div ref={rootRef} className="relative">
-      {icon ? (
-        <TileButton
-          icon={icon}
-          label={label}
-          selected={open}
-          onClick={() => setOpen((v) => !v)}
-        />
-      ) : (
-        <button
-          type="button"
-          className="kg-btn kg-btn-toolbar"
-          aria-expanded={open}
-          aria-haspopup="menu"
-          onClick={() => setOpen((v) => !v)}
-        >
-          {label}
-        </button>
-      )}
-      {open ? (
-        <div
-          className={`kg-menu absolute top-full z-50 mt-1 min-w-[10.5rem] ${
-            align === "left" ? "left-0" : "right-0"
-          }`}
-          role="menu"
-        >
-          {items.map((item) => (
-            <button
-              key={item.label}
-              type="button"
-              role="menuitem"
-              className="kg-menu-item"
-              data-destructive={item.destructive ? "true" : undefined}
-              onClick={() => {
-                setOpen(false);
-                item.onClick();
-              }}
-            >
-              {item.label}
-            </button>
-          ))}
-        </div>
-      ) : null}
-    </div>
-  );
+  if (!items.length) return null;
+  return <DropdownMenu>
+    <DropdownMenuTrigger asChild>
+      <Button variant="ghost" size="sm" className="gap-2">{icon}<span>{label}</span></Button>
+    </DropdownMenuTrigger>
+    <DropdownMenuContent align={align === "left" ? "start" : "end"} sideOffset={6}>
+      {items.map(item => <DropdownMenuItem key={item.label} variant={item.destructive ? "destructive" : "default"} onSelect={item.onClick}>{item.label}</DropdownMenuItem>)}
+    </DropdownMenuContent>
+  </DropdownMenu>;
 }
 
 function AddMenu({ onAdd }: { onAdd: (t: MediaType) => void }) {
   const { t } = useTranslation();
-  const [open, setOpen] = useState(false);
-  const rootRef = useRef<HTMLDivElement>(null);
-
-  useEffect(() => {
-    if (!open) return;
-    const onDoc = (e: MouseEvent) => {
-      if (!rootRef.current?.contains(e.target as Node)) setOpen(false);
-    };
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") setOpen(false);
-    };
-    document.addEventListener("mousedown", onDoc);
-    document.addEventListener("keydown", onKey);
-    return () => {
-      document.removeEventListener("mousedown", onDoc);
-      document.removeEventListener("keydown", onKey);
-    };
-  }, [open]);
-
-  const items = (
-    [
-      ["movie", "action.addMovie"],
-      ["tvShow", "action.addTv"],
-      ["anime", "action.addAnime"],
-    ] as const
-  );
-
-  return (
-    <div ref={rootRef} className="relative">
-      <TileButton
-        icon={<IconAdd />}
-        label={t("action.addLibrary")}
-        selected={open}
-        onClick={() => setOpen((v) => !v)}
-      />
-      {open ? (
-        <div
-          className="kg-menu absolute left-0 bottom-full z-50 mb-1 min-w-[9.5rem]"
-          role="menu"
-        >
-          {items.map(([type, key]) => (
-            <button
-              key={type}
-              type="button"
-              role="menuitem"
-              className="kg-menu-item"
-              onClick={() => {
-                setOpen(false);
-                onAdd(type);
-              }}
-            >
-              {t(key)}
-            </button>
-          ))}
-        </div>
-      ) : null}
-    </div>
-  );
-}
-
-function IconAdd() {
-  return (
-    <svg viewBox="0 0 24 24" aria-hidden>
-      <path d="M12 5v14M5 12h14" />
-    </svg>
-  );
-}
-function IconSettings() {
-  return (
-    <svg viewBox="0 0 24 24" aria-hidden>
-      <circle cx="12" cy="12" r="3" />
-      <path d="M12 3v2M12 19v2M3 12h2M19 12h2M5.6 5.6l1.4 1.4M17 17l1.4 1.4M5.6 18.4 7 17M17 7l1.4-1.4" />
-    </svg>
-  );
-}
-function IconLogs() {
-  return (
-    <svg viewBox="0 0 24 24" aria-hidden>
-      <path d="M8 6h12M8 12h12M8 18h12M4 6h.01M4 12h.01M4 18h.01" />
-    </svg>
-  );
-}
-function IconRename() {
-  return (
-    <svg viewBox="0 0 24 24" aria-hidden>
-      <path d="M4 20h4L18.5 9.5a2.1 2.1 0 0 0-3-3L5 17v3zM13.5 7.5l3 3" />
-    </svg>
-  );
-}
-function IconRefresh() {
-  return (
-    <svg viewBox="0 0 24 24" aria-hidden>
-      <path d="M21 12a9 9 0 1 1-2.6-6.3M21 4v5h-5" />
-    </svg>
-  );
-}
-function IconScrape() {
-  return (
-    <svg viewBox="0 0 24 24" aria-hidden>
-      <path d="M12 3v12M8 11l4 4 4-4M5 19h14" />
-    </svg>
-  );
-}
-function IconMore() {
-  return (
-    <svg viewBox="0 0 24 24" aria-hidden>
-      <circle cx="6" cy="12" r="1.2" fill="currentColor" stroke="none" />
-      <circle cx="12" cy="12" r="1.2" fill="currentColor" stroke="none" />
-      <circle cx="18" cy="12" r="1.2" fill="currentColor" stroke="none" />
-    </svg>
-  );
+  return <MenuButton label={t("action.addLibrary")} icon={<IconAdd />} align="left" items={([
+    ["movie", "action.addMovie"], ["tvShow", "action.addTv"], ["anime", "action.addAnime"],
+  ] as const).map(([type, key]) => ({label:t(key), onClick:()=>onAdd(type)}))} />;
 }
 
 function groupLibraries(libraries: ReturnType<typeof useAppStore.getState>["libraries"]) {
@@ -1873,37 +1504,8 @@ function shortLibraryPath(rootPath: string): string {
 }
 
 function LibraryTypeIcon({ type }: { type: MediaType }) {
-  if (type === "movie") {
-    return (
-      <svg width="15" height="15" viewBox="0 0 24 24" fill="none" aria-hidden>
-        <rect x="3" y="5" width="18" height="14" rx="2.5" stroke="currentColor" strokeWidth="1.75" />
-        <path d="M10 9.5v5l4.5-2.5L10 9.5Z" fill="currentColor" />
-      </svg>
-    );
-  }
-  if (type === "tvShow") {
-    return (
-      <svg width="15" height="15" viewBox="0 0 24 24" fill="none" aria-hidden>
-        <rect x="3" y="6" width="18" height="12" rx="2.5" stroke="currentColor" strokeWidth="1.75" />
-        <path
-          d="M8 20h8M12 18v2"
-          stroke="currentColor"
-          strokeWidth="1.75"
-          strokeLinecap="round"
-        />
-      </svg>
-    );
-  }
-  return (
-    <svg width="15" height="15" viewBox="0 0 24 24" fill="none" aria-hidden>
-      <path
-        d="M12 3.5 13.8 9H19.5l-4.5 3.3 1.7 5.5L12 14.8 7.3 17.8l1.7-5.5L4.5 9h5.7L12 3.5Z"
-        stroke="currentColor"
-        strokeWidth="1.6"
-        strokeLinejoin="round"
-      />
-    </svg>
-  );
+  const Icon = type === "movie" ? Film : type === "tvShow" ? Tv : Sparkles;
+  return <Icon className="size-4" aria-hidden />;
 }
 
 export default App;

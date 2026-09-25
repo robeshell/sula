@@ -40,24 +40,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Checkout Kai brand tokens
-        uses: actions/checkout@v4
-        with:
-          repository: robeshell/kai-brand-design
-          path: .kai-brand-design
-
-      - name: Verify generated brand tokens
-        working-directory: .
-        run: |
-          python3 .kai-brand-design/tool/kai_design.py check --skip-viewer
-          cmp .kai-brand-design/dist/release/kai-design.lock.json kai-design.lock.json
-          cmp .kai-brand-design/dist/css/kaigua/brand.generated.css desktop/src/styles/brand.generated.css
-
       - name: Linux deps
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev libdbus-1-dev patchelf
 
       - uses: pnpm/action-setup@v4
         with:
@@ -76,13 +63,10 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: ". -> target"
-          prefix-key: kaigua-${{ matrix.target }}
+          prefix-key: sula-${{ matrix.target }}
 
       - name: Install frontend deps
         run: pnpm install --frozen-lockfile
-
-      - name: Verify product token boundary
-        run: pnpm tokens:check
 
       - name: Build Tauri app
         working-directory: desktop
@@ -93,7 +77,7 @@ jobs:
       - name: Upload bundles
         uses: actions/upload-artifact@v4
         with:
-          name: kaigua-${{ matrix.os }}
+          name: sula-${{ matrix.os }}
           path: |
             target/release/bundle/**
           if-no-files-found: warn

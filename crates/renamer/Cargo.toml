@@ -3,7 +3,7 @@ name = "renamer"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "kaigua rename templates and media rename (M3); rule engine in M5"
+description = "sula rename templates and media rename (M3); rule engine in M5"
 
 [dependencies]
 chrono.workspace = true

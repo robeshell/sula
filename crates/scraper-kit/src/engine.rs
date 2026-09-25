@@ -83,51 +83,70 @@ pub async fn scrape_library(
     db: Arc<AppDatabase>,
     library_id: &str,
     options: ScrapeOptions,
+    on_progress: impl FnMut(ScrapeProgress) + Send,
+) -> Result<ScrapeSummary, String> {
+    scrape_library_cancellable(db, library_id, options,
+        Arc::new(std::sync::atomic::AtomicBool::new(false)), on_progress).await
+}
+
+pub async fn scrape_library_cancellable(
+    db: Arc<AppDatabase>,
+    library_id: &str,
+    options: ScrapeOptions,
+    cancel: Arc<std::sync::atomic::AtomicBool>,
     mut on_progress: impl FnMut(ScrapeProgress) + Send,
 ) -> Result<ScrapeSummary, String> {
-    let items = db
-        .list_media_items(library_id)
-        .map_err(|e| e.to_string())?
-        .into_iter()
-        .filter(|i| i.status == ScrapedStatus::Unscraped)
-        .collect::<Vec<_>>();
+    use std::sync::atomic::Ordering;
+    if cancel.load(Ordering::SeqCst) { return Err("cancelled".into()); }
+    let items = db.list_media_items(library_id).map_err(|e| e.to_string())?
+        .into_iter().filter(|i| i.status == ScrapedStatus::Unscraped).collect::<Vec<_>>();
     let total = items.len() as u32;
-    let mut done = 0u32;
+    let mut items = items.into_iter();
+    let mut done = 0;
     let mut summary = ScrapeSummary::default();
     let coordinator = ScraperCoordinator::new(options.keys.clone());
     let client = crate::http::build_client();
-    let sem = Arc::new(tokio::sync::Semaphore::new(options.concurrency.max(1)));
-    let mut handles = Vec::new();
-    for item in items {
-        let permit = Arc::clone(&sem).acquire_owned().await.map_err(|e| e.to_string())?;
-        let db = Arc::clone(&db);
-        let coordinator = coordinator.clone();
-        let client = client.clone();
-        let language = options.language.clone();
-        let nfo_format = options.nfo_format.clone();
-        let item_id = item.id.clone();
-        handles.push(tokio::spawn(async move {
-            let _permit = permit;
-            let title = item.title.clone();
-            let result =
-                scrape_item_inner(&db, &coordinator, &client, &item, &language, &nfo_format).await;
-            (item_id, title, result)
-        }));
-    }
-    for handle in handles {
-        let (item_id, title, result) = handle.await.map_err(|e| e.to_string())?;
-        done += 1;
-        on_progress(ScrapeProgress {
-            completed: done,
-            total,
-            current: title,
-            stage_key: "matching".into(),
-        });
-        match result {
-            Ok(ScrapeItemOutcome::Matched) => summary.success_ids.push(item_id),
-            Ok(ScrapeItemOutcome::Unmatched) => summary.unmatched += 1,
-            Ok(ScrapeItemOutcome::Failed) => summary.failed += 1,
-            Err(e) => return Err(e),
+    let mut jobs = tokio::task::JoinSet::new();
+    loop {
+        if cancel.load(Ordering::SeqCst) {
+            jobs.abort_all();
+            while let Some(result) = jobs.join_next().await {
+                if let Ok((id, _, outcome)) = result {
+                    match outcome {
+                        Ok(ScrapeItemOutcome::Matched) => summary.success_ids.push(id),
+                        Ok(ScrapeItemOutcome::Unmatched) => summary.unmatched += 1,
+                        Ok(ScrapeItemOutcome::Failed) | Err(_) => summary.failed += 1,
+                    }
+                }
+            }
+            return Ok(summary);
+        }
+        while jobs.len() < options.concurrency.clamp(1, 8) {
+            let Some(item) = items.next() else { break; };
+            if cancel.load(Ordering::SeqCst) { break; }
+            let db = Arc::clone(&db);
+            let coordinator = coordinator.clone();
+            let client = client.clone();
+            let language = options.language.clone();
+            let nfo_format = options.nfo_format.clone();
+            jobs.spawn(async move {
+                let result = scrape_item_inner(&db, &coordinator, &client, &item, &language, &nfo_format).await;
+                (item.id, item.title, result)
+            });
+        }
+        if jobs.is_empty() { break; }
+        tokio::select! {
+            _ = tokio::time::sleep(std::time::Duration::from_millis(50)) => {},
+            result = jobs.join_next() => {
+                let (id, title, result) = result.expect("nonempty job set").map_err(|e| e.to_string())?;
+                done += 1;
+                match result {
+                    Ok(ScrapeItemOutcome::Matched) => summary.success_ids.push(id),
+                    Ok(ScrapeItemOutcome::Unmatched) => summary.unmatched += 1,
+                    Ok(ScrapeItemOutcome::Failed) | Err(_) => summary.failed += 1,
+                }
+                on_progress(ScrapeProgress { completed: done, total, current: title, stage_key: "matching".into() });
+            }
         }
     }
     Ok(summary)
@@ -177,8 +196,13 @@ async fn scrape_item_inner(
 ) -> Result<ScrapeItemOutcome, String> {
     match coordinator.match_item(item, language).await {
         MatchOutcome::Matched(meta) => {
-            persist_match(db, client, item, meta, nfo_format).await?;
-            Ok(ScrapeItemOutcome::Matched)
+            match persist_match(db, client, item, meta, nfo_format).await {
+                Ok(()) => Ok(ScrapeItemOutcome::Matched),
+                Err(error) => {
+                    db.update_status(&item.id, ScrapedStatus::Partial, Some(&error)).map_err(|e| e.to_string())?;
+                    Ok(ScrapeItemOutcome::Failed)
+                }
+            }
         }
         MatchOutcome::Unmatched { .. } => {
             db.update_status(&item.id, ScrapedStatus::Unmatched, None)
@@ -207,24 +231,33 @@ async fn persist_match(
     nfo_format: &str,
 ) -> Result<(), String> {
     let folder = Path::new(&item.folder_path);
+    let movie_stem = if item.media_type == MediaType::Movie {
+        Some(Path::new(&item.file_path).file_stem().and_then(|v| v.to_str())
+            .ok_or_else(|| "movie file path is missing".to_string())?)
+    } else {
+        if !media_core::media_files::owns_folder(db, item).map_err(|e| e.to_string())? {
+            return Err("cannot write metadata into a shared show folder".into());
+        }
+        None
+    };
     let artwork = download_artwork(
         client,
         folder,
+        movie_stem,
         &crate::types::ArtworkUrls {
             poster_url: scraped.poster_url.clone(),
             fanart_url: scraped.fanart_url.clone(),
             banner_url: scraped.banner_url.clone(),
         },
     )
-    .await
-    .unwrap_or_default();
+    .await;
+    let mut issues = Vec::new();
+    let artwork = match artwork {
+        Ok(artwork) => artwork,
+        Err(error) => { issues.push(format!("artwork: {error}")); Default::default() }
+    };
 
-    for season in &scraped.seasons {
-        if let Some(url) = &season.poster_url {
-            let name = season_poster_name(season.season_number);
-            let _ = download_to_name(client, folder, &name, url).await;
-        }
-    }
+    issues.extend(artwork.issues.clone());
 
     let metadata = MediaMetadata {
         media_item_id: item.id.clone(),
@@ -277,11 +310,19 @@ async fn persist_match(
             .map_err(|e| e.to_string())?;
     }
     if matches!(item.media_type, MediaType::TvShow | MediaType::Anime) {
-        merge_seasons(db, client, item, &scraped.seasons).await?;
+        if let Err(error) = merge_seasons(db, client, item, &scraped.seasons).await { issues.push(error); }
     }
-    let _ = media_core::nfo::write_nfo(item, &metadata, nfo_format);
-    db.update_status(&item.id, ScrapedStatus::Scraped, None)
-        .map_err(|e| e.to_string())?;
+    let updated = db.get_media_item(&item.id).map_err(|e| e.to_string())?
+        .ok_or_else(|| "media item removed during scrape".to_string())?;
+    if let Err(error) = media_core::nfo::write_nfo(&updated, &metadata, nfo_format) {
+        issues.push(format!("NFO: {error}"));
+    }
+    if !issues.is_empty() {
+        let issue = issues.join("; ");
+        db.update_status(&item.id, ScrapedStatus::Partial, Some(&issue)).map_err(|e| e.to_string())?;
+        return Err(issue);
+    }
+    db.update_status(&item.id, ScrapedStatus::Scraped, None).map_err(|e| e.to_string())?;
     Ok(())
 }
 
@@ -319,12 +360,12 @@ pub async fn scrape_season(
     let scraped = tmdb
         .fetch_season(&tmdb_id, season_number, &options.language)
         .await?;
-    let folder = Path::new(&item.folder_path);
-    if let Some(url) = &scraped.poster_url {
-        let name = season_poster_name(scraped.season_number);
-        let _ = download_to_name(&client, folder, &name, url).await;
+    if !media_core::media_files::owns_folder(db, item).map_err(|e| e.to_string())? {
+        return Err("cannot write metadata into a shared show folder".into());
     }
-    merge_seasons(db, &client, item, &[scraped]).await
+    let result = merge_seasons(db, &client, item, &[scraped]).await;
+    if let Err(ref issue) = result { db.update_status(&item.id, ScrapedStatus::Partial, Some(issue)).map_err(|e| e.to_string())?; }
+    result
 }
 
 async fn merge_seasons(
@@ -334,6 +375,7 @@ async fn merge_seasons(
     scraped_seasons: &[crate::types::ScrapedSeason],
 ) -> Result<(), String> {
     let folder = Path::new(&item.folder_path);
+    let mut issues = Vec::new();
     let existing_seasons = db.fetch_seasons(&item.id).map_err(|e| e.to_string())?;
     for scraped_season in scraped_seasons {
         let season_id = existing_seasons
@@ -341,10 +383,14 @@ async fn merge_seasons(
             .find(|s| s.season_number == scraped_season.season_number)
             .map(|s| s.id.clone())
             .unwrap_or_else(|| format!("{}_S{}", item.id, scraped_season.season_number));
-        let poster = scraped_season
-            .poster_url
-            .as_ref()
-            .map(|_| season_poster_name(scraped_season.season_number));
+        let mut poster = existing_seasons.iter().find(|s| s.season_number == scraped_season.season_number).and_then(|s| s.poster_path.clone());
+        if let Some(url) = &scraped_season.poster_url {
+            let name = season_poster_name(scraped_season.season_number);
+            match download_to_name(client, folder, &name, url).await {
+                Ok(_) => poster = Some(name),
+                Err(error) => issues.push(format!("season {} poster: {error}", scraped_season.season_number)),
+            }
+        }
         let season = TvSeason {
             id: season_id.clone(),
             media_item_id: item.id.clone(),
@@ -371,10 +417,9 @@ async fn merge_seasons(
                         if let Some(stem) = ep_path.file_stem().and_then(|s| s.to_str()) {
                             let file_name = format!("{stem}-thumb.jpg");
                             let dest_dir = ep_path.parent().unwrap_or(folder);
-                            if let Ok(abs) = download_to_name(client, dest_dir, &file_name, url).await
-                            {
-                                still_path = Some(relative_to_show(&abs, folder));
-                                still_url = Some(url.clone());
+                            match download_to_name(client, dest_dir, &file_name, url).await {
+                                Ok(abs) => { still_path = Some(relative_to_show(&abs, folder)); still_url = Some(url.clone()); },
+                                Err(error) => issues.push(format!("episode {} still: {error}", existing.episode_number)),
                             }
                         }
                     }
@@ -404,11 +449,57 @@ async fn merge_seasons(
             }
         }
     }
-    Ok(())
+    if issues.is_empty() { Ok(()) } else { Err(issues.join("; ")) }
 }
 
 fn relative_to_show(path: &Path, show_root: &Path) -> String {
     path.strip_prefix(show_root)
         .map(|p| p.to_string_lossy().replace('\\', "/"))
         .unwrap_or_else(|_| path.to_string_lossy().into_owned())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use media_core::Library;
+
+    fn metadata() -> ScrapedMetadata {
+        serde_json::from_value(serde_json::json!({
+            "sourceId": "tmdb:1", "title": "Matched title", "year": 2024,
+            "genres": [], "tags": [], "credits": [], "seasons": []
+        })).unwrap()
+    }
+
+    #[tokio::test]
+    async fn nfo_uses_matched_title_and_write_failure_is_partial() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = AppDatabase::open_in_memory().unwrap();
+        let lib = Library::new("Movies", dir.path().to_string_lossy(), MediaType::Movie);
+        db.insert_library(&lib).unwrap();
+        let video = dir.path().join("Original.mkv");
+        std::fs::write(&video, b"video").unwrap();
+        let item = MediaItem::new_movie("Original", Some(2000), dir.path().to_string_lossy(), video.to_string_lossy(), lib.id, ScrapedStatus::Unscraped);
+        db.insert_media_items(&[item.clone()]).unwrap();
+        let client = Client::new();
+        persist_match(&db, &client, &item, metadata(), "kodi").await.unwrap();
+        let path = video.with_extension("nfo");
+        let xml = std::fs::read_to_string(&path).unwrap();
+        assert!(xml.contains("<title>Matched title</title>"));
+        assert!(xml.contains("<year>2024</year>"));
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        assert!(persist_match(&db, &client, &item, metadata(), "kodi").await.is_err());
+        let updated = db.get_media_item(&item.id).unwrap().unwrap();
+        assert_eq!(updated.status, ScrapedStatus::Partial);
+        assert!(updated.scrape_issue.unwrap().contains("NFO"));
+    }
+
+    #[tokio::test]
+    async fn cancelled_library_does_not_start_work() {
+        let db = Arc::new(AppDatabase::open_in_memory().unwrap());
+        let cancel = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let result = scrape_library_cancellable(db, "unused", ScrapeOptions::default(), cancel,
+            |_| panic!("cancelled task must not publish progress")).await;
+        assert_eq!(result.unwrap_err(), "cancelled");
+    }
 }

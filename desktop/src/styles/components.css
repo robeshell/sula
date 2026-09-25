@@ -1,0 +1,41 @@
+/* shadcn/ui uses the application's own appearance preferences. */
+@theme inline {
+  --color-background: var(--kg-elevated);
+  --color-foreground: var(--kg-text-primary);
+  --color-primary: var(--kg-accent);
+  --color-primary-foreground: var(--kg-on-accent);
+  --color-secondary: var(--kg-subtle-fill);
+  --color-secondary-foreground: var(--kg-text-primary);
+  --color-muted: var(--kg-subtle-fill);
+  --color-muted-foreground: var(--kg-text-secondary);
+  --color-popover: var(--kg-elevated);
+  --color-popover-foreground: var(--kg-text-primary);
+  --color-accent-foreground: var(--kg-text-primary);
+  --color-destructive: var(--kg-error);
+  --color-input: var(--kg-border);
+  --color-ring: var(--kg-accent);
+}
+@custom-variant dark (&:is([data-skin="deep-night"] *));
+[data-slot="button"], [data-slot="select-trigger"] { cursor: pointer; }
+[data-slot="button"]:disabled, [data-slot="select-trigger"]:disabled { cursor: default; }
+[data-slot="dialog-content"], [data-slot="dropdown-menu-content"], [data-slot="select-content"] { border-color: var(--kg-border); }
+[data-slot="input"], [data-slot="textarea"] { background: var(--kg-elevated); }
+[data-slot="dialog-content"] { max-height: calc(100dvh - 48px); }
+[data-slot="switch"] { flex-shrink: 0; }
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { animation-duration: .01ms !important; transition-duration: .01ms !important; scroll-behavior: auto !important; }
+}
+
+/* Quiet control surfaces; typography remains owned by each component. */
+[data-slot="button"]:not([data-variant="plain"]),
+[data-slot="input"], [data-slot="native-select"], [data-slot="select-trigger"] {
+  border-radius: 8px;
+}
+[data-slot="input"], [data-slot="native-select"], [data-slot="select-trigger"] {
+  box-shadow: none;
+}
+[data-slot="dropdown-menu-content"], [data-slot="select-content"] {
+  border-radius: 10px;
+  padding: 5px;
+  box-shadow: 0 12px 32px rgb(0 0 0 / 0.12), 0 2px 6px rgb(0 0 0 / 0.06);
+}

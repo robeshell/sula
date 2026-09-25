@@ -1,3 +1,7 @@
+import { ModalFrame } from "./ModalFrame";
+import { DialogTitle } from "./ui/dialog";
+import { Button } from "./ui/button";
+import { Input } from "./ui/input";
 import { useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { invoke } from "@tauri-apps/api/core";
@@ -77,36 +81,22 @@ export function ManualMatchModal({
   };
 
   return (
-    <div
-      className="fixed inset-0 z-50 flex items-center justify-center bg-barrier px-5 py-6"
-      onClick={onClose}
-      onKeyDown={(e) => {
-        if (e.key === "Escape") onClose();
-      }}
-      role="presentation"
-    >
-      <div
-        className="kg-glass kg-dialog"
-        onClick={(e) => e.stopPropagation()}
-        role="dialog"
-        aria-modal="true"
-        aria-labelledby="manual-match-title"
-      >
+    <ModalFrame onClose={onClose} labelledBy="manual-match-title" className="sm:max-w-2xl">
         <header className="kg-dialog-header flex items-center justify-between gap-3">
-          <h2
+          <DialogTitle
             id="manual-match-title"
             className="truncate kg-type-section-title font-extrabold tracking-[-0.25px] text-fg"
           >
             {t("action.manualMatch")}
-          </h2>
-          <button type="button" className="kg-btn kg-btn-toolbar" onClick={onClose}>
+          </DialogTitle>
+          <Button variant="ghost" size="sm" type="button" onClick={onClose}>
             {t("settings.close")}
-          </button>
+          </Button>
         </header>
 
         <div className="flex gap-2 px-6 pb-3">
-          <input
-            className="kg-field kg-field-compact flex-1"
+          <Input
+            className="flex-1"
             value={query}
             autoFocus
             onChange={(e) => setQuery(e.target.value)}
@@ -114,14 +104,13 @@ export function ManualMatchModal({
               if (e.key === "Enter") void search();
             }}
           />
-          <button
+          <Button variant="default" size="sm"
             type="button"
-            className="kg-btn"
             disabled={loading || applying}
             onClick={() => void search()}
           >
             {loading ? t("match.searching") : t("action.search")}
-          </button>
+          </Button>
         </div>
 
         <ul className="kg-dialog-body !px-3">
@@ -136,7 +125,7 @@ export function ManualMatchModal({
           ) : (
             candidates.map((c) => (
               <li key={c.sourceId}>
-                <button
+                <Button variant="plain" size="none"
                   type="button"
                   disabled={applying}
                   onClick={() => void apply(c.sourceId)}
@@ -158,12 +147,11 @@ export function ManualMatchModal({
                       </span>
                     ) : null}
                   </span>
-                </button>
+                </Button>
               </li>
             ))
           )}
         </ul>
-      </div>
-    </div>
+    </ModalFrame>
   );
 }

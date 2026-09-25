@@ -13,7 +13,7 @@ pub mod types;
 
 pub use coordinator::{MatchOutcome, ScraperCoordinator, ScraperKeys};
 pub use engine::{
-    apply_manual_match, scrape_item, scrape_library, scrape_season, ScrapeItemOutcome,
+    apply_manual_match, scrape_item, scrape_library, scrape_library_cancellable, scrape_season, ScrapeItemOutcome,
     ScrapeOptions, ScrapeProgress, ScrapeSummary,
 };
 pub use http::{build_client, humanize_error};

@@ -32,7 +32,7 @@ impl DirectoryPlan {
         !self.removed.is_empty()
     }
 
-    /// Deepest changed/added dirs only — drop ancestors that have a descendant in the set.
+    /// Keep shallowest changed roots so direct files in changed ancestors are scanned.
     pub fn scan_roots(&self) -> Vec<PathBuf> {
         let mut candidates: Vec<String> = self.added.iter().chain(self.changed.iter()).cloned().collect();
         if self.bootstrap {
@@ -46,7 +46,7 @@ impl DirectoryPlan {
             }
             candidates = self.live.keys().cloned().collect();
         }
-        prune_ancestor_paths(&candidates)
+        prune_descendant_paths(&candidates)
             .into_iter()
             .map(PathBuf::from)
             .collect()
@@ -69,13 +69,23 @@ impl DirectoryPlan {
 /// Stat every previously recorded directory. If all still exist with the same
 /// mtime (within epsilon), a full directory WalkDir can be skipped: creating a
 /// new child always bumps the parent directory mtime on POSIX / APFS / NTFS.
+#[cfg(test)]
 pub fn known_directories_unchanged(
     previous: &[DirectoryScanState],
 ) -> Result<bool, std::io::Error> {
+    known_directories_unchanged_cancellable(previous, &std::sync::atomic::AtomicBool::new(false))
+}
+
+pub fn known_directories_unchanged_cancellable(
+    previous: &[DirectoryScanState],
+    cancel: &std::sync::atomic::AtomicBool,
+) -> Result<bool, std::io::Error> {
+    super::check_cancel(cancel)?;
     if previous.is_empty() {
         return Ok(false);
     }
     for state in previous {
+        super::check_cancel(cancel)?;
         let path = Path::new(&state.directory_path);
         if !path.is_dir() {
             return Ok(false);
@@ -88,26 +98,25 @@ pub fn known_directories_unchanged(
     Ok(true)
 }
 
-/// Bump `last_scanned_at` without re-reading the tree (fast early-exit path).
-pub fn touch_scan_states(previous: &[DirectoryScanState]) -> Vec<DirectoryScanState> {
-    let now = Utc::now();
-    previous
-        .iter()
-        .map(|s| DirectoryScanState {
-            library_id: s.library_id.clone(),
-            directory_path: s.directory_path.clone(),
-            last_known_modification_time: s.last_known_modification_time,
-            last_scanned_at: now,
-        })
-        .collect()
-}
+
 
 /// Directory-only walk + diff against stored scan state (SCAN-11).
+#[cfg(test)]
 pub fn plan_directories(
     library: &Library,
     excluded_folders: &HashSet<String>,
     previous: &[DirectoryScanState],
 ) -> Result<DirectoryPlan, std::io::Error> {
+    plan_directories_cancellable(library, excluded_folders, previous, &std::sync::atomic::AtomicBool::new(false))
+}
+
+pub fn plan_directories_cancellable(
+    library: &Library,
+    excluded_folders: &HashSet<String>,
+    previous: &[DirectoryScanState],
+    cancel: &std::sync::atomic::AtomicBool,
+) -> Result<DirectoryPlan, std::io::Error> {
+    super::check_cancel(cancel)?;
     let root = PathBuf::from(&library.root_path);
     if !root.is_dir() {
         return Err(std::io::Error::new(
@@ -116,7 +125,7 @@ pub fn plan_directories(
         ));
     }
 
-    let live = walk_directories(&root, excluded_folders)?;
+    let live = walk_directories(&root, excluded_folders, cancel)?;
     let prev_map: HashMap<String, f64> = previous
         .iter()
         .map(|s| {
@@ -162,6 +171,7 @@ pub fn plan_directories(
 fn walk_directories(
     root: &Path,
     excluded_folders: &HashSet<String>,
+    cancel: &std::sync::atomic::AtomicBool,
 ) -> Result<HashMap<String, f64>, std::io::Error> {
     let mut live = HashMap::new();
     let root_canon = canonicalize_lossy(root);
@@ -185,6 +195,7 @@ fn walk_directories(
     });
 
     for entry in walker {
+        super::check_cancel(cancel)?;
         let entry = entry?;
         if !entry.file_type().is_dir() {
             continue;
@@ -245,14 +256,12 @@ fn path_is_under(path: &str, root: &str) -> bool {
     crate::db::path_rooted_under(path, root)
 }
 
-fn prune_ancestor_paths(paths: &[String]) -> Vec<PathBuf> {
+fn prune_descendant_paths(paths: &[String]) -> Vec<PathBuf> {
     let mut sorted: Vec<String> = paths.to_vec();
     sorted.sort_by_key(|p| p.len());
     let mut kept: Vec<String> = Vec::new();
-    for path in sorted.into_iter().rev() {
-        // Keep deepest first; skip if an already-kept path is under this one (this is ancestor).
-        let is_ancestor_of_kept = kept.iter().any(|k| path_is_under(k, &path) && k != &path);
-        if is_ancestor_of_kept {
+    for path in sorted {
+        if kept.iter().any(|root| path == *root || path_is_under(&path, root)) {
             continue;
         }
         kept.push(path);
@@ -295,21 +304,19 @@ mod tests {
     }
 
     #[test]
-    fn prune_keeps_deepest_only() {
+    fn prune_keeps_ancestor_coverage() {
         let paths = vec![
             "/lib".into(),
             "/lib/A".into(),
             "/lib/A/B".into(),
             "/lib/C".into(),
         ];
-        let kept = prune_ancestor_paths(&paths);
+        let kept = prune_descendant_paths(&paths);
         let kept: Vec<String> = kept
             .into_iter()
             .map(|p| p.to_string_lossy().into_owned())
             .collect();
-        assert!(kept.contains(&"/lib/A/B".to_string()));
-        assert!(kept.contains(&"/lib/C".to_string()));
-        assert!(!kept.iter().any(|p| p == "/lib" || p == "/lib/A"));
+        assert_eq!(kept, vec!["/lib"]);
     }
 
     #[test]

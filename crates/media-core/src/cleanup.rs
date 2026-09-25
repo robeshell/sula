@@ -99,6 +99,11 @@ pub fn find_residuals(
         if !folder.is_dir() {
             continue;
         }
+        // A shared directory has no unambiguous owner for orphan files.
+        if !crate::media_files::owns_folder(db, &item)
+            .map_err(|e| std::io::Error::other(e.to_string()))? {
+            continue;
+        }
 
         let mut keep_paths: HashSet<String> = HashSet::new();
         let mut keep_stems: HashSet<String> = HashSet::new();
@@ -207,7 +212,7 @@ pub fn find_residuals(
     Ok(out)
 }
 
-/// Move residual files to trash (fallback hard delete). Returns count removed.
+/// Move residual files to trash. Never silently fall back to permanent deletion.
 pub fn perform_cleanup(paths: &[String]) -> Result<usize, CleanupError> {
     let fs = FilesystemService::new();
     let mut n = 0usize;
@@ -218,10 +223,6 @@ pub fn perform_cleanup(paths: &[String]) -> Result<usize, CleanupError> {
         }
         match fs.trash_item(&p) {
             Ok(_) => n += 1,
-            Err(FilesystemError::TrashUnavailable) => {
-                fs.remove_item(&p)?;
-                n += 1;
-            }
             Err(FilesystemError::NotFound(_)) => {}
             Err(e) => return Err(e.into()),
         }
@@ -264,6 +265,25 @@ mod tests {
     use crate::models::{Library, MediaType, ScrapedStatus};
     use crate::AppDatabase;
     use tempfile::tempdir;
+
+    #[test]
+    fn shared_movie_directory_never_proposes_other_movies_subtitles() {
+        let dir = tempdir().unwrap();
+        let db = AppDatabase::open_in_memory().unwrap();
+        let lib = Library::new("Movies", dir.path().to_string_lossy(), MediaType::Movie);
+        db.insert_library(&lib).unwrap();
+        let mut ids = Vec::new();
+        for name in ["A", "B"] {
+            let video = dir.path().join(format!("{name}.mkv"));
+            std::fs::write(&video, b"video").unwrap();
+            std::fs::write(dir.path().join(format!("{name}.srt")), b"subtitle").unwrap();
+            let item = crate::MediaItem::new_movie(name, None, dir.path().to_string_lossy(), video.to_string_lossy(), lib.id.clone(), ScrapedStatus::Scraped);
+            ids.push(item.id.clone());
+            db.insert_media_items(&[item]).unwrap();
+        }
+        assert!(find_residuals(&db, &ids[..1]).unwrap().is_empty());
+        assert!(find_residuals(&db, &ids).unwrap().is_empty());
+    }
 
     #[test]
     fn companion_suffix_accepts_dot_dash_underscore() {

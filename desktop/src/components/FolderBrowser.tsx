@@ -1,3 +1,4 @@
+import { Button } from "./ui/button";
 import { useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { invoke } from "@tauri-apps/api/core";
@@ -79,9 +80,9 @@ export function FolderBrowser({
   return (
     <div className="flex min-h-0 flex-1 flex-col overflow-hidden">
       <div className="flex shrink-0 items-center gap-2 border-b border-hairline px-3 py-2">
-        <button type="button" className="kg-btn kg-btn-toolbar shrink-0" onClick={onClose}>
+        <Button variant="ghost" size="sm" type="button" className="shrink-0" onClick={onClose}>
           ← {t("browser.back")}
-        </button>
+        </Button>
         <nav className="flex min-w-0 flex-1 items-center gap-1 overflow-x-auto kg-type-body-secondary">
           {segments.map((seg, i) => (
             <span key={seg.path} className="flex shrink-0 items-center gap-1">
@@ -89,13 +90,13 @@ export function FolderBrowser({
               {i === segments.length - 1 ? (
                 <span className="font-semibold text-fg">{seg.name}</span>
               ) : (
-                <button
+                <Button variant="plain" size="none"
                   type="button"
                   className="text-fg-secondary hover:text-fg"
                   onClick={() => navigateTo(i)}
                 >
                   {seg.name}
-                </button>
+                </Button>
               )}
             </span>
           ))}
@@ -113,7 +114,7 @@ export function FolderBrowser({
           <ul className="space-y-0.5">
             {entries.map((entry) => (
               <li key={entry.path}>
-                <button
+                <Button variant="plain" size="none"
                   type="button"
                   className="flex w-full items-center gap-2 rounded-control px-2 py-1.5 text-left kg-type-body-secondary hover:bg-subtle"
                   onClick={() => enter(entry)}
@@ -136,7 +137,7 @@ export function FolderBrowser({
                   {entry.modifiedAt ? (
                     <span className="shrink-0 kg-type-caption text-fg-muted">{entry.modifiedAt}</span>
                   ) : null}
-                </button>
+                </Button>
               </li>
             ))}
           </ul>

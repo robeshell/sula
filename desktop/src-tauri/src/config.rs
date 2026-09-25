@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase", default)]
 pub struct AppConfig {
+    pub config_notice: Option<String>,
     pub scrape_concurrency: u8,
     pub metadata_language: String,
     pub nfo_format: String,
@@ -23,11 +24,14 @@ pub struct AppConfig {
     #[serde(default = "default_episode_file_template")]
     pub rename_episode_file_template: String,
     pub appearance: String,
-    /// Accent axis id: indigo | teal | sky | slate (kaigua presets).
+    /// Accent axis id: indigo | teal | sky | slate (sula presets).
     #[serde(default = "default_accent")]
     pub accent: String,
     #[serde(default = "default_tray_enabled")]
     pub tray_enabled: bool,
+    /// Keep the process alive and hide the main window when it is closed.
+    #[serde(default = "default_keep_running_on_close")]
+    pub keep_running_on_close: bool,
     /// UI language: zh-Hans | en | ja (I18N surface language).
     #[serde(default = "default_ui_locale")]
     pub ui_locale: String,
@@ -35,6 +39,10 @@ pub struct AppConfig {
 }
 
 fn default_tray_enabled() -> bool {
+    true
+}
+
+fn default_keep_running_on_close() -> bool {
     true
 }
 
@@ -75,6 +83,7 @@ pub struct ApiKeysConfig {
 impl Default for AppConfig {
     fn default() -> Self {
         Self {
+            config_notice: None,
             scrape_concurrency: 4,
             metadata_language: "zh-CN".into(),
             nfo_format: "kodi".into(),
@@ -97,9 +106,26 @@ impl Default for AppConfig {
             appearance: "system".into(),
             accent: default_accent(),
             tray_enabled: true,
+            keep_running_on_close: true,
             ui_locale: default_ui_locale(),
             api_keys: ApiKeysConfig::default(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::AppConfig;
+
+    #[test]
+    fn keep_running_on_close_defaults_to_enabled() {
+        assert!(AppConfig::default().keep_running_on_close);
+    }
+
+    #[test]
+    fn legacy_config_without_close_preference_defaults_to_enabled() {
+        let config: AppConfig = toml::from_str("").expect("empty config should use defaults");
+        assert!(config.keep_running_on_close);
     }
 }
 
@@ -115,41 +141,134 @@ impl AppConfig {
     }
 }
 
+#[derive(Serialize, Deserialize)]
+struct DiskConfig {
+    #[serde(flatten)]
+    config: AppConfig,
+    #[serde(default)]
+    credential_ref: Option<String>,
+}
+
 pub struct ConfigStore {
     path: PathBuf,
+    credential_ref: Option<String>,
     pub config: AppConfig,
 }
 
 impl ConfigStore {
     pub fn load_or_default(path: impl AsRef<Path>) -> anyhow::Result<Self> {
         let path = path.as_ref().to_path_buf();
-        let config = if path.exists() {
-            let raw = fs::read_to_string(&path)?;
-            toml::from_str(&raw)?
-        } else {
-            let config = AppConfig::default();
-            if let Some(parent) = path.parent() {
-                fs::create_dir_all(parent)?;
-            }
-            let raw = toml::to_string_pretty(&config)?;
-            fs::write(&path, raw)?;
-            config
+        let mut credential_ref = None;
+        let mut needs_save = false;
+        let config = match fs::read_to_string(&path) {
+            Ok(raw) => match toml::from_str::<DiskConfig>(&raw) {
+                Ok(mut disk) => {
+                    credential_ref = disk.credential_ref;
+                    if let Some(id) = &credential_ref {
+                        disk.config.api_keys = serde_json::from_str(&crate::credentials::get(id)?)?;
+                    } else if disk.config.api_keys != ApiKeysConfig::default() { needs_save = true; }
+                    disk.config
+                }
+                Err(error) => {
+                    let backup = path.with_extension(format!("invalid-{}.toml", uuid::Uuid::new_v4()));
+                    fs::rename(&path, &backup)?;
+                    tracing::error!(%error, backup = %backup.display(), "invalid configuration preserved; using defaults");
+                    needs_save = true;
+                    AppConfig { config_notice: Some("err.configRecovered".into()), ..AppConfig::default() }
+                }
+            },
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => { needs_save = true; AppConfig::default() },
+            Err(e) => return Err(e.into()),
         };
-        Ok(Self { path, config })
+        let mut store = Self { path, config, credential_ref };
+        if needs_save { store.save()?; }
+        Ok(store)
     }
 
-    pub fn save(&self) -> anyhow::Result<()> {
-        if let Some(parent) = self.path.parent() {
-            fs::create_dir_all(parent)?;
+    pub fn save(&mut self) -> anyhow::Result<()> {
+        if let Some(parent) = self.path.parent() { fs::create_dir_all(parent)?; }
+        let next_ref = if self.config.api_keys != ApiKeysConfig::default() {
+            let id = uuid::Uuid::new_v4().to_string();
+            crate::credentials::set(&id, &serde_json::to_string(&self.config.api_keys)?)?;
+            Some(id)
+        } else { None };
+        let mut disk_config = self.config.clone();
+        disk_config.api_keys = ApiKeysConfig::default();
+        disk_config.config_notice = None;
+        let result = (|| -> anyhow::Result<()> {
+            let raw = toml::to_string_pretty(&DiskConfig { config: disk_config, credential_ref: next_ref.clone() })?;
+            let tmp = self.path.with_extension("toml.tmp");
+            use std::io::Write;
+            let mut options = fs::OpenOptions::new();
+            options.create(true).truncate(true).write(true);
+            #[cfg(unix)] { use std::os::unix::fs::OpenOptionsExt; options.mode(0o600); }
+            let mut file = options.open(&tmp)?;
+            file.write_all(raw.as_bytes())?;
+            file.sync_all()?;
+            fs::rename(&tmp, &self.path)?;
+            Ok(())
+        })();
+        if let Err(error) = result {
+            if let Some(id) = next_ref { crate::credentials::remove(&id); }
+            return Err(error);
         }
-        let raw = toml::to_string_pretty(&self.config)?;
-        let tmp = self.path.with_extension("toml.tmp");
-        fs::write(&tmp, &raw)?;
-        fs::rename(&tmp, &self.path)?;
+        // The old record remains valid until the new file reference is committed.
+        if let Some(old) = self.credential_ref.take() {
+            crate::credentials::remove(&old);
+        }
+        self.credential_ref = next_ref;
         Ok(())
     }
+}
 
-    pub fn path(&self) -> &Path {
-        &self.path
+#[cfg(test)]
+mod storage_tests {
+    use super::*;
+    fn folder() -> PathBuf {
+        let path = std::env::temp_dir().join(format!("sula-config-test-{}", uuid::Uuid::new_v4()));
+        fs::create_dir(&path).unwrap(); path
     }
+    #[test]
+    fn legacy_keys_migrate_and_roundtrip_without_plaintext_on_disk() {
+        let dir = folder(); let path = dir.join("config.toml");
+        let mut config = AppConfig::default(); config.api_keys.tmdb = "test-only-key".into();
+        fs::write(&path, toml::to_string(&config).unwrap()).unwrap();
+        let mut store = ConfigStore::load_or_default(&path).unwrap();
+        assert_eq!(store.config.api_keys.tmdb, "test-only-key");
+        assert!(!fs::read_to_string(&path).unwrap().contains("test-only-key"));
+        assert_eq!(ConfigStore::load_or_default(&path).unwrap().config.api_keys.tmdb, "test-only-key");
+        let old = store.credential_ref.clone().unwrap();
+        store.config.api_keys.tmdb = "replacement-test-key".into(); store.save().unwrap();
+        assert!(crate::credentials::get(&old).is_err());
+        assert_eq!(ConfigStore::load_or_default(&path).unwrap().config.api_keys.tmdb, "replacement-test-key");
+        crate::credentials::remove(store.credential_ref.as_ref().unwrap());
+        fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
+    fn malformed_config_is_preserved_before_defaults_are_written() {
+        let dir = folder(); let path = dir.join("config.toml");
+        fs::write(&path, "invalid = [").unwrap();
+        let store = ConfigStore::load_or_default(&path).unwrap();
+        assert!(store.config.config_notice.is_some());
+        let backups: Vec<_> = fs::read_dir(&dir).unwrap().filter_map(Result::ok).filter(|e| e.file_name().to_string_lossy().contains("invalid-")).collect();
+        assert_eq!(backups.len(), 1);
+        assert_eq!(fs::read_to_string(backups[0].path()).unwrap(), "invalid = [");
+        assert!(ConfigStore::load_or_default(&path).unwrap().config.config_notice.is_none());
+        fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
+    fn failed_config_save_preserves_previous_disk_and_credential() {
+        let dir = folder(); let path = dir.join("config.toml");
+        let mut store = ConfigStore::load_or_default(&path).unwrap();
+        store.config.api_keys.tmdb = "old-test-key".into(); store.save().unwrap();
+        let original = fs::read(&path).unwrap(); let old = store.credential_ref.clone().unwrap();
+        fs::create_dir(path.with_extension("toml.tmp")).unwrap();
+        store.config.api_keys.tmdb = "new-test-key".into();
+        assert!(store.save().is_err());
+        assert_eq!(fs::read(&path).unwrap(), original);
+        assert_eq!(store.credential_ref.as_ref(), Some(&old));
+        assert_eq!(ConfigStore::load_or_default(&path).unwrap().config.api_keys.tmdb, "old-test-key");
+        crate::credentials::remove(&old); fs::remove_dir_all(dir).unwrap();
+    }
+
 }

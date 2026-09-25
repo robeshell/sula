@@ -1,3 +1,7 @@
+import { Checkbox } from "./ui/checkbox";
+import { ModalFrame } from "./ModalFrame";
+import { DialogTitle } from "./ui/dialog";
+import { Button } from "./ui/button";
 import { useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
 
@@ -46,25 +50,14 @@ export function CleanupSheet({
   };
 
   return (
-    <div
-      className="fixed inset-0 z-50 flex items-center justify-center bg-barrier px-5 py-6"
-      onClick={onClose}
-      role="presentation"
-    >
-      <div
-        className="kg-glass kg-dialog flex max-h-[min(640px,calc(100vh-48px))] w-full max-w-[520px] flex-col"
-        onClick={(e) => e.stopPropagation()}
-        role="dialog"
-        aria-modal="true"
-        aria-labelledby="cleanup-title"
-      >
+    <ModalFrame onClose={onClose} labelledBy="cleanup-title" className="sm:max-w-xl">
         <header className="kg-dialog-header shrink-0">
-          <h2
+          <DialogTitle
             id="cleanup-title"
             className="truncate kg-type-section-title font-extrabold tracking-[-0.25px] text-fg"
           >
             {t("cleanup.title")}
-          </h2>
+          </DialogTitle>
           <p className="mt-2 kg-type-body leading-[1.45] text-fg-secondary">
             {t("cleanup.subtitle", { count: candidates.length })}
           </p>
@@ -72,10 +65,10 @@ export function CleanupSheet({
 
         <div className="flex shrink-0 items-center justify-between gap-2 border-b border-hairline px-6 py-2">
           <label className="flex cursor-pointer items-center gap-2 kg-type-body-secondary text-fg-secondary">
-            <input
-              type="checkbox"
+            <Checkbox
+
               checked={selected.size === candidates.length && candidates.length > 0}
-              onChange={(e) => toggleAll(e.target.checked)}
+              onCheckedChange={(e) => toggleAll(e === true)}
             />
             {t("cleanup.selectAll")}
           </label>
@@ -91,11 +84,11 @@ export function CleanupSheet({
           {candidates.map((c) => (
             <li key={c.path}>
               <label className="flex cursor-pointer items-start gap-2.5 rounded-control px-2.5 py-2 hover:bg-fill-secondary/40">
-                <input
-                  type="checkbox"
+                <Checkbox
+
                   className="mt-1"
                   checked={selected.has(c.path)}
-                  onChange={() => toggle(c.path)}
+                  onCheckedChange={() => toggle(c.path)}
                 />
                 <span className="min-w-0 flex-1">
                   <span className="block truncate kg-type-body-secondary font-semibold text-fg">
@@ -111,20 +104,18 @@ export function CleanupSheet({
         </ul>
 
         <div className="kg-dialog-footer shrink-0">
-          <button type="button" className="kg-btn kg-btn-toolbar" onClick={onClose}>
+          <Button variant="ghost" size="sm" type="button" onClick={onClose}>
             {t("settings.close")}
-          </button>
-          <button
+          </Button>
+          <Button variant="destructive" size="sm"
             type="button"
-            className="kg-btn kg-btn-destructive"
             disabled={selected.size === 0}
             onClick={() => onConfirm([...selected])}
           >
             {t("cleanup.confirm")}
-          </button>
+          </Button>
         </div>
-      </div>
-    </div>
+    </ModalFrame>
   );
 }
 

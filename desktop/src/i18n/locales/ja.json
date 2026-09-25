@@ -1,6 +1,7 @@
 {
+  "list.sort": "並び替え",
   "app.title": "ライブラリ",
-  "app.brand": "开刮",
+  "app.brand": "Sula",
   "action.refresh": "更新",
   "action.refreshing": "スキャン中…",
   "action.scrapeAll": "すべてスクレイプ",
@@ -135,6 +136,9 @@
   "settings.later.shipsIn": "{{note}} で予定",
   "settings.tray.enabled": "メニューバー / トレイアイコンを表示",
   "settings.tray.saved": "トレイ設定を保存しました",
+  "settings.background.keepRunning": "ウィンドウを閉じてもバックグラウンドで実行",
+  "settings.background.keepRunningHint": "Dock、メニューバー、またはトレイから再度開けます。",
+  "settings.background.saved": "バックグラウンド実行設定を保存しました",
   "settings.rename.auto": "スクレイプ後に自動改名",
   "settings.rename.createSeasons": "改名時に Season フォルダを作成",
   "settings.rename.createSeasonsHint": "番組/アニメ：エピソードを Season XX に整理（テンプレート変更可）",
@@ -149,7 +153,7 @@
   "delete.message": "「{{title}}」を削除しますか？",
   "delete.multiTitle": "{{count}} 件の項目",
   "delete.alsoTrash": "ローカルファイルも削除",
-  "delete.alsoTrashHint": "メディアフォルダを削除。ゴミ箱が使えない場合は完全削除になります",
+  "delete.alsoTrashHint": "専用フォルダーは全体をゴミ箱へ移動し、共有フォルダーでは選択した映画ファイルのみ移動します。ゴミ箱が利用できない場合は中止します。",
   "delete.confirm": "削除",
   "lang.zh": "中文",
   "lang.en": "English",
@@ -321,5 +325,7 @@
   "action.more": "その他",
   "detail.close": "詳細を閉じる",
   "settings.language.label": "表示言語",
-  "settings.language.saved": "言語設定を保存しました"
+  "settings.language.saved": "言語設定を保存しました",
+  "err.configRecovered": "設定ファイルが破損しています。バックアップを保存し、初期設定に戻しました。",
+  "tasks.result": "成功 {{success}} · 未一致 {{unmatched}} · 失敗 {{failed}}"
 }

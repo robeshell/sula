@@ -9,7 +9,7 @@ use crate::state::AppState;
 use crate::task_queue::{TaskKind, TaskSnapshot, TaskStatus};
 use crate::ui_i18n;
 
-const TRAY_ID: &str = "kaigua-tray";
+const TRAY_ID: &str = "sula-tray";
 const FLASH_SECS: u64 = 3;
 
 pub struct TrayHandle {
@@ -237,7 +237,7 @@ fn tray_locale_from_state(app: &AppHandle) -> String {
     locale
 }
 
-fn show_main_window(app: &AppHandle) {
+pub(crate) fn show_main_window(app: &AppHandle) {
     if let Some(window) = app.get_webview_window("main") {
         let _ = window.show();
         let _ = window.unminimize();

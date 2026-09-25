@@ -88,6 +88,67 @@ impl AppDatabase {
         })
     }
 
+    pub fn list_metadata_summaries_for_ids(
+        &self,
+        ids_json: &str,
+    ) -> Result<Vec<MediaMetaSummary>, DatabaseError> {
+        self.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT m.mediaItemId, m.posterPath, m.fanartPath, m.overview, m.rating, m.genres
+                 FROM media_metadata m
+                 INNER JOIN media_items i ON i.id = m.mediaItemId
+                 WHERE i.id IN (SELECT value FROM json_each(?1))",
+            )?;
+            let rows = stmt.query_map(params![ids_json], |row| {
+                let genres_json: String = row.get(5)?;
+                Ok(MediaMetaSummary {
+                    media_item_id: row.get(0)?,
+                    poster_path: row.get(1)?,
+                    fanart_path: row.get(2)?,
+                    overview: row.get(3)?,
+                    rating: row.get(4)?,
+                    genres: serde_json::from_str(&genres_json).unwrap_or_default(),
+                })
+            })?;
+            let mut out = Vec::new();
+            for row in rows {
+                out.push(row?);
+            }
+            Ok(out)
+        })
+    }
+
+    /// Season/episode counts for TV & anime rows in a library (one grouped query).
+    pub fn list_show_stats_for_ids(&self, ids_json: &str) -> Result<Vec<ShowListStats>, DatabaseError> {
+        self.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT s.mediaItemId,
+                        COUNT(DISTINCT s.id),
+                        COUNT(e.id),
+                        SUM(CASE WHEN e.filePath IS NOT NULL AND e.filePath != '' THEN 1 ELSE 0 END)
+                 FROM tv_seasons s
+                 INNER JOIN media_items i ON i.id = s.mediaItemId
+                 LEFT JOIN tv_episodes e ON e.seasonId = s.id
+                 WHERE i.id IN (SELECT value FROM json_each(?1))
+                 GROUP BY s.mediaItemId",
+            )?;
+            let rows = stmt.query_map(params![ids_json], |row| {
+                let local: i64 = row.get::<_, Option<i64>>(3)?.unwrap_or(0);
+                Ok(ShowListStats {
+                    media_item_id: row.get(0)?,
+                    season_count: row.get::<_, i64>(1)? as u32,
+                    episode_count: row.get::<_, i64>(2)? as u32,
+                    local_episode_count: local.max(0) as u32,
+                })
+            })?;
+            let mut out = Vec::new();
+            for row in rows {
+                out.push(row?);
+            }
+            Ok(out)
+        })
+    }
+
     pub fn get_media_item(&self, id: &str) -> Result<Option<MediaItem>, DatabaseError> {
         self.with_conn(|conn| {
             conn.query_row(

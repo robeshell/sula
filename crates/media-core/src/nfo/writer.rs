@@ -26,15 +26,15 @@ fn write_xml(item: &MediaItem, xml: String) -> Result<(), String> {
     fs::create_dir_all(folder).map_err(|e| e.to_string())?;
     let path = match item.media_type {
         MediaType::Movie => {
-            let name = folder
-                .file_name()
-                .and_then(|s| s.to_str())
-                .unwrap_or("movie");
-            folder.join(format!("{name}.nfo"))
+            if item.file_path.is_empty() { return Err("movie file path is missing".into()); }
+            Path::new(&item.file_path).with_extension("nfo")
         }
         MediaType::TvShow | MediaType::Anime => folder.join("tvshow.nfo"),
     };
-    fs::write(path, xml).map_err(|e| e.to_string())
+    crate::FilesystemService::new().write_file(xml.as_bytes(), path, crate::WriteOptions {
+        collision_policy: crate::CollisionPolicy::Replace,
+        ..Default::default()
+    }).map(|_| ()).map_err(|e| e.to_string())
 }
 
 fn render_kodi(item: &MediaItem, metadata: &MediaMetadata) -> String {
@@ -243,6 +243,22 @@ mod tests {
             scraped_at: Utc::now(),
         };
         (item, meta)
+    }
+
+    #[test]
+    fn movies_in_shared_directory_write_distinct_nfos() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut item, meta) = sample();
+        item.folder_path = dir.path().to_string_lossy().into_owned();
+        for name in ["A", "B"] {
+            item.file_path = dir.path().join(format!("{name}.mkv")).to_string_lossy().into_owned();
+            item.title = name.into();
+            write_nfo(&item, &meta, "kodi").unwrap();
+        }
+        for name in ["A", "B"] {
+            let xml = std::fs::read_to_string(dir.path().join(format!("{name}.nfo"))).unwrap();
+            assert!(xml.contains(&format!("<title>{name}</title>")));
+        }
     }
 
     #[test]

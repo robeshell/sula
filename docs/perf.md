@@ -1,33 +1,46 @@
-# 性能验收（M6）
+# Sula 验证与性能检查
 
-对应迁移计划 §5。下列命令用于本机/CI 做回归，不替代真实 NAS 手测。
+选择与改动对应的检查。文档更新和任务交接不触发全量测试、构建或打包。自动测试、浏览器模拟数据、真实文件操作和平台安装验证需分别记录，不能互相替代。
 
-## 空增量刷新（SCAN-13）
+## 按模块选择
 
-要求：目录无变更时只做目录 mtime walk + 写 scan state，不重新枚举/入库媒体文件。
+以下命令均从仓库根目录执行，示例是可选的检查入口，不要求每次全跑。
 
-```bash
-# 含 early-exit 单测 + 中等规模目录压测
-cargo test -p media-core --lib refresh -- --nocapture
-cargo test -p media-core --lib empty_refresh_many_dirs -- --nocapture
-```
+| 变更范围 | 建议检查 |
+| --- | --- |
+| 前端类型与组件接线 | `pnpm --dir desktop exec tsc --noEmit` |
+| 状态切换与异步响应 | `pnpm --dir desktop test:store` |
+| 海报请求和缓存失效 | `pnpm --dir desktop test:poster-cache` |
+| 异步确认流程 | `pnpm --dir desktop test:confirmation` |
+| Rust 应用编译边界 | `cargo check -p sula --lib --locked` |
+| 配置与凭据逻辑 | `cargo test -p sula --lib config:: --locked` |
+| 扫描增量退出 | `cargo test -p media-core --lib bootstrap_then_early_exit_on_unchanged --locked` |
+| 中等目录数量的空刷新 | `cargo test -p media-core --lib empty_refresh_many_dirs --locked` |
 
-`empty_refresh_many_dirs` 会建约 300 个电影目录，断言第二次 `refresh_library` 的 `early_exit == true` 且 `discovered_media_count == 0`。
+其他扫描、数据库、整理、匹配修改使用所属 crate 和对应测试名过滤器。测试名称以当前代码为准，不要沿用历史计划中不存在的验收编号。
 
-## 刮削限流
+## 增量扫描
 
-- 设置项 `scrapeConcurrency`（1–8，默认 4）
-- HTTP 层对 429 有退避（`scraper-kit`）
+无变更目录的回归应核对快速退出、发现条目数及数据库变化；有变更目录还需覆盖根目录直接新增文件、子目录变化、排除规则、离线、权限错误与挂载根替换。
 
-手测：批量刮削时观察日志与任务进度，确认不会瞬时打爆 API。
+中等规模临时目录测试只能验证相应场景，不能证明真实 NAS 的时间戳、挂载身份和中断行为可靠。性能比较应记录条目数、目录数、存储介质、冷/热缓存、耗时及观察范围，而不是只写“不卡”。
 
-## 缩略图滚动
+## 网格与图片
 
-- 列表/海报必须走 `ThumbnailCache` 磁盘缩略图（`resolve_poster_thumbnail`）
-- 清除缓存：设置 → 缓存
+界面使用虚拟列表控制挂载数量，海报请求经过队列与缓存。原生缩略图缓存用于减少大图解码。
 
-手测：在 NAS 库切换海报网格并快速滚动，主线程不应反复解码原图。
+检查快速滚动、网格/列表切换、搜索后重新定位、图片替换及缓存清除。调整间距时核对行高计算，并检查 Home/End 和方向键能否把焦点移到视口外条目。不能以占位海报检查替代真实图片解码性能验证。
 
-## 任务进度节流
+## 刮削与任务
 
-扫描类进度事件由任务队列推送；前端 toast/任务面板消费。勿在热路径上每文件 emit。
+并发设置不能保证数据源永不限流。检查实际请求失败、限流、无候选、部分写入失败和取消后的任务状态；不要把错误文案转换当成自动重试策略。
+
+任务取消是合作式的，已完成操作不会因此全部回滚。文件写入与恢复需要定向测试，并在可恢复的测试资料库中进行实查。
+
+## 界面与平台
+
+当前桌面界面至少按 1024px 和 1280px 宽度查看中文长标题、空态、列表、详情、设置和弹窗。检查深浅主题、键盘焦点及减少动态效果；记录是否使用模拟数据。
+
+原生验收另行检查窗口关闭与退出、托盘、文件选择、系统凭据、回收站、重启恢复，以及对应平台的安装与升级。不因某个平台构建通过而宣称其他平台也已验证。
+
+阶段结果见[模块审查](module-review.md)、[界面记录](ui-rewrite.md)及[更名记录](rename.md)，其中结果只对记录中的范围有效。

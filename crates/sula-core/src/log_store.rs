@@ -5,7 +5,6 @@ use std::fmt::{self, Write as _};
 use std::sync::{Arc, Mutex, RwLock};
 
 use serde::Serialize;
-use tauri::{AppHandle, Emitter};
 use tracing::field::{Field, Visit};
 use tracing::{Event, Level, Subscriber};
 use tracing_subscriber::layer::Context;
@@ -43,22 +42,28 @@ pub struct LogEntry {
     pub message: String,
 }
 
+/// Receives log changes as they happen, so a shell can push them to its UI.
+pub trait LogSink: Send + Sync {
+    fn entry(&self, entry: &LogEntry);
+    fn cleared(&self);
+}
+
 pub struct LogStore {
     entries: Mutex<VecDeque<LogEntry>>,
-    app: RwLock<Option<AppHandle>>,
+    sink: RwLock<Option<Arc<dyn LogSink>>>,
 }
 
 impl LogStore {
     pub fn new() -> Arc<Self> {
         Arc::new(Self {
             entries: Mutex::new(VecDeque::with_capacity(128)),
-            app: RwLock::new(None),
+            sink: RwLock::new(None),
         })
     }
 
-    pub fn attach_app(&self, app: AppHandle) {
-        if let Ok(mut slot) = self.app.write() {
-            *slot = Some(app);
+    pub fn attach_sink(&self, sink: Arc<dyn LogSink>) {
+        if let Ok(mut slot) = self.sink.write() {
+            *slot = Some(sink);
         }
     }
 
@@ -75,9 +80,9 @@ impl LogStore {
                 guard.pop_front();
             }
         }
-        if let Ok(app) = self.app.read() {
-            if let Some(handle) = app.as_ref() {
-                let _ = handle.emit("log://entry", &entry);
+        if let Ok(sink) = self.sink.read() {
+            if let Some(sink) = sink.as_ref() {
+                sink.entry(&entry);
             }
         }
     }
@@ -93,9 +98,9 @@ impl LogStore {
         if let Ok(mut guard) = self.entries.lock() {
             guard.clear();
         }
-        if let Ok(app) = self.app.read() {
-            if let Some(handle) = app.as_ref() {
-                let _ = handle.emit("log://cleared", ());
+        if let Ok(sink) = self.sink.read() {
+            if let Some(sink) = sink.as_ref() {
+                sink.cleared();
             }
         }
     }

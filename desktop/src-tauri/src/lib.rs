@@ -1,14 +1,11 @@
 mod accent;
-mod app;
 #[cfg(target_os = "macos")]
 mod app_menu;
 mod commands;
-mod config;
-mod log_store;
-mod state;
-mod task_queue;
 mod tray;
-mod ui_i18n;
+
+// The application core lives in `sula-core`; these keep `crate::…` paths working.
+use sula_core::{app, config, log_store, state, task_queue, ui_i18n};
 
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -52,9 +49,12 @@ pub fn run() {
             }
         })
         .setup(move |app| {
-            let state = AppState::bootstrap(logs.clone()).unwrap_or_else(|error| startup_failed(app.handle(), &error));
+            let runtime = tauri::async_runtime::handle().inner().clone();
+            let state = state::app_data_dir()
+                .and_then(|data_dir| AppState::bootstrap(data_dir, &runtime, logs.clone()))
+                .unwrap_or_else(|error| startup_failed(app.handle(), &error));
             app.manage(state);
-            logs.attach_app(app.handle().clone());
+            logs.attach_sink(Arc::new(LogEvents(app.handle().clone())));
             tray::setup(app.handle())?;
             accent::setup(app.handle());
             #[cfg(target_os = "macos")]
@@ -162,6 +162,19 @@ fn startup_failed(app: &tauri::AppHandle, error: &anyhow::Error) -> ! {
     std::process::exit(if already_running { 0 } else { 1 });
 }
 
+/// Forwards the in-app log to the webview.
+struct LogEvents(tauri::AppHandle);
+
+impl log_store::LogSink for LogEvents {
+    fn entry(&self, entry: &log_store::LogEntry) {
+        let _ = tauri::Emitter::emit(&self.0, "log://entry", entry);
+    }
+
+    fn cleared(&self) {
+        let _ = tauri::Emitter::emit(&self.0, "log://cleared", ());
+    }
+}
+
 fn init_tracing(logs: Arc<log_store::LogStore>) {
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
     tracing_subscriber::registry()
@@ -176,4 +189,3 @@ fn init_tracing(logs: Arc<log_store::LogStore>) {
     tracing::info!("sula tracing initialized");
 }
 
-mod credentials;

@@ -48,18 +48,18 @@ pub trait Events: Send + Sync {
     fn library_updated(&self);
 }
 
-pub(crate) fn err_string(err: impl ToString) -> String {
+pub fn err_string(err: impl ToString) -> String {
     err.to_string()
 }
 
 /// Run filesystem or SQLite work on the blocking pool so slow disks (NAS) and a
 /// busy database connection never stall the async workers.
-pub(crate) async fn blocking<T: Send + 'static>(work: impl FnOnce() -> Result<T, String> + Send + 'static) -> Result<T, String> {
+pub async fn blocking<T: Send + 'static>(work: impl FnOnce() -> Result<T, String> + Send + 'static) -> Result<T, String> {
     tokio::task::spawn_blocking(work).await.map_err(|e| e.to_string())?
 }
 
 /// Poll the cancel flag while awaiting async I/O; never wrap detached blocking work.
-pub(crate) async fn cancellable<T>(cancel: &AtomicBool, future: impl Future<Output = Result<T, String>>) -> Result<T, String> {
+pub async fn cancellable<T>(cancel: &AtomicBool, future: impl Future<Output = Result<T, String>>) -> Result<T, String> {
     tokio::pin!(future);
     loop {
         if cancel.load(Ordering::SeqCst) { return Err("cancelled".into()); }

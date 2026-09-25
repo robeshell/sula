@@ -4,6 +4,7 @@ members = [
     "crates/media-core",
     "crates/scraper-kit",
     "crates/renamer",
+    "crates/sula-core",
     "desktop/src-tauri",
 ]
 
@@ -19,6 +20,7 @@ media-core = { path = "crates/media-core" }
 renamer = { path = "crates/renamer" }
 rusqlite = { version = "0.32", features = ["bundled"] }
 scraper-kit = { path = "crates/scraper-kit" }
+sula-core = { path = "crates/sula-core" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"

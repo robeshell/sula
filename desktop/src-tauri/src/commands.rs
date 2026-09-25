@@ -22,9 +22,13 @@ async fn ui_locale(state: &State<'_, AppState>) -> String {
     state.config.lock().await.config.ui_locale.clone()
 }
 
-impl Events for AppHandle {
+/// Forwards core events to the webview (`Events` belongs to sula-core, so the
+/// handle is wrapped).
+struct UiEvents<'a>(&'a AppHandle);
+
+impl Events for UiEvents<'_> {
     fn library_updated(&self) {
-        let _ = self.emit("library-updated", ());
+        let _ = self.0.emit("library-updated", ());
     }
 }
 
@@ -124,7 +128,7 @@ pub async fn add_library(
     state.db.insert_library(&library).map_err(err_string)?;
     let _ = enqueue_refresh_inner(&app, &state, library.id.clone()).await?;
     // Every window keeps its own library list (settings edits them too).
-    app.library_updated();
+    UiEvents(&app).library_updated();
     Ok(library)
 }
 
@@ -146,7 +150,7 @@ pub async fn rename_library(
         .ok_or_else(|| format!("library not found: {id}"))?;
     library.name = name;
     state.db.update_library(&library).map_err(err_string)?;
-    app.library_updated();
+    UiEvents(&app).library_updated();
     Ok(library)
 }
 
@@ -158,7 +162,7 @@ pub async fn delete_library(
 ) -> Result<(), String> {
     let _mutation_guard = state.tasks.locks().lock(&LockScope::library(&id)).await?;
     state.db.delete_library(&id).map_err(err_string)?;
-    app.library_updated();
+    UiEvents(&app).library_updated();
     Ok(())
 }
 
@@ -201,7 +205,7 @@ pub async fn rebind_library(
         tracing::warn!(library_id = %library.id, %error, "scan state not cleared after rebind");
     }
     let _ = enqueue_refresh_inner(&app, &state, library.id.clone()).await?;
-    app.library_updated();
+    UiEvents(&app).library_updated();
     Ok(library)
 }
 
@@ -355,7 +359,7 @@ pub async fn merge_planned_shows(
     let templates = state.config.lock().await.config.rename_templates();
     blocking(move || {
         let _mutation_guard = mutation_guard;
-        crate::app::organize::merge_planned_shows(&db, &pairs, &templates, &app)
+        crate::app::organize::merge_planned_shows(&db, &pairs, &templates, &UiEvents(&app))
     })
     .await
 }
@@ -810,7 +814,7 @@ pub async fn delete_media_items(
     let db = Arc::clone(&state.db);
     blocking(move || {
         let _mutation_guard = mutation_guard;
-        crate::app::cleanup::delete_media_items(&db, &item_ids, also_trash, &SystemTrash, &app)
+        crate::app::cleanup::delete_media_items(&db, &item_ids, also_trash, &SystemTrash, &UiEvents(&app))
     })
     .await
 }
@@ -1270,7 +1274,7 @@ fn finish_renamer_batch(
     result: Result<(), renamer::ExecuteError>,
 ) -> Result<RenamerOutcome, String> {
     if !outcome.renames.is_empty() {
-        app.library_updated();
+        UiEvents(app).library_updated();
     }
     match result {
         Ok(()) => Ok(outcome),

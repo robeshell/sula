@@ -38,8 +38,9 @@ impl std::fmt::Display for AlreadyRunning {
 impl std::error::Error for AlreadyRunning {}
 
 impl AppState {
-    pub fn bootstrap(logs: Arc<LogStore>) -> anyhow::Result<Self> {
-        let data_dir = app_data_dir()?;
+    /// Opens everything under `data_dir` (shells pass [`app_data_dir`] so existing
+    /// libraries are found) and starts the task queue on `runtime`.
+    pub fn bootstrap(data_dir: PathBuf, runtime: &tokio::runtime::Handle, logs: Arc<LogStore>) -> anyhow::Result<Self> {
         std::fs::create_dir_all(&data_dir)?;
 
         let instance_lock = std::fs::OpenOptions::new().read(true).write(true).create(true).truncate(false).open(data_dir.join("application.lock"))?;
@@ -59,7 +60,7 @@ impl AppState {
         }
         let recovery_db = Arc::clone(&db);
         let locks = Arc::new(MutationLocks::for_database(Arc::clone(&db), move || renamer::recover_media_operations(&recovery_db)));
-        let tasks = Arc::new(TaskQueue::open(data_dir.join("task_history.json"), locks).map_err(anyhow::Error::msg)?);
+        let tasks = Arc::new(TaskQueue::open(runtime, data_dir.join("task_history.json"), locks).map_err(anyhow::Error::msg)?);
         let thumbs = Arc::new(ThumbnailCache::open_default()?);
         let avatars = Arc::new(AvatarCache::open_default()?);
         let rename_undo = Arc::new(RenameUndoManager::open(
@@ -84,6 +85,8 @@ impl AppState {
     }
 }
 
+/// Where Sula keeps its database, config and history. Moving it would make
+/// existing users' libraries disappear, so it is pinned by a test.
 pub fn app_data_dir() -> anyhow::Result<PathBuf> {
     let base = dirs::data_dir().ok_or_else(|| anyhow::anyhow!("no data directory"))?;
     Ok(base.join("sula"))
@@ -107,4 +110,13 @@ pub struct CratesDto {
     pub media_core: String,
     pub scraper_kit: String,
     pub renamer: String,
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn data_dir_stays_under_the_platform_data_dir() {
+        let expected = dirs::data_dir().expect("platform data dir").join("sula");
+        assert_eq!(super::app_data_dir().unwrap(), expected);
+    }
 }

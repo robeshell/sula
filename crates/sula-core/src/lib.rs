@@ -1,0 +1,11 @@
+//! Sula's application core. Everything a UI shell needs — libraries, the task
+//! queue, scraping, organizing, config, credentials and logs — without any
+//! dependency on a particular shell (Tauri today, native shells later).
+
+pub mod app;
+pub mod config;
+pub mod credentials;
+pub mod log_store;
+pub mod state;
+pub mod task_queue;
+pub mod ui_i18n;

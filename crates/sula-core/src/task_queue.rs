@@ -127,14 +127,16 @@ pub struct TaskQueue {
 
 impl TaskQueue {
     #[cfg(test)]
-    pub fn new() -> Self { Self::with_recovery(|| Ok(())) }
+    pub(crate) fn new() -> Self { Self::with_recovery(|| Ok(())) }
 
     #[cfg(test)]
-    pub fn with_recovery(recover: impl Fn() -> Result<(), String> + Send + Sync + 'static) -> Self {
-        Self::start(Arc::new(MutationLocks::new(recover, |ids| ids.to_vec())), None, Vec::new())
+    pub(crate) fn with_recovery(recover: impl Fn() -> Result<(), String> + Send + Sync + 'static) -> Self {
+        let runtime = tokio::runtime::Handle::current();
+        Self::start(&runtime, Arc::new(MutationLocks::new(recover, |ids| ids.to_vec())), None, Vec::new())
     }
 
-    pub fn open(history: std::path::PathBuf, locks: Arc<MutationLocks>) -> Result<Self, String> {
+    /// `runtime` runs the queue's worker; the shell owns it (Tauri passes its own).
+    pub fn open(runtime: &tokio::runtime::Handle, history: std::path::PathBuf, locks: Arc<MutationLocks>) -> Result<Self, String> {
         let snapshots: Vec<TaskSnapshot> = match std::fs::read(&history) {
             Ok(bytes) => match serde_json::from_slice(&bytes) {
                 Ok(snapshots) => snapshots,
@@ -156,10 +158,10 @@ impl TaskQueue {
             }
             TaskRecord { snapshot, scope: None, lock: None, cancel: Arc::new(AtomicBool::new(false)), work: None }
         }).collect();
-        Ok(Self::start(locks, Some(history), records))
+        Ok(Self::start(runtime, locks, Some(history), records))
     }
 
-    fn start(locks: Arc<MutationLocks>, history: Option<std::path::PathBuf>, records: Vec<TaskRecord>) -> Self {
+    fn start(runtime: &tokio::runtime::Handle, locks: Arc<MutationLocks>, history: Option<std::path::PathBuf>, records: Vec<TaskRecord>) -> Self {
         let inner = Arc::new(TaskQueueInner {
             tasks: Mutex::new(records),
             wake: Notify::new(),
@@ -167,7 +169,7 @@ impl TaskQueue {
             history,
         });
         let worker = Arc::clone(&inner);
-        tauri::async_runtime::spawn(async move {
+        runtime.spawn(async move {
             worker_loop(worker).await;
         });
         Self { inner }
@@ -378,7 +380,7 @@ async fn worker_loop(inner: Arc<TaskQueueInner>) {
         let locks = Arc::clone(&inner.locks);
         let job_handle = handle.clone();
         // A panic belongs to this job, not the long-lived queue worker.
-        let result = tauri::async_runtime::spawn(async move {
+        let result = tokio::spawn(async move {
             let _guard = match &lock { Some(scope) => Some(locks.acquire(scope).await), None => None };
             if job_handle.is_cancelled() { return Err("cancelled".into()); }
             // Only now is the job actually running; before this it waited for its locks.
@@ -534,16 +536,16 @@ mod tests {
             progress: None, error_message: None, result: None, target_id: None, created_at: now, updated_at: now,
         }).collect();
         std::fs::write(&path, serde_json::to_vec(&snapshots).unwrap()).unwrap();
-        let queue = TaskQueue::open(path.clone(), Arc::new(MutationLocks::unchecked())).unwrap();
+        let queue = TaskQueue::open(&tokio::runtime::Handle::current(), path.clone(), Arc::new(MutationLocks::unchecked())).unwrap();
         let tasks = queue.list().await;
         assert_eq!(tasks.len(), 256); assert_eq!(tasks.last().unwrap().status, TaskStatus::Failed);
         let next = queue.enqueue("next", TaskKind::Smoke, None, None, |_| Box::pin(async { Ok(()) })).await;
         terminal(&queue, &next.id).await;
         assert_eq!(queue.list().await.len(), 256);
-        let recovered = TaskQueue::open(path.clone(), Arc::new(MutationLocks::unchecked())).unwrap();
+        let recovered = TaskQueue::open(&tokio::runtime::Handle::current(), path.clone(), Arc::new(MutationLocks::unchecked())).unwrap();
         assert_eq!(recovered.list().await.last().unwrap().status, TaskStatus::Completed);
         std::fs::write(&path, "broken").unwrap();
-        assert!(TaskQueue::open(path, Arc::new(MutationLocks::unchecked())).unwrap().list().await.is_empty());
+        assert!(TaskQueue::open(&tokio::runtime::Handle::current(), path, Arc::new(MutationLocks::unchecked())).unwrap().list().await.is_empty());
         assert!(std::fs::read_dir(&dir).unwrap().any(|e| e.unwrap().file_name().to_string_lossy().contains("invalid-")));
         std::fs::remove_dir_all(dir).unwrap();
     }

@@ -4049,8 +4049,6 @@ dependencies = [
  "block2",
  "chrono",
  "dbus",
- "dirs",
- "keyring",
  "media-core",
  "objc2-app-kit",
  "objc2-foundation",
@@ -4060,6 +4058,7 @@ dependencies = [
  "scraper-kit",
  "serde",
  "serde_json",
+ "sula-core",
  "tauri",
  "tauri-build",
  "tauri-plugin-dialog",
@@ -4068,11 +4067,30 @@ dependencies = [
  "tauri-plugin-single-instance",
  "tempfile",
  "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "sula-core"
+version = "1.0.1"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "dirs",
+ "keyring",
+ "media-core",
+ "renamer",
+ "scraper-kit",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
  "toml 0.8.2",
  "tracing",
  "tracing-subscriber",
  "uuid",
- "windows-sys 0.61.2",
 ]
 
 [[package]]

@@ -19,23 +19,20 @@ media-core.workspace = true
 renamer.workspace = true
 scraper-kit.workspace = true
 serde.workspace = true
+sula-core.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-uuid.workspace = true
 
 reqwest.workspace = true
 tauri = { version = "2", features = ["protocol-asset", "tray-icon"] }
 tauri-plugin-opener = "2"
 
-toml = "0.8"
-dirs = "6"
 chrono = { workspace = true }
 tauri-plugin-dialog = "2.7.2"
 tauri-plugin-notification = "2"
 
-keyring = { version = "3.6.3", features = ["apple-native", "windows-native", "sync-secret-service", "crypto-rust"] }
 tauri-plugin-single-instance = "2.4.5"
 rfd = { version = "0.16", default-features = false, features = ["common-controls-v6"] }
 

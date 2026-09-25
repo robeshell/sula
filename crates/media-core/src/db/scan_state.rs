@@ -18,7 +18,7 @@ impl AppDatabase {
         &self,
         library_id: &str,
     ) -> Result<Vec<DirectoryScanState>, DatabaseError> {
-        self.with_conn(|conn| {
+        self.with_read_conn(|conn| {
             let mut stmt = conn.prepare(
                 "SELECT libraryId, directoryPath, lastKnownModificationTime, lastScannedAt
                  FROM directoryScanState

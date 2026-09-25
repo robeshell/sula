@@ -242,13 +242,22 @@ pub fn find_residuals(
 /// Move residual files to trash. Never silently fall back to permanent deletion.
 pub fn perform_cleanup(paths: &[String]) -> Result<usize, CleanupError> {
     let fs = FilesystemService::new();
+    perform_cleanup_with(paths, |path| fs.trash_item(path).map(|_| ()))
+}
+
+/// [`perform_cleanup`] with the trash step supplied by the caller (tests must not
+/// fill the real recycle bin).
+pub fn perform_cleanup_with(
+    paths: &[String],
+    trash: impl Fn(&Path) -> Result<(), FilesystemError>,
+) -> Result<usize, CleanupError> {
     let mut n = 0usize;
     for path in paths {
         let p = PathBuf::from(path);
         if !p.is_file() {
             continue;
         }
-        match fs.trash_item(&p) {
+        match trash(&p) {
             Ok(_) => n += 1,
             Err(FilesystemError::NotFound(_)) => {}
             Err(e) => return Err(e.into()),

@@ -1,36 +1,10 @@
-use std::path::{Path, PathBuf};
-
 use reqwest::Client;
 
 use crate::http::{reqwest_err, send_with_retry};
-use crate::types::ArtworkUrls;
 
-pub async fn download_artwork(
-    client: &Client,
-    folder: &Path,
-    movie_stem: Option<&str>,
-    urls: &ArtworkUrls,
-) -> Result<DownloadedArtwork, String> {
-    let name = |role: &str| movie_stem.map(|stem| format!("{stem}-{role}.jpg"))
-        .unwrap_or_else(|| format!("{role}.jpg"));
-    let mut out = DownloadedArtwork::default();
-    for (role, url) in [("poster", &urls.poster_url), ("fanart", &urls.fanart_url), ("banner", &urls.banner_url)] {
-        if let Some(url) = url {
-            match download_one(client, folder, &name(role), url).await {
-                Ok(path) => match role { "poster" => out.poster_path = Some(path), "fanart" => out.fanart_path = Some(path), _ => out.banner_path = Some(path) },
-                Err(error) => out.issues.push(format!("{role}: {error}")),
-            }
-        }
-    }
-    Ok(out)
-}
-
-async fn download_one(
-    client: &Client,
-    folder: &Path,
-    file_name: &str,
-    url: &str,
-) -> Result<String, String> {
+/// Download one image and check that it really is one. Where (and whether) the
+/// bytes are written is the caller's decision.
+pub async fn fetch_image(client: &Client, url: &str) -> Result<Vec<u8>, String> {
     let response = send_with_retry(client.get(url))
         .await?
         .error_for_status()
@@ -46,13 +20,7 @@ async fn download_one(
         let shown = if content_type.is_empty() { "unknown" } else { content_type.as_str() };
         return Err(format!("not an image (content-type {shown})"));
     }
-    std::fs::create_dir_all(folder).map_err(|e| e.to_string())?;
-    let path = folder.join(file_name);
-    media_core::FilesystemService::new().write_file(&bytes, &path, media_core::WriteOptions {
-        collision_policy: media_core::CollisionPolicy::Replace,
-        ..Default::default()
-    }).map_err(|e| e.to_string())?;
-    Ok(file_name.to_string())
+    Ok(bytes.to_vec())
 }
 
 /// JPEG / PNG / GIF / WebP magic bytes.
@@ -61,28 +29,6 @@ fn looks_like_image(bytes: &[u8]) -> bool {
         || bytes.starts_with(b"\x89PNG")
         || bytes.starts_with(b"GIF8")
         || (bytes.starts_with(b"RIFF") && bytes.get(8..12) == Some(b"WEBP"))
-}
-
-#[derive(Debug, Clone, Default)]
-pub struct DownloadedArtwork {
-    pub issues: Vec<String>,
-    pub poster_path: Option<String>,
-    pub fanart_path: Option<String>,
-    pub banner_path: Option<String>,
-}
-
-pub fn season_poster_name(season: i32) -> String {
-    format!("season{season}-poster.jpg")
-}
-
-pub async fn download_to_name(
-    client: &Client,
-    folder: &Path,
-    file_name: &str,
-    url: &str,
-) -> Result<PathBuf, String> {
-    download_one(client, folder, file_name, url).await?;
-    Ok(folder.join(file_name))
 }
 
 #[cfg(test)]
@@ -103,14 +49,12 @@ mod tests {
                 stream.write_all(response.as_bytes()).unwrap();
             }
         });
-        let dir = tempfile::tempdir().unwrap();
-        let out = download_artwork(&crate::http::build_client(), dir.path(), Some("Movie"), &ArtworkUrls {
-            poster_url: Some(format!("http://{addr}/poster")), fanart_url: Some(format!("http://{addr}/fail")), banner_url: None,
-        }).await.unwrap();
+        let client = crate::http::build_client();
+        let poster = fetch_image(&client, &format!("http://{addr}/poster")).await;
+        let fanart = fetch_image(&client, &format!("http://{addr}/fail")).await;
         server.join().unwrap();
-        assert_eq!(out.poster_path.as_deref(), Some("Movie-poster.jpg"));
-        assert!(out.fanart_path.is_none()); assert_eq!(out.issues.len(), 1);
-        assert!(dir.path().join("Movie-poster.jpg").exists());
+        assert_eq!(poster.unwrap(), b"img");
+        assert!(fanart.is_err());
     }
 
     #[test]
@@ -122,7 +66,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn non_image_body_is_rejected_and_not_written() {
+    async fn non_image_body_is_rejected() {
         let (base, server) = crate::http::serve_routes(3, |line| {
             let (ty, body): (&str, &[u8]) = if line.contains("/html") {
                 ("text/html", b"<html>error</html>")
@@ -134,16 +78,13 @@ mod tests {
             let ty = if ty.is_empty() { String::new() } else { format!("Content-Type: {ty}\r\n") };
             format!("HTTP/1.1 200 OK\r\n{ty}Content-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), std::str::from_utf8(body).unwrap())
         });
-        let dir = tempfile::tempdir().unwrap();
         let client = Client::builder().no_proxy().build().unwrap();
-        let out = download_artwork(&client, dir.path(), None, &ArtworkUrls {
-            poster_url: Some(format!("{base}/html")), fanart_url: Some(format!("{base}/sniff")), banner_url: Some(format!("{base}/webp")),
-        }).await.unwrap();
+        let html = fetch_image(&client, &format!("{base}/html")).await;
+        let sniff = fetch_image(&client, &format!("{base}/sniff")).await;
+        let webp = fetch_image(&client, &format!("{base}/webp")).await;
         server.join().unwrap();
-        assert!(out.poster_path.is_none());
-        assert!(out.issues[0].contains("not an image"), "{:?}", out.issues);
-        assert!(!dir.path().join("poster.jpg").exists());
-        assert_eq!(out.fanart_path.as_deref(), Some("fanart.jpg"));
-        assert_eq!(out.banner_path.as_deref(), Some("banner.jpg"));
+        assert!(html.unwrap_err().contains("not an image"));
+        assert_eq!(sniff.unwrap(), b"GIF89a");
+        assert!(webp.unwrap().starts_with(b"RIFF"));
     }
 }

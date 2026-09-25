@@ -15,7 +15,7 @@ pub mod thumbnail;
 
 pub use avatar::{AvatarCache, AvatarError};
 pub use cleanup::{
-    companion_suffix, find_residuals, perform_cleanup, CleanupError, ResidualCandidate,
+    companion_suffix, find_residuals, perform_cleanup, perform_cleanup_with, CleanupError, ResidualCandidate,
     COMPANION_EXTENSIONS,
 };
 pub use db::{AppDatabase, DatabaseError, DirectoryScanState, MediaMetaSummary, ShowListStats};

@@ -33,7 +33,7 @@ impl AppDatabase {
         &self,
         library_id: &str,
     ) -> Result<Vec<MediaMetaSummary>, DatabaseError> {
-        self.with_conn(|conn| {
+        self.with_read_conn(|conn| {
             let mut stmt = conn.prepare(
                 "SELECT m.mediaItemId, m.posterPath, m.fanartPath, m.overview, m.rating, m.genres, m.scrapedAt
                  FROM media_metadata m
@@ -62,7 +62,7 @@ impl AppDatabase {
 
     /// Season/episode counts for TV & anime rows in a library (one grouped query).
     pub fn list_show_stats(&self, library_id: &str) -> Result<Vec<ShowListStats>, DatabaseError> {
-        self.with_conn(|conn| {
+        self.with_read_conn(|conn| {
             let mut stmt = conn.prepare(
                 "SELECT s.mediaItemId,
                         COUNT(DISTINCT s.id),
@@ -95,7 +95,7 @@ impl AppDatabase {
         &self,
         ids_json: &str,
     ) -> Result<Vec<MediaMetaSummary>, DatabaseError> {
-        self.with_conn(|conn| {
+        self.with_read_conn(|conn| {
             let mut stmt = conn.prepare(
                 "SELECT m.mediaItemId, m.posterPath, m.fanartPath, m.overview, m.rating, m.genres, m.scrapedAt
                  FROM media_metadata m
@@ -124,7 +124,7 @@ impl AppDatabase {
 
     /// Season/episode counts for TV & anime rows in a library (one grouped query).
     pub fn list_show_stats_for_ids(&self, ids_json: &str) -> Result<Vec<ShowListStats>, DatabaseError> {
-        self.with_conn(|conn| {
+        self.with_read_conn(|conn| {
             let mut stmt = conn.prepare(
                 "SELECT s.mediaItemId,
                         COUNT(DISTINCT s.id),
@@ -154,7 +154,7 @@ impl AppDatabase {
     }
 
     pub fn get_media_item(&self, id: &str) -> Result<Option<MediaItem>, DatabaseError> {
-        self.with_conn(|conn| {
+        self.with_read_conn(|conn| {
             conn.query_row(
                 "SELECT id, type, title, originalTitle, year, folderPath, filePath,
                         bookmarkData, status, scrapeIssue, libraryId, addedAt

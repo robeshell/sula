@@ -8,7 +8,7 @@ use super::AppDatabase;
 
 impl AppDatabase {
     pub fn list_media_items(&self, library_id: &str) -> Result<Vec<MediaItem>, DatabaseError> {
-        self.with_conn(|conn| {
+        self.with_read_conn(|conn| {
             let mut stmt = conn.prepare(
                 "SELECT id, type, title, originalTitle, year, folderPath, filePath,
                         bookmarkData, status, scrapeIssue, libraryId, addedAt
@@ -26,7 +26,7 @@ impl AppDatabase {
     }
 
     pub fn list_media_items_page(&self, library_id: &str, offset: u32, limit: u32) -> Result<Vec<MediaItem>, DatabaseError> {
-        self.with_conn(|conn| {
+        self.with_read_conn(|conn| {
             let mut stmt = conn.prepare("SELECT id,type,title,originalTitle,year,folderPath,filePath,bookmarkData,status,scrapeIssue,libraryId,addedAt FROM media_items WHERE libraryId=?1 ORDER BY title COLLATE NOCASE ASC,id ASC LIMIT ?2 OFFSET ?3")?;
             let rows = stmt.query_map(params![library_id, limit, offset], map_media_item)?;
             Ok(rows.collect::<Result<Vec<_>, _>>()?)
@@ -34,7 +34,7 @@ impl AppDatabase {
     }
 
     pub fn list_media_file_paths(&self, library_id: &str) -> Result<Vec<String>, DatabaseError> {
-        self.with_conn(|conn| {
+        self.with_read_conn(|conn| {
             let mut stmt =
                 conn.prepare("SELECT filePath FROM media_items WHERE libraryId = ?1")?;
             let rows = stmt.query_map([library_id], |row| row.get(0))?;
@@ -47,7 +47,7 @@ impl AppDatabase {
     }
 
     pub fn list_media_folder_paths(&self, library_id: &str) -> Result<Vec<String>, DatabaseError> {
-        self.with_conn(|conn| {
+        self.with_read_conn(|conn| {
             let mut stmt =
                 conn.prepare("SELECT folderPath FROM media_items WHERE libraryId = ?1")?;
             let rows = stmt.query_map([library_id], |row| row.get(0))?;

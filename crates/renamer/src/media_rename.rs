@@ -433,6 +433,8 @@ fn merge_show_into(
             .map_err(|e| RenameError::Database(e.to_string()))?;
         Ok(())
     })();
+    // Ended: recovery may now roll it back (failure) or clear it (committed).
+    drop(journal);
     if let Err(error) = result {
         return match crate::recover_media_operations(db) {
             Ok(()) => Err(error),
@@ -603,6 +605,7 @@ fn rename_planned(db: &AppDatabase, item: &MediaItem, templates: &RenameTemplate
         for (from,to) in &files { journal.move_file(&source(from), to).map_err(RenameError::Filesystem)?; }
         db.commit_media_paths(&item.id, &root, &new_root, &new_file, &files, &journal.id).map_err(|e| RenameError::Database(e.to_string()))
     })();
+    drop(journal);
     if let Err(error) = result {
         return match crate::recover_media_operations(db) { Ok(()) => Err(error), Err(recovery) => Err(RenameError::Filesystem(format!("{error}; recovery pending: {recovery}"))) };
     }

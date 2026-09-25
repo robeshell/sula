@@ -2,140 +2,36 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use media_core::{
-    Library, MediaItem, MediaMetaSummary, MediaMetadata, MediaType, ScrapedStatus, ShowListStats,
+    AppDatabase, Library, MediaItem, MediaMetaSummary, MediaMetadata, MediaType, ScrapedStatus, ShowListStats,
     TvEpisode, TvSeason,
 };
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager, State};
 
+use crate::app::cleanup::SystemTrash;
+use crate::app::library::RefreshService;
+use crate::app::locks::LockScope;
+use crate::app::organize::{OrganizeService, ShowMergePair, ShowMergePlanDto};
+use crate::app::scrape::{localized_error, ScrapeService, ScrapeSettings};
+use crate::app::{blocking, err_string, Events};
 use crate::config::AppConfig;
 use crate::state::{AppState, AppStatusDto, CratesDto};
-use crate::task_queue::{TaskKind, TaskProgress, TaskSnapshot, TaskStatus};
+use crate::task_queue::{TaskKind, TaskSnapshot, TaskStatus};
 
 async fn ui_locale(state: &State<'_, AppState>) -> String {
     state.config.lock().await.config.ui_locale.clone()
 }
 
-fn loc_progress(locale: &str, name: &str) -> String {
-    match name {
-        "scan.checking" => crate::ui_i18n::t(locale, "prog.checking"),
-        "scan.unchanged" => crate::ui_i18n::t(locale, "prog.unchanged"),
-        _ => name.to_string(),
+impl Events for AppHandle {
+    fn library_updated(&self) {
+        let _ = self.emit("library-updated", ());
     }
 }
 
-fn loc_scrape_summary(locale: &str, raw: &str) -> String {
-    if let Some((s, u, f)) = scraper_kit::ScrapeSummary::parse_result(raw) {
-        return crate::ui_i18n::tf(
-            locale,
-            "prog.scrapeSummary",
-            &[
-                ("success", &s.to_string()),
-                ("unmatched", &u.to_string()),
-                ("failed", &f.to_string()),
-            ],
-        );
-    }
-    raw.to_string()
-}
-
-fn loc_err(locale: &str, err: String) -> String {
-    if err.starts_with("err.") {
-        crate::ui_i18n::t(locale, &err)
-    } else {
-        err
-    }
-}
-
-/// File moves can be slow on network shares: keep them off the async workers.
-async fn auto_rename_after_scrape(
-    db: &Arc<media_core::AppDatabase>,
-    ids: &[String],
-    templates: &renamer::RenameTemplates,
-    create_season_folders: bool,
-    handle: &crate::task_queue::TaskHandle,
-) -> (u32, u32) {
-    let (db, ids, templates, handle) = (Arc::clone(db), ids.to_vec(), templates.clone(), handle.clone());
-    let total = ids.len() as u32;
-    tokio::task::spawn_blocking(move || auto_rename_blocking(&db, &ids, &templates, create_season_folders, &handle))
-        .await
-        .unwrap_or((0, total))
-}
-
-async fn consolidate_after_scrape(
-    db: &Arc<media_core::AppDatabase>,
-    ids: &[String],
-    templates: &renamer::RenameTemplates,
-    handle: &crate::task_queue::TaskHandle,
-) {
-    let (db, ids, templates, handle) = (Arc::clone(db), ids.to_vec(), templates.clone(), handle.clone());
-    let _ = tokio::task::spawn_blocking(move || consolidate_blocking(&db, &ids, &templates, &handle)).await;
-}
-
-fn auto_rename_blocking(
-    db: &media_core::AppDatabase,
-    ids: &[String],
-    templates: &renamer::RenameTemplates,
-    create_season_folders: bool,
-    handle: &crate::task_queue::TaskHandle,
-) -> (u32, u32) {
-    let mut ok = 0u32;
-    let mut failed = 0u32;
-    for id in ids {
-        if handle.is_cancelled() { break; }
-        let Some(item) = db.get_media_item(id).ok().flatten() else {
-            // May already have been merged into a canonical show.
-            continue;
-        };
-        // Absorb season packs / release folders into the existing series first.
-        if let Ok(true) = renamer::consolidate_show_item(db, &item, templates) {
-            ok += 1;
-            continue;
-        }
-        let Some(item) = db.get_media_item(id).ok().flatten() else {
-            continue;
-        };
-        match renamer::rename_after_scrape_with_options(
-            db,
-            &item,
-            templates,
-            create_season_folders,
-        ) {
-            Ok(()) => ok += 1,
-            Err(err) => {
-                failed += 1;
-                tracing::warn!(
-                    item_id = %id,
-                    title = %item.title,
-                    error = %err,
-                    "auto-rename after scrape failed"
-                );
-            }
-        }
-    }
-    (ok, failed)
-}
-
-fn consolidate_blocking(
-    db: &media_core::AppDatabase,
-    ids: &[String],
-    templates: &renamer::RenameTemplates,
-    handle: &crate::task_queue::TaskHandle,
-) {
-    for id in ids {
-        if handle.is_cancelled() { break; }
-        let Some(item) = db.get_media_item(id).ok().flatten() else {
-            continue;
-        };
-        if let Err(err) = renamer::consolidate_show_item(db, &item, templates) {
-            tracing::warn!(
-                item_id = %id,
-                title = %item.title,
-                error = %err,
-                "consolidate duplicate show failed"
-            );
-        }
-    }
+/// Lock scope of the libraries the given items belong to.
+async fn items_scope(db: &Arc<AppDatabase>, item_ids: &[String]) -> Result<LockScope, String> {
+    let (db, ids) = (Arc::clone(db), item_ids.to_vec());
+    blocking(move || LockScope::for_items(&db, &ids)).await
 }
 
 #[tauri::command]
@@ -171,7 +67,7 @@ pub async fn save_config(
     // Ordinary settings must not wait for a long scrape. Only a change of scan
     // exclusions resets scan state, which has to stay out of a running refresh.
     let exclusions_changed = state.config.lock().await.config.scan_excluded_folders != config.scan_excluded_folders;
-    let mutation_guard = if exclusions_changed { Some(state.tasks.lock_mutations().await?) } else { None };
+    let mutation_guard = if exclusions_changed { Some(state.tasks.locks().lock(&LockScope::Global).await?) } else { None };
     let tray_enabled = config.tray_enabled;
     let mut store = state.config.lock().await;
     let old = store.config.clone();
@@ -248,7 +144,7 @@ pub async fn rename_library(
 
 #[tauri::command]
 pub async fn delete_library(state: State<'_, AppState>, id: String) -> Result<(), String> {
-    let _mutation_guard = state.tasks.lock_mutations().await?;
+    let _mutation_guard = state.tasks.locks().lock(&LockScope::library(&id)).await?;
     state.db.delete_library(&id).map_err(err_string)
 }
 
@@ -269,7 +165,8 @@ pub async fn rebind_library(
     id: String,
     root_path: String,
 ) -> Result<Library, String> {
-    let _mutation_guard = state.tasks.lock_mutations().await?;
+    // A new root can overlap other libraries, so rebinding excludes all of them.
+    let _mutation_guard = state.tasks.locks().lock(&LockScope::Global).await?;
     let root_path = root_path.trim().to_string();
     if root_path.is_empty() {
         return Err("library path is empty".into());
@@ -290,7 +187,7 @@ pub async fn rebind_library(
         tracing::warn!(library_id = %library.id, %error, "scan state not cleared after rebind");
     }
     let _ = enqueue_refresh_inner(&app, &state, library.id.clone()).await?;
-    let _ = app.emit("library-updated", ());
+    app.library_updated();
     Ok(library)
 }
 
@@ -417,24 +314,6 @@ fn list_media_page_sync(db: &media_core::AppDatabase, library_id: &str, offset: 
     Ok(MediaListPayload { items, metadata, show_stats, next_offset })
 }
 
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ShowMergePlanDto {
-    pub source_id: String,
-    pub source_title: String,
-    pub source_folder: String,
-    pub target_id: String,
-    pub target_title: String,
-    pub target_folder: String,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ShowMergePair {
-    pub source_id: String,
-    pub target_id: String,
-}
-
 /// Read-only preview of duplicate-show merges for a library or selected items, so
 /// the user sees exactly which folders would be absorbed before anything moves.
 #[tauri::command]
@@ -444,31 +323,7 @@ pub async fn plan_show_merges(
     item_ids: Option<Vec<String>>,
 ) -> Result<Vec<ShowMergePlanDto>, String> {
     let db = Arc::clone(&state.db);
-    tokio::task::spawn_blocking(move || {
-        let candidates = match (library_id, item_ids) {
-            (_, Some(ids)) => ids
-                .iter()
-                .filter_map(|id| db.get_media_item(id).transpose())
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(err_string)?,
-            (Some(library_id), None) => db.list_media_items(&library_id).map_err(err_string)?,
-            (None, None) => Vec::new(),
-        };
-        let plan = renamer::plan_duplicate_show_merges(&db, &candidates).map_err(err_string)?;
-        Ok(plan
-            .into_iter()
-            .map(|(source, target)| ShowMergePlanDto {
-                source_id: source.id,
-                source_title: source.title,
-                source_folder: source.folder_path,
-                target_id: target.id,
-                target_title: target.title,
-                target_folder: target.folder_path,
-            })
-            .collect())
-    })
-    .await
-    .map_err(|e| e.to_string())?
+    blocking(move || crate::app::organize::plan_show_merges(&db, library_id, item_ids)).await
 }
 
 /// Execute merges the user confirmed from `plan_show_merges`. Each pair is checked
@@ -479,25 +334,16 @@ pub async fn merge_planned_shows(
     state: State<'_, AppState>,
     pairs: Vec<ShowMergePair>,
 ) -> Result<u32, String> {
-    let mutation_guard = state.tasks.lock_mutations().await?;
-    let templates = state.config.lock().await.config.rename_templates();
     let db = Arc::clone(&state.db);
-    let merged = tokio::task::spawn_blocking(move || {
+    // Every library of every pair, locked in one sorted acquisition.
+    let scope = items_scope(&db, &crate::app::organize::merge_item_ids(&pairs)).await?;
+    let mutation_guard = state.tasks.locks().lock(&scope).await?;
+    let templates = state.config.lock().await.config.rename_templates();
+    blocking(move || {
         let _mutation_guard = mutation_guard;
-        let mut merged = 0u32;
-        for pair in pairs {
-            if renamer::merge_planned_show(&db, &pair.source_id, &pair.target_id, &templates).map_err(err_string)? {
-                merged += 1;
-            }
-        }
-        Ok::<_, String>(merged)
+        crate::app::organize::merge_planned_shows(&db, &pairs, &templates, &app)
     })
     .await
-    .map_err(|e| e.to_string())??;
-    if merged > 0 {
-        let _ = app.emit("library-updated", ());
-    }
-    Ok(merged)
 }
 
 #[derive(Debug, Serialize)]
@@ -611,47 +457,14 @@ pub async fn refresh_media_items(
     };
     let config_store = Arc::clone(&state.config);
     let db = Arc::clone(&state.db);
+    let lock = items_scope(&db, &item_ids).await?;
     let snapshot = state
         .tasks
-        .enqueue_scoped(title, TaskKind::Refresh, item_ids.first().cloned(), task_scope("items", &item_ids), move |handle| {
-            let locale = locale.clone();
+        .enqueue_scoped(title, TaskKind::Refresh, item_ids.first().cloned(), task_scope("items", &item_ids), Some(lock), move |handle| {
             Box::pin(async move {
-                let excluded = config_store.lock().await.config.scan_excluded_folders.clone();
-                let total = item_ids.len() as u32;
-                handle
-                    .update_progress(TaskProgress {
-                        completed: 0,
-                        total,
-                        current: crate::ui_i18n::t(&locale, "prog.refreshing"),
-                        stage_key: Some("refreshItems".into()),
-                    })
-                    .await;
-                let cancel = handle.cancellation_flag();
-                let report = tokio::task::spawn_blocking(move || {
-                    media_core::refresh_items_cancellable(&db, &item_ids, &excluded, &cancel)
-                })
-                .await
-                .map_err(|e| e.to_string())?
-                .map_err(err_string)?;
-                if handle.is_cancelled() {
-                    return Err("cancelled".into());
-                }
-                handle
-                    .update_progress(TaskProgress {
-                        completed: total,
-                        total,
-                        current: crate::ui_i18n::tf(
-                            &locale,
-                            "prog.refreshDone",
-                            &[
-                                ("ok", &report.refreshed.to_string()),
-                                ("removed", &report.removed.to_string()),
-                            ],
-                        ),
-                        stage_key: Some("refreshItems".into()),
-                    })
-                    .await;
-                Ok(())
+                let excluded_folders = config_store.lock().await.config.scan_excluded_folders.clone();
+                let service = RefreshService { db, excluded_folders, templates: Default::default(), locale };
+                service.refresh_items(item_ids, &handle).await
             })
         })
         .await;
@@ -704,141 +517,26 @@ async fn enqueue_refresh_inner(
         .get_library(&library_id)
         .map_err(err_string)?
         .ok_or_else(|| format!("library not found: {library_id}"))?;
-    let locale = {
-        let cfg = state.config.lock().await;
-        cfg.config.ui_locale.clone()
-    };
+    let locale = ui_locale(state).await;
     let config_store = Arc::clone(&state.config);
     let db = Arc::clone(&state.db);
     let title = crate::ui_i18n::tf(&locale, "task.refreshLib", &[("name", &library.name)]);
     let target_id = Some(library_id.clone());
-    let library_id_for_merge = library_id.clone();
+    let lock = Some(LockScope::library(&library_id));
 
     let snapshot = state
         .tasks
-        .enqueue_scoped(title, TaskKind::Refresh, target_id, task_scope("library", &[library_id.clone()]), move |handle| {
-            let locale = locale.clone();
+        .enqueue_scoped(title, TaskKind::Refresh, target_id, task_scope("library", std::slice::from_ref(&library_id)), lock, move |handle| {
             Box::pin(async move {
-                let library_for_scan = db.get_library(&library.id).map_err(err_string)?
-                    .ok_or_else(|| "library removed before refresh".to_string())?;
+                // Settings are read when the refresh starts, not when it was queued.
                 let config = config_store.lock().await.config.clone();
-                let excluded_folders = config.scan_excluded_folders.clone();
-                let rename_templates = config.rename_templates();
-                let media_type = library_for_scan.media_type;
-                let db_scan = Arc::clone(&db);
-                let (progress_tx, mut progress_rx) =
-                    tokio::sync::mpsc::unbounded_channel::<media_core::ScanProgress>();
-                let cancel = handle.cancellation_flag();
-                let scan = tokio::task::spawn_blocking(move || {
-                    let mut last_emit = 0u32;
-                    let mut saw_check = false;
-                    media_core::refresh_library_cancellable(&db_scan, &library_for_scan, &excluded_folders, |p| {
-                        let is_check = p.discovered_count == 0
-                            && (p.current_name == "scan.checking"
-                                || p.current_name == "scan.unchanged"
-                                || p.current_name.starts_with("检查")
-                                || p.current_name.starts_with("目录")
-                                || p.current_name.starts_with("scan."));
-                        if is_check {
-                            if !saw_check || p.current_name == "scan.unchanged" || p.current_name.starts_with("目录无变更") {
-                                saw_check = true;
-                                let _ = progress_tx.send(p);
-                            }
-                            return;
-                        }
-                        if p.discovered_count == 1
-                            || p.discovered_count.saturating_sub(last_emit) >= 25
-                        {
-                            last_emit = p.discovered_count;
-                            let _ = progress_tx.send(p);
-                        }
-                    }, &cancel)
-                });
-
-                while let Some(p) = progress_rx.recv().await {
-                    if handle.is_cancelled() {
-                        break;
-                    }
-                    let stage_key = if p.discovered_count == 0
-                        && (p.current_name == "scan.checking"
-                            || p.current_name == "scan.unchanged"
-                            || p.current_name.starts_with("检查")
-                            || p.current_name.starts_with("目录")
-                            || p.current_name.starts_with("scan."))
-                    {
-                        "checkDirectories"
-                    } else {
-                        "scanFiles"
-                    };
-                    handle
-                        .update_progress(TaskProgress {
-                            completed: p.discovered_count,
-                            total: 0,
-                            current: loc_progress(&locale, &p.current_name),
-                            stage_key: Some(stage_key.into()),
-                        })
-                        .await;
-                }
-
-                let report = scan
-                    .await
-                    .map_err(|e| e.to_string())?
-                    .map_err(|e| e.to_string())?;
-
-                if handle.is_cancelled() {
-                    return Err("cancelled".into());
-                }
-
-                // Same TMDB season packs → merge into the canonical show (also on early-exit).
-                let mut merged_n = 0usize;
-                if matches!(
-                    media_type,
-                    media_core::MediaType::TvShow | media_core::MediaType::Anime
-                ) {
-                    let db_merge = Arc::clone(&db);
-                    let templates = rename_templates.clone();
-                    let lib_id = library_id_for_merge.clone();
-                    merged_n = tokio::task::spawn_blocking(move || {
-                        renamer::consolidate_library_duplicate_shows(&db_merge, &lib_id, &templates)
-                    })
-                    .await
-                    .map_err(|e| e.to_string())?
-                    .unwrap_or(0);
-                }
-
-                if merged_n > 0 {
-                    handle
-                        .update_progress(TaskProgress {
-                            completed: merged_n as u32,
-                            total: merged_n as u32,
-                            current: crate::ui_i18n::tf(
-                                &locale,
-                                "prog.mergedShows",
-                                &[("n", &merged_n.to_string())],
-                            ),
-                            stage_key: Some("saveResults".into()),
-                        })
-                        .await;
-                } else if report.early_exit {
-                    handle
-                        .update_progress(TaskProgress {
-                            completed: 0,
-                            total: 0,
-                            current: crate::ui_i18n::t(&locale, "prog.unchanged"),
-                            stage_key: Some("checkDirectories".into()),
-                        })
-                        .await;
-                } else {
-                    handle
-                        .update_progress(TaskProgress {
-                            completed: report.new_item_count as u32,
-                            total: report.new_item_count as u32,
-                            current: crate::ui_i18n::tf(&locale, "prog.added", &[("n", &report.new_item_count.to_string())]),
-                            stage_key: Some("saveResults".into()),
-                        })
-                        .await;
-                }
-                Ok(())
+                let service = RefreshService {
+                    db,
+                    excluded_folders: config.scan_excluded_folders.clone(),
+                    templates: config.rename_templates(),
+                    locale,
+                };
+                service.refresh_library(&library_id, &handle).await
             })
         })
         .await;
@@ -860,10 +558,7 @@ pub async fn scrape_library(
         .map_err(err_string)?
         .ok_or_else(|| format!("library not found: {library_id}"))?;
     let config = state.config.lock().await.config.clone();
-    let locale = config.ui_locale.clone();
-    let db = Arc::clone(&state.db);
-    let title = crate::ui_i18n::tf(&locale, "task.scrapeAll", &[("name", &library.name)]);
-    let options = scrape_options_from_config(&config);
+    let title = crate::ui_i18n::tf(&config.ui_locale, "task.scrapeAll", &[("name", &library.name)]);
     let target_id = Some(library_id.clone());
 
     if let Some(existing) = state
@@ -875,102 +570,12 @@ pub async fn scrape_library(
         return Ok(existing);
     }
 
+    // No held lock: the service fetches unlocked and locks the library only to write.
+    let service = scrape_service(&state, &config);
     let snapshot = state
         .tasks
-        .enqueue(title, TaskKind::BatchScrape, target_id, move |handle| {
-            Box::pin(async move {
-                let (progress_tx, mut progress_rx) =
-                    tokio::sync::mpsc::unbounded_channel::<scraper_kit::ScrapeProgress>();
-                let db_job = Arc::clone(&db);
-                let cancel = handle.cancellation_flag();
-                let job = tokio::spawn(async move {
-                    scraper_kit::scrape_library_cancellable(db_job, &library_id, options, cancel, |p| {
-                        let _ = progress_tx.send(p);
-                    })
-                    .await
-                });
-                while let Some(p) = progress_rx.recv().await {
-                    if handle.is_cancelled() {
-                        break;
-                    }
-                    handle
-                        .update_progress(TaskProgress {
-                            completed: p.completed,
-                            total: p.total,
-                            current: p.current,
-                            stage_key: Some(p.stage_key),
-                        })
-                        .await;
-                }
-                let summary = job
-                    .await
-                    .map_err(|e| e.to_string())?
-                    .map_err(|e| loc_err(&locale, e))?;
-                handle.record_scrape_result(&summary).await;
-                if handle.is_cancelled() { return Err("cancelled".into()); }
-                let success_ids = summary.success_ids.clone();
-                handle
-                    .update_progress(TaskProgress {
-                        completed: summary.success_ids.len() as u32
-                            + summary.unmatched
-                            + summary.failed,
-                        total: summary.success_ids.len() as u32
-                            + summary.unmatched
-                            + summary.failed,
-                        current: loc_scrape_summary(&locale, &summary.format_result()),
-                        stage_key: Some("saveResults".into()),
-                    })
-                    .await;
-                if !success_ids.is_empty() {
-                    let templates = config.rename_templates();
-                    if config.rename_auto_after_scrape {
-                        handle
-                            .update_progress(TaskProgress {
-                                completed: success_ids.len() as u32,
-                                total: success_ids.len() as u32,
-                                current: crate::ui_i18n::t(&locale, "prog.autoRename"),
-                                stage_key: Some("rename".into()),
-                            })
-                            .await;
-                        let (renamed, rename_failed) = auto_rename_after_scrape(
-                            &db,
-                            &success_ids,
-                            &templates,
-                            config.rename_create_season_folders,
-                            &handle,
-                        ).await;
-                        let mut summary_text = loc_scrape_summary(&locale, &summary.format_result());
-                        if rename_failed > 0 {
-                            summary_text = format!(
-                                "{summary_text} · {}",
-                                crate::ui_i18n::tf(
-                                    &locale,
-                                    "prog.autoRenameResult",
-                                    &[
-                                        ("ok", &renamed.to_string()),
-                                        ("failed", &rename_failed.to_string()),
-                                    ],
-                                )
-                            );
-                        }
-                        handle
-                            .update_progress(TaskProgress {
-                                completed: success_ids.len() as u32
-                                    + summary.unmatched
-                                    + summary.failed,
-                                total: success_ids.len() as u32
-                                    + summary.unmatched
-                                    + summary.failed,
-                                current: summary_text,
-                                stage_key: Some("saveResults".into()),
-                            })
-                            .await;
-                    } else {
-                        consolidate_after_scrape(&db, &success_ids, &templates, &handle).await;
-                    }
-                }
-                Ok(())
-            })
+        .enqueue(title, TaskKind::BatchScrape, target_id, None, move |handle| {
+            Box::pin(async move { service.scrape_library(&library_id, &handle).await })
         })
         .await;
 
@@ -989,107 +594,12 @@ pub async fn scrape_items(
         return Err("no items selected".into());
     }
     let config = state.config.lock().await.config.clone();
-    let locale = config.ui_locale.clone();
-    let options = scrape_options_from_config(&config);
-    let db = Arc::clone(&state.db);
-    let title = crate::ui_i18n::tf(&locale, "task.scrapeN", &[("n", &item_ids.len().to_string())]);
-
+    let title = crate::ui_i18n::tf(&config.ui_locale, "task.scrapeN", &[("n", &item_ids.len().to_string())]);
+    let service = scrape_service(&state, &config);
     let snapshot = state
         .tasks
-        .enqueue_scoped(title, TaskKind::Scrape, item_ids.first().cloned(), task_scope("items", &item_ids), move |handle| {
-            Box::pin(async move {
-                let mut summary = scraper_kit::ScrapeSummary::default();
-                let total = item_ids.len() as u32;
-                for (idx, id) in item_ids.into_iter().enumerate() {
-                    if handle.is_cancelled() {
-                        return Err("cancelled".into());
-                    }
-                    let item = db
-                        .get_media_item(&id)
-                        .map_err(err_string)?
-                        .ok_or_else(|| format!("media item not found: {id}"))?;
-                    handle
-                        .update_progress(TaskProgress {
-                            completed: idx as u32,
-                            total,
-                            current: item.title.clone(),
-                            stage_key: Some("matching".into()),
-                        })
-                        .await;
-                    match handle.run_cancellable(scraper_kit::scrape_item(&db, &item, &options))
-                        .await
-                    {
-                        Ok(scraper_kit::ScrapeItemOutcome::Matched) => {
-                            summary.success_ids.push(id);
-                        }
-                        Ok(scraper_kit::ScrapeItemOutcome::Unmatched) => {
-                            summary.unmatched += 1;
-                        }
-                        Ok(scraper_kit::ScrapeItemOutcome::Failed) => {
-                            summary.failed += 1;
-                        }
-                        Err(error) => {
-                            if handle.is_cancelled() { return Err(error); }
-                            summary.failed += 1;
-                            db.update_status(&id, media_core::ScrapedStatus::Partial, Some(&error)).map_err(err_string)?;
-                        }
-                    }
-                    handle.record_scrape_result(&summary).await;
-                }
-                handle
-                    .update_progress(TaskProgress {
-                        completed: total,
-                        total,
-                        current: loc_scrape_summary(&locale, &summary.format_result()),
-                        stage_key: Some("saveResults".into()),
-                    })
-                    .await;
-                if !summary.success_ids.is_empty() {
-                    let templates = config.rename_templates();
-                    if config.rename_auto_after_scrape {
-                        handle
-                            .update_progress(TaskProgress {
-                                completed: total,
-                                total,
-                                current: crate::ui_i18n::t(&locale, "prog.autoRename"),
-                                stage_key: Some("rename".into()),
-                            })
-                            .await;
-                        let (renamed, rename_failed) = auto_rename_after_scrape(
-                            &db,
-                            &summary.success_ids,
-                            &templates,
-                            config.rename_create_season_folders,
-                            &handle,
-                        ).await;
-                        let mut summary_text = loc_scrape_summary(&locale, &summary.format_result());
-                        if rename_failed > 0 {
-                            summary_text = format!(
-                                "{summary_text} · {}",
-                                crate::ui_i18n::tf(
-                                    &locale,
-                                    "prog.autoRenameResult",
-                                    &[
-                                        ("ok", &renamed.to_string()),
-                                        ("failed", &rename_failed.to_string()),
-                                    ],
-                                )
-                            );
-                        }
-                        handle
-                            .update_progress(TaskProgress {
-                                completed: total,
-                                total,
-                                current: summary_text,
-                                stage_key: Some("saveResults".into()),
-                            })
-                            .await;
-                    } else {
-                        consolidate_after_scrape(&db, &summary.success_ids, &templates, &handle).await;
-                    }
-                }
-                Ok(())
-            })
+        .enqueue_scoped(title, TaskKind::Scrape, item_ids.first().cloned(), task_scope("items", &item_ids), None, move |handle| {
+            Box::pin(async move { service.scrape_items(item_ids, &handle).await })
         })
         .await;
 
@@ -1123,11 +633,8 @@ pub async fn rescrape_items(
     }
 
     let config = state.config.lock().await.config.clone();
-    let locale = config.ui_locale.clone();
-    let options = scrape_options_from_config(&config);
-    let db = Arc::clone(&state.db);
-    let title = crate::ui_i18n::tf(&locale, "task.rescrapeN", &[("n", &scraped_ids.len().to_string())]);
-
+    let title = crate::ui_i18n::tf(&config.ui_locale, "task.rescrapeN", &[("n", &scraped_ids.len().to_string())]);
+    let service = scrape_service(&state, &config);
     let snapshot = state
         .tasks
         .enqueue_scoped(
@@ -1135,102 +642,8 @@ pub async fn rescrape_items(
             TaskKind::Rescrape,
             scraped_ids.first().cloned(),
             task_scope("items", &scraped_ids),
-            move |handle| {
-                Box::pin(async move {
-                    let mut summary = scraper_kit::ScrapeSummary::default();
-                    let total = scraped_ids.len() as u32;
-                    for (idx, id) in scraped_ids.into_iter().enumerate() {
-                        if handle.is_cancelled() {
-                            return Err("cancelled".into());
-                        }
-                        let item = db
-                            .get_media_item(&id)
-                            .map_err(err_string)?
-                            .ok_or_else(|| format!("media item not found: {id}"))?;
-                        handle
-                            .update_progress(TaskProgress {
-                                completed: idx as u32,
-                                total,
-                                current: item.title.clone(),
-                                stage_key: Some("matching".into()),
-                            })
-                            .await;
-                        match handle.run_cancellable(scraper_kit::scrape_item(&db, &item, &options))
-                            .await
-                        {
-                            Ok(scraper_kit::ScrapeItemOutcome::Matched) => {
-                                summary.success_ids.push(id);
-                            }
-                            Ok(scraper_kit::ScrapeItemOutcome::Unmatched) => {
-                                summary.unmatched += 1;
-                            }
-                            Ok(scraper_kit::ScrapeItemOutcome::Failed) => {
-                                summary.failed += 1;
-                            }
-                        Err(error) => {
-                            if handle.is_cancelled() { return Err(error); }
-                            summary.failed += 1;
-                            db.update_status(&id, media_core::ScrapedStatus::Partial, Some(&error)).map_err(err_string)?;
-                        }
-                    }
-                    handle.record_scrape_result(&summary).await;
-                    }
-                    handle
-                        .update_progress(TaskProgress {
-                            completed: total,
-                            total,
-                            current: loc_scrape_summary(&locale, &summary.format_result()),
-                            stage_key: Some("saveResults".into()),
-                        })
-                        .await;
-                    if !summary.success_ids.is_empty() {
-                        let templates = config.rename_templates();
-                        if config.rename_auto_after_scrape {
-                            handle
-                                .update_progress(TaskProgress {
-                                    completed: total,
-                                    total,
-                                    current: crate::ui_i18n::t(&locale, "prog.autoRename"),
-                                    stage_key: Some("rename".into()),
-                                })
-                                .await;
-                            let (renamed, rename_failed) = auto_rename_after_scrape(
-                                &db,
-                                &summary.success_ids,
-                                &templates,
-                                config.rename_create_season_folders,
-                                &handle,
-                            ).await;
-                            let mut summary_text =
-                                loc_scrape_summary(&locale, &summary.format_result());
-                            if rename_failed > 0 {
-                                summary_text = format!(
-                                    "{summary_text} · {}",
-                                    crate::ui_i18n::tf(
-                                        &locale,
-                                        "prog.autoRenameResult",
-                                        &[
-                                            ("ok", &renamed.to_string()),
-                                            ("failed", &rename_failed.to_string()),
-                                        ],
-                                    )
-                                );
-                            }
-                            handle
-                                .update_progress(TaskProgress {
-                                    completed: total,
-                                    total,
-                                    current: summary_text,
-                                    stage_key: Some("saveResults".into()),
-                                })
-                                .await;
-                        } else {
-                            consolidate_after_scrape(&db, &summary.success_ids, &templates, &handle).await;
-                        }
-                    }
-                    Ok(())
-                })
-            },
+            None,
+            move |handle| Box::pin(async move { service.scrape_items(scraped_ids, &handle).await }),
         )
         .await;
 
@@ -1247,13 +660,10 @@ pub async fn scrape_season(
     season_number: i32,
 ) -> Result<TaskSnapshot, String> {
     let config = state.config.lock().await.config.clone();
-    let options = scrape_options_from_config(&config);
-    let db = Arc::clone(&state.db);
+    let service = scrape_service(&state, &config);
     let snapshot = state.tasks.enqueue_scoped(format!("Season {season_number}"), TaskKind::Scrape,
-        Some(media_item_id.clone()), task_scope("season", &[media_item_id.clone(), season_number.to_string()]), move |handle| Box::pin(async move {
-            let item = db.get_media_item(&media_item_id).map_err(err_string)?.ok_or_else(|| "media item not found".to_string())?;
-            handle.run_cancellable(scraper_kit::scrape_season(&db, &item, season_number, &options)).await
-        })).await;
+        Some(media_item_id.clone()), task_scope("season", &[media_item_id.clone(), season_number.to_string()]), None,
+        move |handle| Box::pin(async move { service.scrape_season(&media_item_id, season_number, &handle).await })).await;
     watch_task(app, Arc::clone(&state.tasks), snapshot.id.clone());
     Ok(snapshot)
 }
@@ -1268,61 +678,13 @@ pub async fn apply_rename_templates(
         return Err("no items selected".into());
     }
     let config = state.config.lock().await.config.clone();
-    let locale = config.ui_locale.clone();
-    let templates = config.rename_templates();
-    let create_season_folders = config.rename_create_season_folders;
-    let db = Arc::clone(&state.db);
-    let title = crate::ui_i18n::tf(&locale, "task.renameN", &[("n", &item_ids.len().to_string())]);
-
+    let title = crate::ui_i18n::tf(&config.ui_locale, "task.renameN", &[("n", &item_ids.len().to_string())]);
+    let lock = items_scope(&state.db, &item_ids).await?;
+    let service = organize_service(&state, &config);
     let snapshot = state
         .tasks
-        .enqueue_scoped(title, TaskKind::Rename, item_ids.first().cloned(), task_scope("items", &item_ids), move |handle| {
-            Box::pin(async move {
-                let total = item_ids.len() as u32;
-                for (idx, id) in item_ids.into_iter().enumerate() {
-                    if handle.is_cancelled() {
-                        return Err("cancelled".into());
-                    }
-                    let item = db
-                        .get_media_item(&id)
-                        .map_err(err_string)?
-                        .ok_or_else(|| format!("media item not found: {id}"))?;
-                    handle
-                        .update_progress(TaskProgress {
-                            completed: idx as u32,
-                            total,
-                            current: item.title.clone(),
-                            stage_key: Some("rename".into()),
-                        })
-                        .await;
-                    // Season packs that share TMDB with an existing show are absorbed first.
-                    if let Err(error) = renamer::consolidate_show_item(&db, &item, &templates) {
-                        tracing::warn!(item_id = %id, %error, "consolidate before rename failed");
-                    }
-                    let Some(item) = db
-                        .get_media_item(&id)
-                        .map_err(err_string)?
-                    else {
-                        continue;
-                    };
-                    renamer::rename_after_scrape_with_options(
-                        &db,
-                        &item,
-                        &templates,
-                        create_season_folders,
-                    )
-                    .map_err(|e| e.to_string())?;
-                }
-                handle
-                    .update_progress(TaskProgress {
-                        completed: total,
-                        total,
-                        current: crate::ui_i18n::tf(&locale, "prog.renamed", &[("n", &total.to_string())]),
-                        stage_key: Some("rename".into()),
-                    })
-                    .await;
-                Ok(())
-            })
+        .enqueue_scoped(title, TaskKind::Rename, item_ids.first().cloned(), task_scope("items", &item_ids), Some(lock), move |handle| {
+            Box::pin(async move { service.apply_rename_templates(item_ids, &handle).await })
         })
         .await;
 
@@ -1357,13 +719,10 @@ pub async fn organize_season_folders(
         return Err("no scraped tv/anime items selected".into());
     }
 
-    let (templates, locale) = {
-        let cfg = state.config.lock().await;
-        (cfg.config.rename_templates(), cfg.config.ui_locale.clone())
-    };
-    let db = Arc::clone(&state.db);
-    let title = crate::ui_i18n::tf(&locale, "task.organizeN", &[("n", &targets.len().to_string())]);
-
+    let config = state.config.lock().await.config.clone();
+    let title = crate::ui_i18n::tf(&config.ui_locale, "task.organizeN", &[("n", &targets.len().to_string())]);
+    let lock = items_scope(&state.db, &targets).await?;
+    let service = organize_service(&state, &config);
     let snapshot = state
         .tasks
         .enqueue_scoped(
@@ -1371,39 +730,8 @@ pub async fn organize_season_folders(
             TaskKind::Organize,
             targets.first().cloned(),
             task_scope("items", &targets),
-            move |handle| {
-                Box::pin(async move {
-                    let total = targets.len() as u32;
-                    for (idx, id) in targets.into_iter().enumerate() {
-                        if handle.is_cancelled() {
-                            return Err("cancelled".into());
-                        }
-                        let item = db
-                            .get_media_item(&id)
-                            .map_err(err_string)?
-                            .ok_or_else(|| format!("media item not found: {id}"))?;
-                        handle
-                            .update_progress(TaskProgress {
-                                completed: idx as u32,
-                                total,
-                                current: item.title.clone(),
-                                stage_key: Some("organize".into()),
-                            })
-                            .await;
-                        renamer::organize_season_folders(&db, &item, &templates)
-                            .map_err(|e| e.to_string())?;
-                    }
-                    handle
-                        .update_progress(TaskProgress {
-                            completed: total,
-                            total,
-                            current: crate::ui_i18n::tf(&locale, "prog.organized", &[("n", &total.to_string())]),
-                            stage_key: Some("organize".into()),
-                        })
-                        .await;
-                    Ok(())
-                })
-            },
+            Some(lock),
+            move |handle| Box::pin(async move { service.organize_season_folders(targets, &handle).await }),
         )
         .await;
 
@@ -1439,54 +767,11 @@ pub async fn cleanup_media_residuals(
     let locale = ui_locale(&state).await;
     let title = crate::ui_i18n::tf(&locale, "task.cleanupN", &[("n", &paths.len().to_string())]);
     let db = Arc::clone(&state.db);
+    // Candidates are revalidated across every library, so the job excludes all of them.
     let snapshot = state
         .tasks
-        .enqueue(title, TaskKind::Cleanup, None, move |handle| {
-            let locale = locale.clone();
-            Box::pin(async move {
-                let total = paths.len() as u32;
-                handle
-                    .update_progress(TaskProgress {
-                        completed: 0,
-                        total,
-                        current: crate::ui_i18n::t(&locale, "prog.cleaning"),
-                        stage_key: Some("cleanup".into()),
-                    })
-                    .await;
-                let cancel = handle.cancellation_flag();
-                let removed = tokio::task::spawn_blocking(move || -> Result<usize, String> {
-                    let mut ids = Vec::new();
-                    for library in db.list_libraries().map_err(err_string)? {
-                        ids.extend(db.list_media_items(&library.id).map_err(err_string)?.into_iter().map(|i| i.id));
-                    }
-                    let allowed: std::collections::HashSet<_> = media_core::find_residuals(&db, &ids)
-                        .map_err(err_string)?.into_iter().map(|c| c.path).collect();
-                    if paths.iter().any(|p| !allowed.contains(p)) {
-                        return Err("cleanup candidates changed; scan again".into());
-                    }
-                    let mut removed = 0;
-                    for path in paths {
-                        if cancel.load(std::sync::atomic::Ordering::SeqCst) { break; }
-                        removed += media_core::perform_cleanup(&[path]).map_err(err_string)?;
-                    }
-                    Ok(removed)
-                })
-                .await
-                .map_err(|e| e.to_string())?
-                .map_err(err_string)?;
-                if handle.is_cancelled() {
-                    return Err("cancelled".into());
-                }
-                handle
-                    .update_progress(TaskProgress {
-                        completed: removed as u32,
-                        total,
-                        current: crate::ui_i18n::tf(&locale, "prog.cleaned", &[("n", &removed.to_string())]),
-                        stage_key: Some("cleanup".into()),
-                    })
-                    .await;
-                Ok(())
-            })
+        .enqueue(title, TaskKind::Cleanup, None, Some(LockScope::Global), move |handle| {
+            Box::pin(async move { crate::app::cleanup::cleanup_residuals(db, paths, &locale, Arc::new(SystemTrash), &handle).await })
         })
         .await;
 
@@ -1502,44 +787,18 @@ pub async fn delete_media_items(
     item_ids: Vec<String>,
     also_trash: bool,
 ) -> Result<usize, String> {
-    let _mutation_guard = state.tasks.lock_mutations().await?;
+    let scope = items_scope(&state.db, &item_ids).await?;
+    let mutation_guard = state.tasks.locks().lock(&scope).await?;
     if item_ids.is_empty() {
         return Err("no items selected".into());
     }
 
     let db = Arc::clone(&state.db);
-    let result = blocking(move || {
-        let _mutation_guard = _mutation_guard;
-        // Preflight the entire request before touching either files or records.
-        let mut targets = Vec::new();
-        if also_trash {
-            for id in &item_ids {
-                if let Some(item) = db.get_media_item(id).map_err(err_string)? {
-                    let target = media_core::media_files::deletion_target(&db, &item)
-                        .map_err(err_string)?;
-                    targets.push((id.clone(), target));
-                }
-            }
-        }
-        if also_trash {
-            let fs = media_core::FilesystemService::new();
-            let mut deleted = 0;
-            for (id, path) in targets {
-                // Keep the record if trash fails; do not turn a trash request into
-                // permanent deletion on platforms without recycle-bin support.
-                fs.trash_item(&path).map_err(err_string)?;
-                deleted += db.delete_media_items(&[id]).map_err(err_string)?;
-            }
-            Ok(deleted)
-        } else {
-            db.delete_media_items(&item_ids).map_err(err_string)
-        }
+    blocking(move || {
+        let _mutation_guard = mutation_guard;
+        crate::app::cleanup::delete_media_items(&db, &item_ids, also_trash, &SystemTrash, &app)
     })
-    .await;
-
-    // Items trashed before a later failure are gone too; refresh either way.
-    let _ = app.emit("library-updated", ());
-    result
+    .await
 }
 
 #[tauri::command]
@@ -1554,7 +813,7 @@ pub async fn search_match_candidates(
     coordinator
         .search_manual(&query, media_type, &config.metadata_language)
         .await
-        .map_err(|e| loc_err(&locale, e))
+        .map_err(|e| localized_error(&locale, e))
 }
 
 #[tauri::command]
@@ -1565,70 +824,23 @@ pub async fn apply_manual_match(
     source_id: String,
 ) -> Result<TaskSnapshot, String> {
     let config = state.config.lock().await.config.clone();
-    let locale = config.ui_locale.clone();
-    let options = scrape_options_from_config(&config);
     let item = state
         .db
         .get_media_item(&item_id)
         .map_err(err_string)?
         .ok_or_else(|| format!("media item not found: {item_id}"))?;
-    let db = Arc::clone(&state.db);
     let title = crate::ui_i18n::tf(
-        &locale,
+        &config.ui_locale,
         "task.manualMatch",
         &[("title", &item.title)],
     );
     let target_id = Some(item_id.clone());
+    let service = scrape_service(&state, &config);
 
     let snapshot = state
         .tasks
-        .enqueue_scoped(title, TaskKind::ManualMatch, target_id, task_scope("match", &[item_id.clone(), source_id.clone()]), move |handle| {
-            let locale = locale.clone();
-            Box::pin(async move {
-                handle
-                    .update_progress(TaskProgress {
-                        completed: 0,
-                        total: 1,
-                        current: item.title.clone(),
-                        stage_key: Some("matching".into()),
-                    })
-                    .await;
-                handle.run_cancellable(scraper_kit::apply_manual_match(&db, &item, &source_id, &options))
-                    .await
-                    .map_err(|e| loc_err(&locale, e))?;
-                if handle.is_cancelled() {
-                    return Err("cancelled".into());
-                }
-                let templates = config.rename_templates();
-                if config.rename_auto_after_scrape {
-                    handle
-                        .update_progress(TaskProgress {
-                            completed: 0,
-                            total: 1,
-                            current: crate::ui_i18n::t(&locale, "prog.autoRename"),
-                            stage_key: Some("rename".into()),
-                        })
-                        .await;
-                    let _ = auto_rename_after_scrape(
-                        &db,
-                        &[item.id.clone()],
-                        &templates,
-                        config.rename_create_season_folders,
-                        &handle,
-                    ).await;
-                } else {
-                    consolidate_after_scrape(&db, &[item.id.clone()], &templates, &handle).await;
-                }
-                handle
-                    .update_progress(TaskProgress {
-                        completed: 1,
-                        total: 1,
-                        current: item.title.clone(),
-                        stage_key: Some("saveResults".into()),
-                    })
-                    .await;
-                Ok(())
-            })
+        .enqueue_scoped(title, TaskKind::ManualMatch, target_id, task_scope("match", &[item_id.clone(), source_id.clone()]), None, move |handle| {
+            Box::pin(async move { service.apply_manual_match(&item, &source_id, &handle).await })
         })
         .await;
 
@@ -1642,7 +854,6 @@ fn scrape_options_from_config(config: &AppConfig) -> scraper_kit::ScrapeOptions 
         language: config.metadata_language.clone(),
         concurrency: config.scrape_concurrency.max(1) as usize,
         keys: scraper_keys(config),
-        nfo_format: config.nfo_format.clone(),
     }
 }
 
@@ -1652,6 +863,32 @@ fn scraper_keys(config: &AppConfig) -> scraper_kit::ScraperKeys {
         bangumi: config.api_keys.bangumi.clone(),
         omdb: config.api_keys.omdb.clone(),
         tvdb: config.api_keys.tvdb.clone(),
+    }
+}
+
+fn scrape_service(state: &State<'_, AppState>, config: &AppConfig) -> ScrapeService<scraper_kit::ScrapeClient> {
+    let options = scrape_options_from_config(config);
+    ScrapeService {
+        db: Arc::clone(&state.db),
+        locks: Arc::clone(state.tasks.locks()),
+        source: Arc::new(scraper_kit::ScrapeClient::new(&options)),
+        settings: ScrapeSettings {
+            concurrency: options.concurrency,
+            nfo_format: config.nfo_format.clone(),
+            locale: config.ui_locale.clone(),
+            templates: config.rename_templates(),
+            auto_rename: config.rename_auto_after_scrape,
+            create_season_folders: config.rename_create_season_folders,
+        },
+    }
+}
+
+fn organize_service(state: &State<'_, AppState>, config: &AppConfig) -> OrganizeService {
+    OrganizeService {
+        db: Arc::clone(&state.db),
+        templates: config.rename_templates(),
+        create_season_folders: config.rename_create_season_folders,
+        locale: config.ui_locale.clone(),
     }
 }
 
@@ -1905,7 +1142,7 @@ pub async fn renamer_execute(
     files: Vec<renamer::FileEntry>,
     pipeline: renamer::RulePipeline,
 ) -> Result<RenamerOutcome, String> {
-    let mutation_guard = state.tasks.lock_mutations().await?;
+    let mutation_guard = state.tasks.locks().lock(&LockScope::Global).await?;
     let (db, undo) = (Arc::clone(&state.db), Arc::clone(&state.rename_undo));
     blocking(move || {
         let _mutation_guard = mutation_guard;
@@ -1922,7 +1159,7 @@ pub async fn renamer_execute(
 
 #[tauri::command]
 pub async fn renamer_undo_last(app: AppHandle, state: State<'_, AppState>) -> Result<RenamerOutcome, String> {
-    let mutation_guard = state.tasks.lock_mutations().await?;
+    let mutation_guard = state.tasks.locks().lock(&LockScope::Global).await?;
     let (db, undo) = (Arc::clone(&state.db), Arc::clone(&state.rename_undo));
     blocking(move || {
         let _mutation_guard = mutation_guard;
@@ -1945,7 +1182,7 @@ fn finish_renamer_batch(
     result: Result<(), renamer::ExecuteError>,
 ) -> Result<RenamerOutcome, String> {
     if !outcome.renames.is_empty() {
-        let _ = app.emit("library-updated", ());
+        app.library_updated();
     }
     match result {
         Ok(()) => Ok(outcome),
@@ -2145,15 +1382,6 @@ fn collect_paths_into(
     Ok(())
 }
 
-/// Run filesystem or SQLite work on the blocking pool so slow disks (NAS) and a
-/// busy database connection never stall the async command workers.
-async fn blocking<T: Send + 'static>(work: impl FnOnce() -> Result<T, String> + Send + 'static) -> Result<T, String> {
-    tokio::task::spawn_blocking(work).await.map_err(|e| e.to_string())?
-}
-
-fn err_string(err: impl ToString) -> String {
-    err.to_string()
-}
 
 fn task_scope(label: &str, ids: &[String]) -> Option<String> {
     let mut ids = ids.to_vec(); ids.sort(); ids.dedup();

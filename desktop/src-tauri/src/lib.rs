@@ -1,3 +1,4 @@
+mod app;
 mod commands;
 mod config;
 mod log_store;

@@ -8,7 +8,7 @@ use super::AppDatabase;
 
 impl AppDatabase {
     pub fn list_libraries(&self) -> Result<Vec<Library>, DatabaseError> {
-        self.with_conn(|conn| {
+        self.with_read_conn(|conn| {
             let mut stmt = conn.prepare(
                 "SELECT id, name, rootPath, bookmarkData, mediaType, addedAt
                  FROM libraries
@@ -35,7 +35,7 @@ impl AppDatabase {
     }
 
     pub fn get_library(&self, id: &str) -> Result<Option<Library>, DatabaseError> {
-        self.with_conn(|conn| {
+        self.with_read_conn(|conn| {
             conn.query_row(
                 "SELECT id, name, rootPath, bookmarkData, mediaType, addedAt
                  FROM libraries WHERE id = ?1",

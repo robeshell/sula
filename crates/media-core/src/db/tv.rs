@@ -11,7 +11,7 @@ impl AppDatabase {
         &self,
         library_id: &str,
     ) -> Result<Vec<String>, DatabaseError> {
-        self.with_conn(|conn| {
+        self.with_read_conn(|conn| {
             let mut stmt = conn.prepare(
                 "SELECT e.filePath
                  FROM tv_episodes e
@@ -128,7 +128,7 @@ impl AppDatabase {
     }
 
     pub fn fetch_seasons(&self, media_item_id: &str) -> Result<Vec<TvSeason>, DatabaseError> {
-        self.with_conn(|conn| {
+        self.with_read_conn(|conn| {
             let mut stmt = conn.prepare(
                 "SELECT id, mediaItemId, seasonNumber, title, overview, posterPath, airDate, episodeCount
                  FROM tv_seasons
@@ -145,7 +145,7 @@ impl AppDatabase {
     }
 
     pub fn fetch_episodes(&self, season_id: &str) -> Result<Vec<TvEpisode>, DatabaseError> {
-        self.with_conn(|conn| {
+        self.with_read_conn(|conn| {
             let mut stmt = conn.prepare(
                 "SELECT id, seasonId, episodeNumber, title, overview, airDate, stillPath, stillURL,
                         filePath, runtime, rating, director, writer, guestCast, absoluteNumber,
@@ -288,7 +288,7 @@ impl AppDatabase {
 
     #[allow(dead_code)]
     pub fn get_season(&self, id: &str) -> Result<Option<TvSeason>, DatabaseError> {
-        self.with_conn(|conn| {
+        self.with_read_conn(|conn| {
             conn.query_row(
                 "SELECT id, mediaItemId, seasonNumber, title, overview, posterPath, airDate, episodeCount
                  FROM tv_seasons WHERE id = ?1",

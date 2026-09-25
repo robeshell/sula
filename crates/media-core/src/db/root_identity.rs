@@ -33,7 +33,7 @@ impl AppDatabase {
 
     /// Sub-mounts recorded by the last directory walk; `None` until the first one.
     pub fn library_mount_points(&self, library_id: &str) -> Result<Option<Vec<String>>, DatabaseError> {
-        self.with_conn(|conn| {
+        self.with_read_conn(|conn| {
             let raw: Option<String> = conn.query_row(
                 "SELECT paths FROM library_mount_points WHERE library_id=?1", [library_id], |r| r.get(0)).optional()?;
             Ok(raw.map(|raw| serde_json::from_str(&raw).unwrap_or_default()))

@@ -2,7 +2,21 @@
 use crate::execute::{file_identity, FileIdentity};
 use media_core::{entry_name_exists, is_case_only_rename, AppDatabase, CollisionPolicy, FilesystemService};
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
+
+/// Journals whose operation is still running in this process. Libraries mutate in
+/// parallel, so recovery started for one library must not roll back another
+/// library's merge mid-flight; only journals of finished or crashed operations
+/// are recovered.
+fn live_journals() -> &'static Mutex<HashSet<String>> {
+    static LIVE: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+    LIVE.get_or_init(Default::default)
+}
+
+/// One recovery pass at a time, so two lock holders never replay one journal.
+static RECOVERY: Mutex<()> = Mutex::new(());
 
 #[derive(Default, Serialize, Deserialize)]
 struct Journal {
@@ -24,6 +38,7 @@ pub(crate) struct MergeJournal<'a> {
     journal: Journal,
 }
 impl<'a> MergeJournal<'a> {
+    /// The journal is live until dropped; drop it before recovering its own failure.
     pub fn begin(db: &'a AppDatabase) -> Result<Self, String> {
         let id = uuid::Uuid::new_v4().to_string();
         let journal = Journal {
@@ -31,12 +46,15 @@ impl<'a> MergeJournal<'a> {
             moves: Vec::new(),
             created_directories: Vec::new(),
         };
-        db.create_media_operation(
-            &id,
-            &serde_json::to_string(&journal).map_err(|e| e.to_string())?,
+        // Registered before the row exists, so no recovery pass sees it unowned.
+        live_journals().lock().unwrap_or_else(|e| e.into_inner()).insert(id.clone());
+        let this = Self { db, id, journal };
+        this.db.create_media_operation(
+            &this.id,
+            &serde_json::to_string(&this.journal).map_err(|e| e.to_string())?,
         )
         .map_err(|e| e.to_string())?;
-        Ok(Self { db, id, journal })
+        Ok(this)
     }
     pub fn move_file(&mut self, from: &Path, to: &Path) -> Result<(), String> {
         if from == to {
@@ -75,6 +93,12 @@ impl<'a> MergeJournal<'a> {
     }
 }
 
+impl Drop for MergeJournal<'_> {
+    fn drop(&mut self) {
+        live_journals().lock().unwrap_or_else(|e| e.into_inner()).remove(&self.id);
+    }
+}
+
 fn was_moved(step: &Move) -> Result<bool, String> {
     let state = (
         step.from.try_exists().map_err(|e| e.to_string())?,
@@ -104,8 +128,13 @@ fn was_moved(step: &Move) -> Result<bool, String> {
 
 /// Called before mutations and on startup. Pending merges roll back; committed
 /// merges keep their files. Ambiguous paths retain the journal and block mutations.
+/// Journals of operations still running in this process are left to their owner.
 pub fn recover_media_operations(db: &AppDatabase) -> Result<(), String> {
+    let _recovery = RECOVERY.lock().unwrap_or_else(|e| e.into_inner());
     for (id, payload, committed) in db.media_operations().map_err(|e| e.to_string())? {
+        if live_journals().lock().unwrap_or_else(|e| e.into_inner()).contains(&id) {
+            continue;
+        }
         if !committed {
             let journal: Journal = serde_json::from_str(&payload)
                 .map_err(|e| format!("invalid media journal {id}: {e}"))?;
@@ -190,9 +219,31 @@ mod tests {
             &serde_json::to_string(&journal.journal).unwrap(),
         )
         .unwrap();
+        drop(journal); // The process exits.
         recover_media_operations(&db).unwrap();
         assert_eq!(std::fs::read_to_string(from).unwrap(), "original");
         assert!(!to.exists());
+    }
+
+    #[test]
+    fn running_operation_is_not_recovered_until_it_ends() {
+        let dir = tempdir().unwrap();
+        let from = dir.path().join("source");
+        let to = dir.path().join("dest");
+        std::fs::write(&from, "original").unwrap();
+        let db = AppDatabase::open(dir.path().join("db.sqlite")).unwrap();
+        let mut journal = MergeJournal::begin(&db).unwrap();
+        journal.move_file(&from, &to).unwrap();
+        // Another library's lock holder runs recovery meanwhile.
+        recover_media_operations(&db).unwrap();
+        assert!(!from.exists());
+        assert_eq!(std::fs::read_to_string(&to).unwrap(), "original");
+        assert_eq!(db.media_operations().unwrap().len(), 1);
+        drop(journal);
+        recover_media_operations(&db).unwrap();
+        assert_eq!(std::fs::read_to_string(&from).unwrap(), "original");
+        assert!(!to.exists());
+        assert!(db.media_operations().unwrap().is_empty());
     }
 
     #[test]
@@ -204,6 +255,7 @@ mod tests {
         let db = AppDatabase::open(dir.path().join("db.sqlite")).unwrap();
         let mut journal = MergeJournal::begin(&db).unwrap();
         journal.move_file(&from, &to).unwrap();
+        drop(journal); // The process exits.
         std::fs::write(&from, "unrelated").unwrap();
         assert!(recover_media_operations(&db).is_err());
         assert_eq!(std::fs::read_to_string(&from).unwrap(), "unrelated");

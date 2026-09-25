@@ -31,14 +31,8 @@ pub enum TaskStatus {
     Cancelled,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct TaskProgress {
-    pub completed: u32,
-    pub total: u32,
-    pub current: String,
-    pub stage_key: Option<String>,
-}
+pub use crate::app::TaskProgress;
+use crate::app::locks::{LockScope, MutationLocks};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TaskResult {
@@ -67,6 +61,8 @@ pub struct TaskSnapshot {
 struct TaskRecord {
     snapshot: TaskSnapshot,
     scope: Option<String>,
+    /// Held by the worker for the whole job; `None` jobs lock phases themselves.
+    lock: Option<LockScope>,
     cancel: Arc<AtomicBool>,
     work: Option<TaskWork>,
 }
@@ -89,22 +85,10 @@ impl TaskHandle {
         self.cancel.load(Ordering::SeqCst)
     }
 
-    pub async fn record_scrape_result(&self, summary: &scraper_kit::ScrapeSummary) {
+    pub async fn record_scrape_result(&self, summary: &crate::app::scrape::ScrapeSummary) {
         self.queue.update(&self.id, |snap| {
             snap.result = Some(TaskResult { success: summary.success_ids.len() as u32, unmatched: summary.unmatched, failed: summary.failed });
         }).await;
-    }
-
-    /// Use only for cancellable async I/O, never for detached blocking workers.
-    pub async fn run_cancellable<T>(&self, future: impl std::future::Future<Output = Result<T, String>>) -> Result<T, String> {
-        tokio::pin!(future);
-        loop {
-            if self.is_cancelled() { return Err("cancelled".into()); }
-            tokio::select! {
-                result = &mut future => return result,
-                _ = tokio::time::sleep(std::time::Duration::from_millis(50)) => {},
-            }
-        }
     }
 
     /// Progress is transient: kept in memory only. History is written on status
@@ -118,11 +102,22 @@ impl TaskHandle {
     }
 }
 
+impl crate::app::Progress for TaskHandle {
+    fn update(&self, progress: TaskProgress) -> impl std::future::Future<Output = ()> + Send {
+        self.update_progress(progress)
+    }
+    fn scrape_result(&self, summary: &crate::app::scrape::ScrapeSummary) -> impl std::future::Future<Output = ()> + Send {
+        self.record_scrape_result(summary)
+    }
+    fn cancel_flag(&self) -> Arc<AtomicBool> {
+        self.cancellation_flag()
+    }
+}
+
 struct TaskQueueInner {
     tasks: Mutex<Vec<TaskRecord>>,
     wake: Notify,
-    mutation_gate: Arc<Mutex<()>>,
-    recover: Arc<dyn Fn() -> Result<(), String> + Send + Sync>,
+    locks: Arc<MutationLocks>,
     history: Option<std::path::PathBuf>,
 }
 
@@ -136,10 +131,10 @@ impl TaskQueue {
 
     #[cfg(test)]
     pub fn with_recovery(recover: impl Fn() -> Result<(), String> + Send + Sync + 'static) -> Self {
-        Self::start(recover, None, Vec::new())
+        Self::start(Arc::new(MutationLocks::new(recover, |ids| ids.to_vec())), None, Vec::new())
     }
 
-    pub fn open(history: std::path::PathBuf, recover: impl Fn() -> Result<(), String> + Send + Sync + 'static) -> Result<Self, String> {
+    pub fn open(history: std::path::PathBuf, locks: Arc<MutationLocks>) -> Result<Self, String> {
         let snapshots: Vec<TaskSnapshot> = match std::fs::read(&history) {
             Ok(bytes) => match serde_json::from_slice(&bytes) {
                 Ok(snapshots) => snapshots,
@@ -159,17 +154,16 @@ impl TaskQueue {
                 snapshot.error_message = Some("interrupted by application exit; completed changes were preserved".into());
                 snapshot.updated_at = Utc::now();
             }
-            TaskRecord { snapshot, scope: None, cancel: Arc::new(AtomicBool::new(false)), work: None }
+            TaskRecord { snapshot, scope: None, lock: None, cancel: Arc::new(AtomicBool::new(false)), work: None }
         }).collect();
-        Ok(Self::start(recover, Some(history), records))
+        Ok(Self::start(locks, Some(history), records))
     }
 
-    fn start(recover: impl Fn() -> Result<(), String> + Send + Sync + 'static, history: Option<std::path::PathBuf>, records: Vec<TaskRecord>) -> Self {
+    fn start(locks: Arc<MutationLocks>, history: Option<std::path::PathBuf>, records: Vec<TaskRecord>) -> Self {
         let inner = Arc::new(TaskQueueInner {
             tasks: Mutex::new(records),
             wake: Notify::new(),
-            mutation_gate: Arc::new(Mutex::new(())),
-            recover: Arc::new(recover),
+            locks,
             history,
         });
         let worker = Arc::clone(&inner);
@@ -180,10 +174,8 @@ impl TaskQueue {
     }
 
     /// Shared by queued jobs and direct file-mutating commands.
-    pub async fn lock_mutations(&self) -> Result<tokio::sync::OwnedMutexGuard<()>, String> {
-        let guard = Arc::clone(&self.inner.mutation_gate).lock_owned().await;
-        (self.inner.recover)()?;
-        Ok(guard)
+    pub fn locks(&self) -> &Arc<MutationLocks> {
+        &self.inner.locks
     }
 
     pub async fn get(&self, id: &str) -> Option<TaskSnapshot> {
@@ -201,7 +193,7 @@ impl TaskQueue {
     }
 
     pub async fn enqueue_smoke(&self, title: impl Into<String>) -> TaskSnapshot {
-        self.enqueue(title, TaskKind::Smoke, None, |_handle| {
+        self.enqueue(title, TaskKind::Smoke, None, None, |_handle| {
             Box::pin(async move {
                 for step in 1..=5u32 {
                     if _handle.is_cancelled() {
@@ -236,6 +228,7 @@ impl TaskQueue {
         title: impl Into<String>,
         kind: TaskKind,
         target_id: Option<String>,
+        lock: Option<LockScope>,
         work: F,
     ) -> TaskSnapshot
     where
@@ -244,11 +237,11 @@ impl TaskQueue {
             + 'static,
     {
         let scope = if matches!(kind, TaskKind::BatchScrape) { target_id.clone() } else { None };
-        self.enqueue_scoped(title, kind, target_id, scope, work).await
+        self.enqueue_scoped(title, kind, target_id, scope, lock, work).await
     }
 
     pub async fn enqueue_scoped<F>(&self, title: impl Into<String>, kind: TaskKind,
-        target_id: Option<String>, scope: Option<String>, work: F) -> TaskSnapshot
+        target_id: Option<String>, scope: Option<String>, lock: Option<LockScope>, work: F) -> TaskSnapshot
     where F: FnOnce(TaskHandle) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send>> + Send + 'static,
     {
         let title = title.into();
@@ -290,6 +283,7 @@ impl TaskQueue {
             tasks.push(TaskRecord {
                 snapshot: snapshot.clone(),
                 scope,
+                lock,
                 cancel,
                 work: Some(work),
             });
@@ -372,28 +366,28 @@ async fn worker_loop(inner: Arc<TaskQueueInner>) {
                         cancel: Arc::clone(&t.cancel),
                         queue: Arc::clone(&inner),
                     };
-                    (work, handle)
+                    (work, t.lock.clone(), handle)
                 })
         };
 
-        let Some((work, handle)) = next else {
+        let Some((work, lock, handle)) = next else {
             inner.wake.notified().await;
             continue;
         };
 
-        let gate = Arc::clone(&inner.mutation_gate);
-        let recover = Arc::clone(&inner.recover);
+        let locks = Arc::clone(&inner.locks);
         let job_handle = handle.clone();
         // A panic belongs to this job, not the long-lived queue worker.
         let result = tauri::async_runtime::spawn(async move {
-            let _guard = gate.lock_owned().await;
+            let _guard = match &lock { Some(scope) => Some(locks.acquire(scope).await), None => None };
             if job_handle.is_cancelled() { return Err("cancelled".into()); }
-            // Only now is the job actually running; before this it waited for the gate.
+            // Only now is the job actually running; before this it waited for its locks.
             job_handle.queue.update(&job_handle.id, |snap| {
                 snap.status = TaskStatus::Running;
                 snap.updated_at = Utc::now();
             }).await;
-            recover()?;
+            // Also for lock-free jobs: nothing starts while a media operation awaits recovery.
+            locks.recover()?;
             work(job_handle).await
         }).await.unwrap_or_else(|_| Err("task stopped unexpectedly".into()));
         {
@@ -419,6 +413,8 @@ async fn worker_loop(inner: Arc<TaskQueueInner>) {
 mod tests {
     use super::*;
 
+    fn lib(id: &str) -> Option<LockScope> { Some(LockScope::library(id)) }
+
     async fn terminal(queue: &TaskQueue, id: &str) -> TaskSnapshot {
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
             loop {
@@ -434,22 +430,23 @@ mod tests {
         let blocked = Arc::new(AtomicBool::new(true));
         let check = Arc::clone(&blocked);
         let queue = TaskQueue::with_recovery(move || if check.load(Ordering::SeqCst) { Err("recovery pending".into()) } else { Ok(()) });
-        assert!(queue.lock_mutations().await.is_err());
-        let task = queue.enqueue("blocked", TaskKind::Rename, None, |_| Box::pin(async { panic!("must not run") })).await;
+        assert!(queue.locks().lock(&LockScope::library("lib")).await.is_err());
+        assert!(queue.locks().lock(&LockScope::Global).await.is_err());
+        let task = queue.enqueue("blocked", TaskKind::Rename, None, lib("lib"), |_| Box::pin(async { panic!("must not run") })).await;
         let failed = terminal(&queue, &task.id).await;
         assert_eq!(failed.status, TaskStatus::Failed);
         assert_eq!(failed.error_message.as_deref(), Some("recovery pending"));
         blocked.store(false, Ordering::SeqCst);
-        assert!(queue.lock_mutations().await.is_ok());
-        let next = queue.enqueue("ready", TaskKind::Rename, None, |_| Box::pin(async { Ok(()) })).await;
+        assert!(queue.locks().lock(&LockScope::Global).await.is_ok());
+        let next = queue.enqueue("ready", TaskKind::Rename, None, lib("lib"), |_| Box::pin(async { Ok(()) })).await;
         assert_eq!(terminal(&queue, &next.id).await.status, TaskStatus::Completed);
     }
 
     #[tokio::test]
     async fn panic_does_not_stop_the_queue() {
         let queue = TaskQueue::new();
-        let bad = queue.enqueue("bad", TaskKind::Smoke, None, |_| Box::pin(async { panic!("injected") })).await;
-        let good = queue.enqueue("good", TaskKind::Smoke, None, |_| Box::pin(async { Ok(()) })).await;
+        let bad = queue.enqueue("bad", TaskKind::Smoke, None, None, |_| Box::pin(async { panic!("injected") })).await;
+        let good = queue.enqueue("good", TaskKind::Smoke, None, None, |_| Box::pin(async { Ok(()) })).await;
         assert_eq!(terminal(&queue, &bad.id).await.status, TaskStatus::Failed);
         assert_eq!(terminal(&queue, &good.id).await.status, TaskStatus::Completed);
         assert!(!queue.cancel(&good.id).await);
@@ -458,10 +455,10 @@ mod tests {
     #[tokio::test]
     async fn direct_mutation_gate_blocks_jobs_and_cancellation_skips_work() {
         let queue = TaskQueue::new();
-        let guard = queue.lock_mutations().await.unwrap();
+        let guard = queue.locks().lock(&LockScope::Global).await.unwrap();
         let ran = Arc::new(AtomicBool::new(false));
         let ran_job = Arc::clone(&ran);
-        let task = queue.enqueue("job", TaskKind::Rename, None, move |_| Box::pin(async move {
+        let task = queue.enqueue("job", TaskKind::Rename, None, lib("lib"), move |_| Box::pin(async move {
             ran_job.store(true, Ordering::SeqCst); Ok(())
         })).await;
         tokio::task::yield_now().await;
@@ -475,9 +472,9 @@ mod tests {
     #[tokio::test]
     async fn batch_scrape_enqueue_deduplicates_under_lock() {
         let queue = TaskQueue::new();
-        let _guard = queue.lock_mutations().await.unwrap();
-        let a = queue.enqueue("a", TaskKind::BatchScrape, Some("library".into()), |_| Box::pin(async { Ok(()) }));
-        let b = queue.enqueue("b", TaskKind::BatchScrape, Some("library".into()), |_| Box::pin(async { Ok(()) }));
+        let _guard = queue.locks().lock(&LockScope::Global).await.unwrap();
+        let a = queue.enqueue("a", TaskKind::BatchScrape, Some("library".into()), lib("library"), |_| Box::pin(async { Ok(()) }));
+        let b = queue.enqueue("b", TaskKind::BatchScrape, Some("library".into()), lib("library"), |_| Box::pin(async { Ok(()) }));
         let (a, b) = tokio::join!(a, b);
         assert_eq!(a.id, b.id);
         queue.cancel(&a.id).await;
@@ -486,23 +483,42 @@ mod tests {
     async fn cancelled_async_io_releases_queue() {
         let queue = TaskQueue::new();
         let started = Arc::new(Notify::new()); let signal = started.clone();
-        let task = queue.enqueue("io", TaskKind::Scrape, None, move |handle| Box::pin(async move {
+        let task = queue.enqueue("io", TaskKind::Scrape, None, None, move |handle| Box::pin(async move {
             signal.notify_one();
-            handle.run_cancellable(std::future::pending::<Result<(), String>>()).await
+            crate::app::cancellable(&handle.cancellation_flag(), std::future::pending::<Result<(), String>>()).await
         })).await;
         started.notified().await;
         queue.cancel(&task.id).await;
         assert_eq!(terminal(&queue, &task.id).await.status, TaskStatus::Cancelled);
-        let next = queue.enqueue("next", TaskKind::Smoke, None, |_| Box::pin(async { Ok(()) })).await;
+        let next = queue.enqueue("next", TaskKind::Smoke, None, None, |_| Box::pin(async { Ok(()) })).await;
         assert_eq!(terminal(&queue, &next.id).await.status, TaskStatus::Completed);
     }
 
     #[tokio::test]
+    async fn library_lock_blocks_only_jobs_of_that_library() {
+        let queue = TaskQueue::new();
+        let guard = queue.locks().lock(&LockScope::library("a")).await.unwrap();
+        let other = queue.enqueue("b", TaskKind::Rename, None, lib("b"), |_| Box::pin(async { Ok(()) })).await;
+        assert_eq!(terminal(&queue, &other.id).await.status, TaskStatus::Completed);
+        let unlocked = queue.enqueue("scrape", TaskKind::BatchScrape, Some("a".into()), None, |_| Box::pin(async { Ok(()) })).await;
+        assert_eq!(terminal(&queue, &unlocked.id).await.status, TaskStatus::Completed);
+        let ran = Arc::new(AtomicBool::new(false));
+        let ran_job = Arc::clone(&ran);
+        let same = queue.enqueue("a", TaskKind::Rename, None, lib("a"), move |_| Box::pin(async move { ran_job.store(true, Ordering::SeqCst); Ok(()) })).await;
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(!ran.load(Ordering::SeqCst));
+        assert_eq!(queue.get(&same.id).await.unwrap().status, TaskStatus::Pending);
+        drop(guard);
+        assert_eq!(terminal(&queue, &same.id).await.status, TaskStatus::Completed);
+        assert!(ran.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
     async fn exact_scope_dedup_preserves_different_batches() {
-        let queue = TaskQueue::new(); let _guard = queue.lock_mutations().await.unwrap();
-        let a = queue.enqueue_scoped("a", TaskKind::Scrape, Some("first".into()), Some("first,second".into()), |_| Box::pin(async { Ok(()) })).await;
-        let b = queue.enqueue_scoped("b", TaskKind::Scrape, Some("first".into()), Some("first,second".into()), |_| Box::pin(async { Ok(()) })).await;
-        let c = queue.enqueue_scoped("c", TaskKind::Scrape, Some("first".into()), Some("first,third".into()), |_| Box::pin(async { Ok(()) })).await;
+        let queue = TaskQueue::new(); let _guard = queue.locks().lock(&LockScope::Global).await.unwrap();
+        let a = queue.enqueue_scoped("a", TaskKind::Scrape, Some("first".into()), Some("first,second".into()), lib("l"), |_| Box::pin(async { Ok(()) })).await;
+        let b = queue.enqueue_scoped("b", TaskKind::Scrape, Some("first".into()), Some("first,second".into()), lib("l"), |_| Box::pin(async { Ok(()) })).await;
+        let c = queue.enqueue_scoped("c", TaskKind::Scrape, Some("first".into()), Some("first,third".into()), lib("l"), |_| Box::pin(async { Ok(()) })).await;
         assert_eq!(a.id, b.id); assert_ne!(a.id, c.id);
         queue.cancel(&a.id).await; queue.cancel(&c.id).await;
     }
@@ -518,16 +534,16 @@ mod tests {
             progress: None, error_message: None, result: None, target_id: None, created_at: now, updated_at: now,
         }).collect();
         std::fs::write(&path, serde_json::to_vec(&snapshots).unwrap()).unwrap();
-        let queue = TaskQueue::open(path.clone(), || Ok(())).unwrap();
+        let queue = TaskQueue::open(path.clone(), Arc::new(MutationLocks::unchecked())).unwrap();
         let tasks = queue.list().await;
         assert_eq!(tasks.len(), 256); assert_eq!(tasks.last().unwrap().status, TaskStatus::Failed);
-        let next = queue.enqueue("next", TaskKind::Smoke, None, |_| Box::pin(async { Ok(()) })).await;
+        let next = queue.enqueue("next", TaskKind::Smoke, None, None, |_| Box::pin(async { Ok(()) })).await;
         terminal(&queue, &next.id).await;
         assert_eq!(queue.list().await.len(), 256);
-        let recovered = TaskQueue::open(path.clone(), || Ok(())).unwrap();
+        let recovered = TaskQueue::open(path.clone(), Arc::new(MutationLocks::unchecked())).unwrap();
         assert_eq!(recovered.list().await.last().unwrap().status, TaskStatus::Completed);
         std::fs::write(&path, "broken").unwrap();
-        assert!(TaskQueue::open(path, || Ok(())).unwrap().list().await.is_empty());
+        assert!(TaskQueue::open(path, Arc::new(MutationLocks::unchecked())).unwrap().list().await.is_empty());
         assert!(std::fs::read_dir(&dir).unwrap().any(|e| e.unwrap().file_name().to_string_lossy().contains("invalid-")));
         std::fs::remove_dir_all(dir).unwrap();
     }

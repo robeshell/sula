@@ -6,6 +6,7 @@ use media_core::{AppDatabase, AvatarCache, ThumbnailCache};
 use renamer::{PresetManager, RenameUndoManager};
 use tokio::sync::Mutex;
 
+use crate::app::locks::MutationLocks;
 use crate::config::{AppConfig, ConfigStore};
 use crate::log_store::LogStore;
 use crate::task_queue::TaskQueue;
@@ -57,7 +58,8 @@ impl AppState {
             tracing::error!(%error, "media recovery pending; mutations remain blocked");
         }
         let recovery_db = Arc::clone(&db);
-        let tasks = Arc::new(TaskQueue::open(data_dir.join("task_history.json"), move || renamer::recover_media_operations(&recovery_db)).map_err(anyhow::Error::msg)?);
+        let locks = Arc::new(MutationLocks::for_database(Arc::clone(&db), move || renamer::recover_media_operations(&recovery_db)));
+        let tasks = Arc::new(TaskQueue::open(data_dir.join("task_history.json"), locks).map_err(anyhow::Error::msg)?);
         let thumbs = Arc::new(ThumbnailCache::open_default()?);
         let avatars = Arc::new(AvatarCache::open_default()?);
         let rename_undo = Arc::new(RenameUndoManager::open(

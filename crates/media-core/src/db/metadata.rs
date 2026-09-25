@@ -91,7 +91,7 @@ impl AppDatabase {
         &self,
         media_item_id: &str,
     ) -> Result<Option<MediaMetadata>, DatabaseError> {
-        self.with_conn(|conn| {
+        self.with_read_conn(|conn| {
             let mut stmt = conn.prepare(
                 "SELECT mediaItemId, overview, outline, tagline, genres, tags, rating, ratingVotes,
                         contentRating, director, writer, credits, studio, country, language,

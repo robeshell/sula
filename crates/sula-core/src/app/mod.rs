@@ -50,6 +50,8 @@ pub trait Events: Send + Sync {
     fn library_updated(&self);
     /// A task was queued or changed status, progress or result.
     fn task_updated(&self, _task: &crate::task_queue::TaskSnapshot) {}
+    /// Settings were saved.
+    fn config_changed(&self, _config: &crate::config::AppConfig) {}
 }
 
 pub fn err_string(err: impl ToString) -> String {

@@ -1,23 +1,19 @@
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
-use media_core::{AppDatabase, Library, MediaItem, MediaType, ScrapedStatus};
+use media_core::{Library, MediaItem, MediaType};
 use tauri::{AppHandle, Emitter, Manager, State};
 
-use crate::app::cleanup::SystemTrash;
-use crate::app::library::RefreshService;
 use crate::app::locks::LockScope;
-use crate::app::organize::{OrganizeService, ShowMergePair, ShowMergePlanDto};
-use crate::app::scrape::{localized_error, ScrapeService, ScrapeSettings};
+use crate::app::organize::{ShowMergePair, ShowMergePlanDto};
 use crate::app::{blocking, err_string, Events};
 use crate::config::AppConfig;
 use crate::state::{AppState, AppStatusDto};
+use crate::task_queue::TaskSnapshot;
 use sula_core::files::DirectoryEntryDto;
 use sula_core::media::{MediaDetailDto, MediaListPayload};
-use crate::task_queue::{TaskKind, TaskSnapshot};
 
-async fn ui_locale(state: &State<'_, AppState>) -> String {
-    state.config.lock().await.config.ui_locale.clone()
+async fn ui_locale(state: &AppState) -> String {
+    state.config().await.ui_locale
 }
 
 /// Forwards core events to the webview (`Events` belongs to sula-core, so the
@@ -32,12 +28,15 @@ impl Events for UiEvents {
     fn task_updated(&self, task: &TaskSnapshot) {
         let _ = self.0.emit("task-updated", task);
     }
-}
 
-/// Lock scope of the libraries the given items belong to.
-async fn items_scope(db: &Arc<AppDatabase>, item_ids: &[String]) -> Result<LockScope, String> {
-    let (db, ids) = (Arc::clone(db), item_ids.to_vec());
-    blocking(move || LockScope::for_items(&db, &ids)).await
+    fn config_changed(&self, config: &AppConfig) {
+        crate::tray::set_enabled(&self.0, config.tray_enabled);
+        crate::tray::set_locale(&self.0, &config.ui_locale);
+        #[cfg(target_os = "macos")]
+        crate::app_menu::set_locale(&self.0, &config.ui_locale);
+        // Other windows (main ↔ settings) keep their config in sync from this event.
+        let _ = self.0.emit("config-changed", config);
+    }
 }
 
 #[tauri::command]
@@ -47,111 +46,42 @@ pub async fn app_status(state: State<'_, AppState>) -> Result<AppStatusDto, Stri
 
 #[tauri::command]
 pub async fn get_config(state: State<'_, AppState>) -> Result<AppConfig, String> {
-    Ok(state.config.lock().await.config.clone())
+    Ok(state.config().await)
 }
 
 #[tauri::command]
-pub async fn save_config(
-    app: AppHandle,
-    state: State<'_, AppState>,
-    config: AppConfig,
-) -> Result<AppConfig, String> {
-    // Ordinary settings must not wait for a long scrape. Only a change of scan
-    // exclusions resets scan state, which has to stay out of a running refresh.
-    let exclusions_changed = state.config.lock().await.config.scan_excluded_folders != config.scan_excluded_folders;
-    let mutation_guard = if exclusions_changed { Some(state.tasks.locks().lock(&LockScope::Global).await?) } else { None };
-    let tray_enabled = config.tray_enabled;
-    let mut store = state.config.lock().await;
-    let old = store.config.clone();
-    let exclusions_changed = old.scan_excluded_folders != config.scan_excluded_folders;
-    if exclusions_changed && mutation_guard.is_none() {
-        return Err("settings changed concurrently; try again".into());
-    }
-    store.config = config;
-    if let Err(error) = store.save() {
-        store.config = old;
-        return Err(error.to_string());
-    }
-    if exclusions_changed {
-        for library in state.db.list_libraries().map_err(err_string)? {
-            state.db.clear_scan_states(&library.id).map_err(err_string)?;
-        }
-    }
-    let saved = store.config.clone();
-    drop(store);
-    state
-        .keep_running_on_close
-        .store(saved.keep_running_on_close, Ordering::Relaxed);
-    crate::tray::set_enabled(&app, tray_enabled);
-    crate::tray::set_locale(&app, &saved.ui_locale);
-    #[cfg(target_os = "macos")]
-    crate::app_menu::set_locale(&app, &saved.ui_locale);
-    // Other windows (main ↔ settings) keep their config in sync from this event.
-    let _ = app.emit("config-changed", &saved);
-    Ok(saved)
+pub async fn save_config(state: State<'_, AppState>, config: AppConfig) -> Result<AppConfig, String> {
+    state.save_config(config).await
 }
 
 #[tauri::command]
 pub async fn list_libraries(state: State<'_, AppState>) -> Result<Vec<Library>, String> {
-    state.db.list_libraries().map_err(err_string)
+    state.libraries().await
 }
 
 #[tauri::command]
 pub async fn add_library(
-    app: AppHandle,
     state: State<'_, AppState>,
     name: String,
     root_path: String,
     media_type: MediaType,
 ) -> Result<Library, String> {
-    // Only inserts a row and queues its first refresh; no files change here.
-    let name = name.trim().to_string();
-    if name.is_empty() {
-        return Err("library name is empty".into());
-    }
-    if root_path.trim().is_empty() {
-        return Err("library path is empty".into());
-    }
-    let library = Library::new(name, root_path, media_type);
-    state.db.insert_library(&library).map_err(err_string)?;
-    let _ = enqueue_refresh_inner(&app, &state, library.id.clone()).await?;
-    // Every window keeps its own library list (settings edits them too).
-    UiEvents(app.clone()).library_updated();
-    Ok(library)
+    state.add_library(name, root_path, media_type).await
 }
 
 #[tauri::command]
-pub async fn rename_library(
-    app: AppHandle,
-    state: State<'_, AppState>,
-    id: String,
-    name: String,
-) -> Result<Library, String> {
-    let name = name.trim().to_string();
-    if name.is_empty() {
-        return Err("library name is empty".into());
-    }
-    let mut library = state
-        .db
-        .get_library(&id)
-        .map_err(err_string)?
-        .ok_or_else(|| format!("library not found: {id}"))?;
-    library.name = name;
-    state.db.update_library(&library).map_err(err_string)?;
-    UiEvents(app.clone()).library_updated();
-    Ok(library)
+pub async fn rename_library(state: State<'_, AppState>, id: String, name: String) -> Result<Library, String> {
+    state.rename_library(id, name).await
 }
 
 #[tauri::command]
-pub async fn delete_library(
-    app: AppHandle,
-    state: State<'_, AppState>,
-    id: String,
-) -> Result<(), String> {
-    let _mutation_guard = state.tasks.locks().lock(&LockScope::library(&id)).await?;
-    state.db.delete_library(&id).map_err(err_string)?;
-    UiEvents(app.clone()).library_updated();
-    Ok(())
+pub async fn delete_library(state: State<'_, AppState>, id: String) -> Result<(), String> {
+    state.delete_library(id).await
+}
+
+#[tauri::command]
+pub async fn rebind_library(state: State<'_, AppState>, id: String, root_path: String) -> Result<Library, String> {
+    state.rebind_library(id, root_path).await
 }
 
 #[tauri::command]
@@ -159,38 +89,9 @@ pub async fn path_is_dir(path: String) -> Result<bool, String> {
     sula_core::files::path_is_dir(path).await
 }
 
-/// LIB-08: rebind library root when the previous path is stale / moved.
 #[tauri::command]
-pub async fn rebind_library(
-    app: AppHandle,
-    state: State<'_, AppState>,
-    id: String,
-    root_path: String,
-) -> Result<Library, String> {
-    // A new root can overlap other libraries, so rebinding excludes all of them.
-    let _mutation_guard = state.tasks.locks().lock(&LockScope::Global).await?;
-    let root_path = root_path.trim().to_string();
-    if root_path.is_empty() {
-        return Err("library path is empty".into());
-    }
-    if !std::path::Path::new(&root_path).is_dir() {
-        return Err("selected path is not a directory".into());
-    }
-    let mut library = state
-        .db
-        .get_library(&id)
-        .map_err(err_string)?
-        .ok_or_else(|| format!("library not found: {id}"))?;
-    library.root_path = root_path;
-    library.bookmark_data = None;
-    state.db.update_library(&library).map_err(err_string)?;
-    // Path changed → wipe scan state so next refresh re-bootstraps.
-    if let Err(error) = state.db.clear_scan_states(&library.id) {
-        tracing::warn!(library_id = %library.id, %error, "scan state not cleared after rebind");
-    }
-    let _ = enqueue_refresh_inner(&app, &state, library.id.clone()).await?;
-    UiEvents(app.clone()).library_updated();
-    Ok(library)
+pub async fn list_directory(path: String) -> Result<Vec<DirectoryEntryDto>, String> {
+    sula_core::files::list_directory(path).await
 }
 
 #[tauri::command]
@@ -201,55 +102,6 @@ pub async fn clear_thumbnail_cache(state: State<'_, AppState>) -> Result<usize, 
 #[tauri::command]
 pub async fn resolve_actor_avatar(state: State<'_, AppState>, url: String) -> Result<Option<String>, String> {
     Ok(state.actor_avatar(url).await?.map(|path| path.display().to_string()))
-}
-
-#[tauri::command]
-pub async fn list_media_items(state: State<'_, AppState>, library_id: String) -> Result<Vec<MediaItem>, String> {
-    state.media_items(library_id).await
-}
-
-#[tauri::command]
-pub async fn list_media_page(
-    state: State<'_, AppState>, library_id: String, offset: Option<u32>, limit: Option<u32>,
-) -> Result<MediaListPayload, String> {
-    state.media_page(library_id, offset, limit).await
-}
-
-/// Read-only preview of duplicate-show merges for a library or selected items, so
-/// the user sees exactly which folders would be absorbed before anything moves.
-#[tauri::command]
-pub async fn plan_show_merges(
-    state: State<'_, AppState>,
-    library_id: Option<String>,
-    item_ids: Option<Vec<String>>,
-) -> Result<Vec<ShowMergePlanDto>, String> {
-    let db = Arc::clone(&state.db);
-    blocking(move || crate::app::organize::plan_show_merges(&db, library_id, item_ids)).await
-}
-
-/// Execute merges the user confirmed from `plan_show_merges`. Each pair is checked
-/// again against the current index and skipped if the match changed meanwhile.
-#[tauri::command]
-pub async fn merge_planned_shows(
-    app: AppHandle,
-    state: State<'_, AppState>,
-    pairs: Vec<ShowMergePair>,
-) -> Result<u32, String> {
-    let db = Arc::clone(&state.db);
-    // Every library of every pair, locked in one sorted acquisition.
-    let scope = items_scope(&db, &crate::app::organize::merge_item_ids(&pairs)).await?;
-    let mutation_guard = state.tasks.locks().lock(&scope).await?;
-    let templates = state.config.lock().await.config.rename_templates();
-    blocking(move || {
-        let _mutation_guard = mutation_guard;
-        crate::app::organize::merge_planned_shows(&db, &pairs, &templates, &UiEvents(app.clone()))
-    })
-    .await
-}
-
-#[tauri::command]
-pub async fn get_media_detail(state: State<'_, AppState>, id: String) -> Result<MediaDetailDto, String> {
-    state.media_detail(id).await
 }
 
 #[tauri::command]
@@ -267,209 +119,74 @@ pub async fn resolve_poster_thumbnail(
 }
 
 #[tauri::command]
-pub async fn refresh_library(
-    app: AppHandle,
-    state: State<'_, AppState>,
-    library_id: String,
-) -> Result<TaskSnapshot, String> {
-    enqueue_refresh_inner(&app, &state, library_id).await
+pub async fn list_media_items(state: State<'_, AppState>, library_id: String) -> Result<Vec<MediaItem>, String> {
+    state.media_items(library_id).await
 }
 
 #[tauri::command]
-pub async fn refresh_media_items(
-    state: State<'_, AppState>,
-    item_ids: Vec<String>,
-) -> Result<TaskSnapshot, String> {
-    if item_ids.is_empty() {
-        return Err("no items selected".into());
-    }
-    let locale = ui_locale(&state).await;
-    let title = if item_ids.len() == 1 {
-        crate::ui_i18n::t(&locale, "task.refreshItems")
-    } else {
-        crate::ui_i18n::tf(&locale, "task.refreshItemsN", &[("n", &item_ids.len().to_string())])
-    };
-    let config_store = Arc::clone(&state.config);
-    let db = Arc::clone(&state.db);
-    let lock = items_scope(&db, &item_ids).await?;
-    let snapshot = state
-        .tasks
-        .enqueue_scoped(title, TaskKind::Refresh, item_ids.first().cloned(), task_scope("items", &item_ids), Some(lock), move |handle| {
-            Box::pin(async move {
-                let excluded_folders = config_store.lock().await.config.scan_excluded_folders.clone();
-                let service = RefreshService { db, excluded_folders, templates: Default::default(), locale };
-                service.refresh_items(item_ids, &handle).await
-            })
-        })
-        .await;
+pub async fn list_media_page(
+    state: State<'_, AppState>, library_id: String, offset: Option<u32>, limit: Option<u32>,
+) -> Result<MediaListPayload, String> {
+    state.media_page(library_id, offset, limit).await
+}
 
-    Ok(snapshot)
+#[tauri::command]
+pub async fn get_media_detail(state: State<'_, AppState>, id: String) -> Result<MediaDetailDto, String> {
+    state.media_detail(id).await
+}
+
+#[tauri::command]
+pub async fn plan_show_merges(
+    state: State<'_, AppState>,
+    library_id: Option<String>,
+    item_ids: Option<Vec<String>>,
+) -> Result<Vec<ShowMergePlanDto>, String> {
+    state.plan_show_merges(library_id, item_ids).await
+}
+
+#[tauri::command]
+pub async fn merge_planned_shows(state: State<'_, AppState>, pairs: Vec<ShowMergePair>) -> Result<u32, String> {
+    state.merge_planned_shows(pairs).await
 }
 
 #[tauri::command]
 pub async fn list_tasks(state: State<'_, AppState>) -> Result<Vec<TaskSnapshot>, String> {
-    Ok(state.tasks.list().await)
+    Ok(state.tasks().await)
 }
 
 #[tauri::command]
-pub async fn enqueue_smoke_task(
-    state: State<'_, AppState>,
-    title: Option<String>,
-) -> Result<TaskSnapshot, String> {
-    let snapshot = state
-        .tasks
-        .enqueue_smoke(title.unwrap_or_else(|| "M0 smoke task".into()))
-        .await;
-    Ok(snapshot)
+pub async fn enqueue_smoke_task(state: State<'_, AppState>, title: Option<String>) -> Result<TaskSnapshot, String> {
+    Ok(state.enqueue_smoke_task(title).await)
 }
 
 #[tauri::command]
 pub async fn cancel_task(state: State<'_, AppState>, id: String) -> Result<bool, String> {
-    Ok(state.tasks.cancel(&id).await)
-}
-
-async fn enqueue_refresh_inner(
-    app: &AppHandle,
-    state: &State<'_, AppState>,
-    library_id: String,
-) -> Result<TaskSnapshot, String> {
-    if let Some(existing) = state
-        .tasks
-        .find_active(TaskKind::Refresh, &library_id)
-        .await
-    {
-        let _ = app.emit("task-updated", &existing);
-        return Ok(existing);
-    }
-
-    let library = state
-        .db
-        .get_library(&library_id)
-        .map_err(err_string)?
-        .ok_or_else(|| format!("library not found: {library_id}"))?;
-    let locale = ui_locale(state).await;
-    let config_store = Arc::clone(&state.config);
-    let db = Arc::clone(&state.db);
-    let title = crate::ui_i18n::tf(&locale, "task.refreshLib", &[("name", &library.name)]);
-    let target_id = Some(library_id.clone());
-    let lock = Some(LockScope::library(&library_id));
-
-    let snapshot = state
-        .tasks
-        .enqueue_scoped(title, TaskKind::Refresh, target_id, task_scope("library", std::slice::from_ref(&library_id)), lock, move |handle| {
-            Box::pin(async move {
-                // Settings are read when the refresh starts, not when it was queued.
-                let config = config_store.lock().await.config.clone();
-                let service = RefreshService {
-                    db,
-                    excluded_folders: config.scan_excluded_folders.clone(),
-                    templates: config.rename_templates(),
-                    locale,
-                };
-                service.refresh_library(&library_id, &handle).await
-            })
-        })
-        .await;
-
-    Ok(snapshot)
+    Ok(state.cancel_task(id).await)
 }
 
 #[tauri::command]
-pub async fn scrape_library(
-    app: AppHandle,
-    state: State<'_, AppState>,
-    library_id: String,
-) -> Result<TaskSnapshot, String> {
-    let library = state
-        .db
-        .get_library(&library_id)
-        .map_err(err_string)?
-        .ok_or_else(|| format!("library not found: {library_id}"))?;
-    let config = state.config.lock().await.config.clone();
-    let title = crate::ui_i18n::tf(&config.ui_locale, "task.scrapeAll", &[("name", &library.name)]);
-    let target_id = Some(library_id.clone());
-
-    if let Some(existing) = state
-        .tasks
-        .find_active(TaskKind::BatchScrape, &library_id)
-        .await
-    {
-        let _ = app.emit("task-updated", &existing);
-        return Ok(existing);
-    }
-
-    // No held lock: the service fetches unlocked and locks the library only to write.
-    let service = scrape_service(&state, &config);
-    let snapshot = state
-        .tasks
-        .enqueue(title, TaskKind::BatchScrape, target_id, None, move |handle| {
-            Box::pin(async move { service.scrape_library(&library_id, &handle).await })
-        })
-        .await;
-
-    Ok(snapshot)
+pub async fn refresh_library(state: State<'_, AppState>, library_id: String) -> Result<TaskSnapshot, String> {
+    state.refresh_library(library_id).await
 }
 
 #[tauri::command]
-pub async fn scrape_items(
-    state: State<'_, AppState>,
-    item_ids: Vec<String>,
-) -> Result<TaskSnapshot, String> {
-    if item_ids.is_empty() {
-        return Err("no items selected".into());
-    }
-    let config = state.config.lock().await.config.clone();
-    let title = crate::ui_i18n::tf(&config.ui_locale, "task.scrapeN", &[("n", &item_ids.len().to_string())]);
-    let service = scrape_service(&state, &config);
-    let snapshot = state
-        .tasks
-        .enqueue_scoped(title, TaskKind::Scrape, item_ids.first().cloned(), task_scope("items", &item_ids), None, move |handle| {
-            Box::pin(async move { service.scrape_items(item_ids, &handle).await })
-        })
-        .await;
-
-    Ok(snapshot)
+pub async fn refresh_media_items(state: State<'_, AppState>, item_ids: Vec<String>) -> Result<TaskSnapshot, String> {
+    state.refresh_items(item_ids).await
 }
 
 #[tauri::command]
-pub async fn rescrape_items(
-    state: State<'_, AppState>,
-    item_ids: Vec<String>,
-) -> Result<TaskSnapshot, String> {
-    if item_ids.is_empty() {
-        return Err("no items selected".into());
-    }
-    let mut scraped_ids = Vec::new();
-    for id in &item_ids {
-        let item = state
-            .db
-            .get_media_item(id)
-            .map_err(err_string)?
-            .ok_or_else(|| format!("media item not found: {id}"))?;
-        if item.status == ScrapedStatus::Scraped {
-            scraped_ids.push(id.clone());
-        }
-    }
-    if scraped_ids.is_empty() {
-        return Err("no scraped items selected".into());
-    }
+pub async fn scrape_library(state: State<'_, AppState>, library_id: String) -> Result<TaskSnapshot, String> {
+    state.scrape_library(library_id).await
+}
 
-    let config = state.config.lock().await.config.clone();
-    let title = crate::ui_i18n::tf(&config.ui_locale, "task.rescrapeN", &[("n", &scraped_ids.len().to_string())]);
-    let service = scrape_service(&state, &config);
-    let snapshot = state
-        .tasks
-        .enqueue_scoped(
-            title,
-            TaskKind::Rescrape,
-            scraped_ids.first().cloned(),
-            task_scope("items", &scraped_ids),
-            None,
-            move |handle| Box::pin(async move { service.scrape_items(scraped_ids, &handle).await }),
-        )
-        .await;
+#[tauri::command]
+pub async fn scrape_items(state: State<'_, AppState>, item_ids: Vec<String>) -> Result<TaskSnapshot, String> {
+    state.scrape_items(item_ids).await
+}
 
-    Ok(snapshot)
+#[tauri::command]
+pub async fn rescrape_items(state: State<'_, AppState>, item_ids: Vec<String>) -> Result<TaskSnapshot, String> {
+    state.rescrape_items(item_ids).await
 }
 
 #[tauri::command]
@@ -478,136 +195,7 @@ pub async fn scrape_season(
     media_item_id: String,
     season_number: i32,
 ) -> Result<TaskSnapshot, String> {
-    let config = state.config.lock().await.config.clone();
-    let service = scrape_service(&state, &config);
-    let snapshot = state.tasks.enqueue_scoped(format!("Season {season_number}"), TaskKind::Scrape,
-        Some(media_item_id.clone()), task_scope("season", &[media_item_id.clone(), season_number.to_string()]), None,
-        move |handle| Box::pin(async move { service.scrape_season(&media_item_id, season_number, &handle).await })).await;
-    Ok(snapshot)
-}
-
-#[tauri::command]
-pub async fn apply_rename_templates(
-    state: State<'_, AppState>,
-    item_ids: Vec<String>,
-) -> Result<TaskSnapshot, String> {
-    if item_ids.is_empty() {
-        return Err("no items selected".into());
-    }
-    let config = state.config.lock().await.config.clone();
-    let title = crate::ui_i18n::tf(&config.ui_locale, "task.renameN", &[("n", &item_ids.len().to_string())]);
-    let lock = items_scope(&state.db, &item_ids).await?;
-    let service = organize_service(&state, &config);
-    let snapshot = state
-        .tasks
-        .enqueue_scoped(title, TaskKind::Rename, item_ids.first().cloned(), task_scope("items", &item_ids), Some(lock), move |handle| {
-            Box::pin(async move { service.apply_rename_templates(item_ids, &handle).await })
-        })
-        .await;
-
-    Ok(snapshot)
-}
-
-#[tauri::command]
-pub async fn organize_season_folders(
-    state: State<'_, AppState>,
-    item_ids: Vec<String>,
-) -> Result<TaskSnapshot, String> {
-    if item_ids.is_empty() {
-        return Err("no items selected".into());
-    }
-    let mut targets = Vec::new();
-    for id in &item_ids {
-        let item = state
-            .db
-            .get_media_item(id)
-            .map_err(err_string)?
-            .ok_or_else(|| format!("media item not found: {id}"))?;
-        if item.status == ScrapedStatus::Scraped
-            && matches!(item.media_type, MediaType::TvShow | MediaType::Anime)
-        {
-            targets.push(id.clone());
-        }
-    }
-    if targets.is_empty() {
-        return Err("no scraped tv/anime items selected".into());
-    }
-
-    let config = state.config.lock().await.config.clone();
-    let title = crate::ui_i18n::tf(&config.ui_locale, "task.organizeN", &[("n", &targets.len().to_string())]);
-    let lock = items_scope(&state.db, &targets).await?;
-    let service = organize_service(&state, &config);
-    let snapshot = state
-        .tasks
-        .enqueue_scoped(
-            title,
-            TaskKind::Organize,
-            targets.first().cloned(),
-            task_scope("items", &targets),
-            Some(lock),
-            move |handle| Box::pin(async move { service.organize_season_folders(targets, &handle).await }),
-        )
-        .await;
-
-    Ok(snapshot)
-}
-
-#[tauri::command]
-pub async fn scan_media_residuals(
-    state: State<'_, AppState>,
-    item_ids: Vec<String>,
-) -> Result<Vec<media_core::ResidualCandidate>, String> {
-    if item_ids.is_empty() {
-        return Err("no items selected".into());
-    }
-    let db = Arc::clone(&state.db);
-    tokio::task::spawn_blocking(move || media_core::find_residuals(&db, &item_ids))
-        .await
-        .map_err(|e| e.to_string())?
-        .map_err(err_string)
-}
-
-#[tauri::command]
-pub async fn cleanup_media_residuals(
-    state: State<'_, AppState>,
-    paths: Vec<String>,
-) -> Result<TaskSnapshot, String> {
-    if paths.is_empty() {
-        return Err("no residual files selected".into());
-    }
-    let locale = ui_locale(&state).await;
-    let title = crate::ui_i18n::tf(&locale, "task.cleanupN", &[("n", &paths.len().to_string())]);
-    let db = Arc::clone(&state.db);
-    // Candidates are revalidated across every library, so the job excludes all of them.
-    let snapshot = state
-        .tasks
-        .enqueue(title, TaskKind::Cleanup, None, Some(LockScope::Global), move |handle| {
-            Box::pin(async move { crate::app::cleanup::cleanup_residuals(db, paths, &locale, Arc::new(SystemTrash), &handle).await })
-        })
-        .await;
-
-    Ok(snapshot)
-}
-
-#[tauri::command]
-pub async fn delete_media_items(
-    app: AppHandle,
-    state: State<'_, AppState>,
-    item_ids: Vec<String>,
-    also_trash: bool,
-) -> Result<usize, String> {
-    let scope = items_scope(&state.db, &item_ids).await?;
-    let mutation_guard = state.tasks.locks().lock(&scope).await?;
-    if item_ids.is_empty() {
-        return Err("no items selected".into());
-    }
-
-    let db = Arc::clone(&state.db);
-    blocking(move || {
-        let _mutation_guard = mutation_guard;
-        crate::app::cleanup::delete_media_items(&db, &item_ids, also_trash, &SystemTrash, &UiEvents(app.clone()))
-    })
-    .await
+    state.scrape_season(media_item_id, season_number).await
 }
 
 #[tauri::command]
@@ -616,89 +204,41 @@ pub async fn search_match_candidates(
     query: String,
     media_type: MediaType,
 ) -> Result<Vec<scraper_kit::SearchResult>, String> {
-    let config = state.config.lock().await.config.clone();
-    let locale = config.ui_locale.clone();
-    let coordinator = scraper_kit::ScraperCoordinator::new(scraper_keys(&config));
-    coordinator
-        .search_manual(&query, media_type, &config.metadata_language)
-        .await
-        .map_err(|e| localized_error(&locale, e))
+    state.search_match_candidates(query, media_type).await
 }
 
 #[tauri::command]
-pub async fn apply_manual_match(
+pub async fn apply_manual_match(state: State<'_, AppState>, item_id: String, source_id: String) -> Result<TaskSnapshot, String> {
+    state.apply_manual_match(item_id, source_id).await
+}
+
+#[tauri::command]
+pub async fn apply_rename_templates(state: State<'_, AppState>, item_ids: Vec<String>) -> Result<TaskSnapshot, String> {
+    state.apply_rename_templates(item_ids).await
+}
+
+#[tauri::command]
+pub async fn organize_season_folders(state: State<'_, AppState>, item_ids: Vec<String>) -> Result<TaskSnapshot, String> {
+    state.organize_season_folders(item_ids).await
+}
+
+#[tauri::command]
+pub async fn scan_media_residuals(
     state: State<'_, AppState>,
-    item_id: String,
-    source_id: String,
-) -> Result<TaskSnapshot, String> {
-    let config = state.config.lock().await.config.clone();
-    let item = state
-        .db
-        .get_media_item(&item_id)
-        .map_err(err_string)?
-        .ok_or_else(|| format!("media item not found: {item_id}"))?;
-    let title = crate::ui_i18n::tf(
-        &config.ui_locale,
-        "task.manualMatch",
-        &[("title", &item.title)],
-    );
-    let target_id = Some(item_id.clone());
-    let service = scrape_service(&state, &config);
-
-    let snapshot = state
-        .tasks
-        .enqueue_scoped(title, TaskKind::ManualMatch, target_id, task_scope("match", &[item_id.clone(), source_id.clone()]), None, move |handle| {
-            Box::pin(async move { service.apply_manual_match(&item, &source_id, &handle).await })
-        })
-        .await;
-
-    Ok(snapshot)
+    item_ids: Vec<String>,
+) -> Result<Vec<media_core::ResidualCandidate>, String> {
+    state.scan_residuals(item_ids).await
 }
 
-fn scrape_options_from_config(config: &AppConfig) -> scraper_kit::ScrapeOptions {
-    scraper_kit::ScrapeOptions {
-        language: config.metadata_language.clone(),
-        concurrency: config.scrape_concurrency.max(1) as usize,
-        keys: scraper_keys(config),
-    }
+#[tauri::command]
+pub async fn cleanup_media_residuals(state: State<'_, AppState>, paths: Vec<String>) -> Result<TaskSnapshot, String> {
+    state.cleanup_residuals(paths).await
 }
 
-fn scraper_keys(config: &AppConfig) -> scraper_kit::ScraperKeys {
-    scraper_kit::ScraperKeys {
-        tmdb: config.api_keys.tmdb.clone(),
-        bangumi: config.api_keys.bangumi.clone(),
-        omdb: config.api_keys.omdb.clone(),
-        tvdb: config.api_keys.tvdb.clone(),
-    }
+#[tauri::command]
+pub async fn delete_media_items(state: State<'_, AppState>, item_ids: Vec<String>, also_trash: bool) -> Result<usize, String> {
+    state.delete_media_items(item_ids, also_trash).await
 }
-
-fn scrape_service(state: &State<'_, AppState>, config: &AppConfig) -> ScrapeService<scraper_kit::ScrapeClient> {
-    let options = scrape_options_from_config(config);
-    ScrapeService {
-        db: Arc::clone(&state.db),
-        locks: Arc::clone(state.tasks.locks()),
-        source: Arc::new(scraper_kit::ScrapeClient::new(&options)),
-        settings: ScrapeSettings {
-            concurrency: options.concurrency,
-            nfo_format: config.nfo_format.clone(),
-            locale: config.ui_locale.clone(),
-            templates: config.rename_templates(),
-            auto_rename: config.rename_auto_after_scrape,
-            create_season_folders: config.rename_create_season_folders,
-        },
-    }
-}
-
-fn organize_service(state: &State<'_, AppState>, config: &AppConfig) -> OrganizeService {
-    OrganizeService {
-        db: Arc::clone(&state.db),
-        templates: config.rename_templates(),
-        create_season_folders: config.rename_create_season_folders,
-        locale: config.ui_locale.clone(),
-    }
-}
-
-
 
 #[tauri::command]
 pub async fn open_renamer_window(app: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
@@ -983,10 +523,6 @@ pub async fn clear_logs(state: State<'_, AppState>) -> Result<(), String> {
     Ok(())
 }
 
-#[tauri::command]
-pub async fn list_directory(path: String) -> Result<Vec<DirectoryEntryDto>, String> {
-    sula_core::files::list_directory(path).await
-}
 
 /// Reveal a file/folder in the OS file manager (Explorer / Finder / …).
 ///
@@ -1058,8 +594,3 @@ fn collect_paths_into(
     Ok(())
 }
 
-
-fn task_scope(label: &str, ids: &[String]) -> Option<String> {
-    let mut ids = ids.to_vec(); ids.sort(); ids.dedup();
-    Some(format!("{label}:{}", serde_json::to_string(&ids).expect("string list")))
-}

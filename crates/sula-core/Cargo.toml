@@ -12,6 +12,7 @@ dirs.workspace = true
 keyring = { version = "3.6.3", features = ["apple-native", "windows-native", "sync-secret-service", "crypto-rust"] }
 media-core.workspace = true
 renamer.workspace = true
+reqwest.workspace = true
 scraper-kit.workspace = true
 serde.workspace = true
 serde_json.workspace = true

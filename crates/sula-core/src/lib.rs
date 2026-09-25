@@ -5,7 +5,10 @@
 pub mod app;
 pub mod config;
 pub mod credentials;
+pub mod files;
+pub mod images;
 pub mod log_store;
+pub mod media;
 pub mod state;
 pub mod task_queue;
 pub mod ui_i18n;

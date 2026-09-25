@@ -1,11 +1,7 @@
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
-use media_core::{
-    AppDatabase, Library, MediaItem, MediaMetaSummary, MediaMetadata, MediaType, ScrapedStatus, ShowListStats,
-    TvEpisode, TvSeason,
-};
-use serde::Serialize;
+use media_core::{AppDatabase, Library, MediaItem, MediaType, ScrapedStatus};
 use tauri::{AppHandle, Emitter, Manager, State};
 
 use crate::app::cleanup::SystemTrash;
@@ -15,7 +11,9 @@ use crate::app::organize::{OrganizeService, ShowMergePair, ShowMergePlanDto};
 use crate::app::scrape::{localized_error, ScrapeService, ScrapeSettings};
 use crate::app::{blocking, err_string, Events};
 use crate::config::AppConfig;
-use crate::state::{AppState, AppStatusDto, CratesDto};
+use crate::state::{AppState, AppStatusDto};
+use sula_core::files::DirectoryEntryDto;
+use sula_core::media::{MediaDetailDto, MediaListPayload};
 use crate::task_queue::{TaskKind, TaskSnapshot};
 
 async fn ui_locale(state: &State<'_, AppState>) -> String {
@@ -44,21 +42,7 @@ async fn items_scope(db: &Arc<AppDatabase>, item_ids: &[String]) -> Result<LockS
 
 #[tauri::command]
 pub async fn app_status(state: State<'_, AppState>) -> Result<AppStatusDto, String> {
-    let library_count = state.db.library_count().map_err(err_string)?;
-    let config = state.config.lock().await.config.clone();
-    Ok(AppStatusDto {
-        app_name: "Sula".into(),
-        version: env!("CARGO_PKG_VERSION").into(),
-        data_dir: state.data_dir.display().to_string(),
-        database_path: state.db.path().display().to_string(),
-        library_count,
-        config,
-        crates: CratesDto {
-            media_core: "media-core".into(),
-            scraper_kit: scraper_kit::crate_name().into(),
-            renamer: renamer::crate_name().into(),
-        },
-    })
+    state.status().await
 }
 
 #[tauri::command]
@@ -172,11 +156,7 @@ pub async fn delete_library(
 
 #[tauri::command]
 pub async fn path_is_dir(path: String) -> Result<bool, String> {
-    blocking(move || path_is_dir_sync(path)).await
-}
-
-fn path_is_dir_sync(path: String) -> Result<bool, String> {
-    Ok(std::path::Path::new(path.trim()).is_dir())
+    sula_core::files::path_is_dir(path).await
 }
 
 /// LIB-08: rebind library root when the previous path is stale / moved.
@@ -215,125 +195,24 @@ pub async fn rebind_library(
 
 #[tauri::command]
 pub async fn clear_thumbnail_cache(state: State<'_, AppState>) -> Result<usize, String> {
-    let (thumbs, avatars) = (Arc::clone(&state.thumbs), Arc::clone(&state.avatars));
-    blocking(move || clear_thumbnail_cache_sync(&thumbs, &avatars)).await
-}
-
-fn clear_thumbnail_cache_sync(thumbs: &media_core::ThumbnailCache, avatars: &media_core::AvatarCache) -> Result<usize, String> {
-    let thumbs = thumbs.clear_all().map_err(err_string)?;
-    let avatars = avatars.clear().map_err(err_string)?;
-    Ok(thumbs + avatars)
-}
-
-const MAX_AVATAR_BYTES: usize = 10 * 1024 * 1024;
-
-fn is_public_http_url(url: &reqwest::Url) -> bool {
-    if !matches!(url.scheme(), "http" | "https") {
-        return false;
-    }
-    let Some(host) = url.host_str() else { return false };
-    let host = host.trim_start_matches('[').trim_end_matches(']').trim_end_matches('.').to_ascii_lowercase();
-    match host.parse::<std::net::IpAddr>() {
-        Ok(std::net::IpAddr::V4(ip)) => {
-            !(ip.is_loopback() || ip.is_private() || ip.is_link_local() || ip.is_unspecified() || ip.is_broadcast())
-        }
-        Ok(std::net::IpAddr::V6(ip)) => {
-            let unique_local = (ip.segments()[0] & 0xfe00) == 0xfc00;
-            let link_local = (ip.segments()[0] & 0xffc0) == 0xfe80;
-            !(ip.is_loopback() || ip.is_unspecified() || unique_local || link_local)
-                && ip.to_ipv4_mapped().is_none_or(|v4| !(v4.is_loopback() || v4.is_private()))
-        }
-        Err(_) => host != "localhost" && !host.ends_with(".localhost") && !host.ends_with(".local"),
-    }
+    state.clear_image_caches().await
 }
 
 #[tauri::command]
-pub async fn resolve_actor_avatar(
-    state: State<'_, AppState>,
-    url: String,
-) -> Result<Option<String>, String> {
-    let url = url.trim().to_string();
-    if url.is_empty() {
-        return Ok(None);
-    }
-    if let Some(cached) = state.avatars.cached_path(&url) {
-        return Ok(Some(cached.display().to_string()));
-    }
-    // The URL comes from scraped metadata: only fetch public http(s) hosts, also
-    // after redirects, and cap the body so a hostile source can't fill the disk.
-    let parsed = reqwest::Url::parse(&url).map_err(err_string)?;
-    if !is_public_http_url(&parsed) {
-        return Ok(None);
-    }
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(20))
-        .redirect(reqwest::redirect::Policy::custom(|attempt| {
-            if attempt.previous().len() >= 5 || !is_public_http_url(attempt.url()) {
-                attempt.stop()
-            } else {
-                attempt.follow()
-            }
-        }))
-        .build()
-        .map_err(err_string)?;
-    let mut response = client.get(parsed).send().await.map_err(|e| e.without_url().to_string())?;
-    if !response.status().is_success() {
-        return Ok(None);
-    }
-    let mut bytes = Vec::new();
-    while let Some(chunk) = response.chunk().await.map_err(|e| e.without_url().to_string())? {
-        if bytes.len() + chunk.len() > MAX_AVATAR_BYTES {
-            return Ok(None);
-        }
-        bytes.extend_from_slice(&chunk);
-    }
-    let avatars = Arc::clone(&state.avatars);
-    let stored = tokio::task::spawn_blocking(move || avatars.store(&url, &bytes))
-        .await
-        .map_err(|e| e.to_string())?
-        .map_err(err_string)?;
-    Ok(Some(stored.display().to_string()))
+pub async fn resolve_actor_avatar(state: State<'_, AppState>, url: String) -> Result<Option<String>, String> {
+    Ok(state.actor_avatar(url).await?.map(|path| path.display().to_string()))
 }
 
 #[tauri::command]
-pub async fn list_media_items(
-    state: State<'_, AppState>,
-    library_id: String,
-) -> Result<Vec<MediaItem>, String> {
-    let db = Arc::clone(&state.db);
-    blocking(move || list_media_items_sync(&db, &library_id)).await
-}
-
-fn list_media_items_sync(db: &media_core::AppDatabase, library_id: &str) -> Result<Vec<MediaItem>, String> {
-    db.list_media_items(library_id).map_err(err_string)
-}
-
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct MediaListPayload {
-    pub next_offset: Option<u32>,
-    pub items: Vec<MediaItem>,
-    pub metadata: Vec<MediaMetaSummary>,
-    pub show_stats: Vec<ShowListStats>,
+pub async fn list_media_items(state: State<'_, AppState>, library_id: String) -> Result<Vec<MediaItem>, String> {
+    state.media_items(library_id).await
 }
 
 #[tauri::command]
 pub async fn list_media_page(
     state: State<'_, AppState>, library_id: String, offset: Option<u32>, limit: Option<u32>,
 ) -> Result<MediaListPayload, String> {
-    let db = Arc::clone(&state.db);
-    blocking(move || list_media_page_sync(&db, &library_id, offset, limit)).await
-}
-
-fn list_media_page_sync(db: &media_core::AppDatabase, library_id: &str, offset: Option<u32>, limit: Option<u32>) -> Result<MediaListPayload, String> {
-    let offset = offset.unwrap_or(0);
-    let limit = limit.unwrap_or(256).clamp(1, 512);
-    let items = db.list_media_items_page(library_id, offset, limit).map_err(err_string)?;
-    let ids = serde_json::to_string(&items.iter().map(|i| &i.id).collect::<Vec<_>>()).map_err(err_string)?;
-    let metadata = db.list_metadata_summaries_for_ids(&ids).map_err(err_string)?;
-    let show_stats = db.list_show_stats_for_ids(&ids).map_err(err_string)?;
-    let next_offset = if items.len() == limit as usize { offset.checked_add(limit) } else { None };
-    Ok(MediaListPayload { items, metadata, show_stats, next_offset })
+    state.media_page(library_id, offset, limit).await
 }
 
 /// Read-only preview of duplicate-show merges for a library or selected items, so
@@ -368,49 +247,9 @@ pub async fn merge_planned_shows(
     .await
 }
 
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct MediaDetailDto {
-    pub item: MediaItem,
-    pub metadata: Option<MediaMetadata>,
-    pub seasons: Vec<TvSeason>,
-    pub episodes: Vec<TvEpisode>,
-}
-
 #[tauri::command]
-pub async fn get_media_detail(
-    state: State<'_, AppState>,
-    id: String,
-) -> Result<MediaDetailDto, String> {
-    let db = Arc::clone(&state.db);
-    blocking(move || get_media_detail_sync(&db, id)).await
-}
-
-fn get_media_detail_sync(db: &media_core::AppDatabase, id: String) -> Result<MediaDetailDto, String> {
-    let item = db
-        .get_media_item(&id)
-        .map_err(err_string)?
-        .ok_or_else(|| format!("media item not found: {id}"))?;
-    let metadata = db.fetch_metadata(&id).map_err(err_string)?;
-    let (seasons, episodes) = if matches!(
-        item.media_type,
-        MediaType::TvShow | MediaType::Anime
-    ) {
-        let seasons = db.fetch_seasons(&id).map_err(err_string)?;
-        let mut episodes = Vec::new();
-        for season in &seasons {
-            episodes.extend(db.fetch_episodes(&season.id).map_err(err_string)?);
-        }
-        (seasons, episodes)
-    } else {
-        (Vec::new(), Vec::new())
-    };
-    Ok(MediaDetailDto {
-        item,
-        metadata,
-        seasons,
-        episodes,
-    })
+pub async fn get_media_detail(state: State<'_, AppState>, id: String) -> Result<MediaDetailDto, String> {
+    state.media_detail(id).await
 }
 
 #[tauri::command]
@@ -422,35 +261,9 @@ pub async fn resolve_poster_thumbnail(
     height: Option<u32>,
     allow_fallbacks: Option<bool>,
 ) -> Result<Option<String>, String> {
-    let width = width.unwrap_or(media_core::POSTER_THUMB_WIDTH);
-    let height = height.unwrap_or(media_core::POSTER_THUMB_HEIGHT);
-    let allow_fallbacks = allow_fallbacks.unwrap_or(true);
-    let (db, thumbs) = (Arc::clone(&state.db), Arc::clone(&state.thumbs));
-    blocking(move || {
-        let Some(source) = media_core::ThumbnailCache::resolve_poster_source_with_fallbacks(
-            &folder_path,
-            &poster_path,
-            allow_fallbacks,
-        ) else {
-            return Ok(None);
-        };
-        // Thumbnails land in a webview-readable cache: only images inside a library.
-        let canonical = media_core::scanner::canonicalize_lossy(std::path::Path::new(&source));
-        let inside_library = db.list_libraries().map_err(err_string)?.iter().any(|library| {
-            let root = media_core::scanner::canonicalize_lossy(std::path::Path::new(&library.root_path));
-            media_core::db::path_rooted_under(&canonical, &root)
-        });
-        if !inside_library {
-            return Ok(None);
-        }
-        match thumbs.ensure(&source, width, height) {
-            // Return cache file path; frontend uses convertFileSrc (faster than base64 IPC).
-            Ok(path) => Ok(Some(path.display().to_string())),
-            Err(media_core::ThumbnailError::Missing(_)) => Ok(None),
-            Err(err) => Err(err.to_string()),
-        }
-    })
-    .await
+    // A cache file path; the frontend loads it through convertFileSrc.
+    let path = state.poster_thumbnail(folder_path, poster_path, width, height, allow_fallbacks).await?;
+    Ok(path.map(|path| path.display().to_string()))
 }
 
 #[tauri::command]
@@ -1170,61 +983,9 @@ pub async fn clear_logs(state: State<'_, AppState>) -> Result<(), String> {
     Ok(())
 }
 
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct DirectoryEntryDto {
-    pub name: String,
-    pub path: String,
-    pub is_directory: bool,
-    pub file_size: Option<u64>,
-    pub modified_at: Option<String>,
-}
-
 #[tauri::command]
 pub async fn list_directory(path: String) -> Result<Vec<DirectoryEntryDto>, String> {
-    blocking(move || list_directory_sync(path)).await
-}
-
-fn list_directory_sync(path: String) -> Result<Vec<DirectoryEntryDto>, String> {
-    let root = std::path::PathBuf::from(&path);
-    if !root.is_dir() {
-        return Err("path is not a directory".into());
-    }
-    let mut out = Vec::new();
-    let rd = std::fs::read_dir(&root).map_err(err_string)?;
-    for entry in rd {
-        let entry = entry.map_err(err_string)?;
-        let name = entry.file_name().to_string_lossy().into_owned();
-        if name.starts_with('.') {
-            continue;
-        }
-        let child = entry.path();
-        let meta = entry.metadata().ok();
-        let is_directory = meta.as_ref().map(|m| m.is_dir()).unwrap_or(false);
-        let file_size = meta
-            .as_ref()
-            .filter(|m| m.is_file())
-            .map(|m| m.len());
-        let modified_at = meta
-            .and_then(|m| m.modified().ok())
-            .map(|t| {
-                let dt: chrono::DateTime<chrono::Local> = t.into();
-                dt.format("%Y-%m-%d").to_string()
-            });
-        out.push(DirectoryEntryDto {
-            name,
-            path: child.to_string_lossy().into_owned(),
-            is_directory,
-            file_size,
-            modified_at,
-        });
-    }
-    out.sort_by(|a, b| match (a.is_directory, b.is_directory) {
-        (true, false) => std::cmp::Ordering::Less,
-        (false, true) => std::cmp::Ordering::Greater,
-        _ => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
-    });
-    Ok(out)
+    sula_core::files::list_directory(path).await
 }
 
 /// Reveal a file/folder in the OS file manager (Explorer / Finder / …).
@@ -1301,21 +1062,4 @@ fn collect_paths_into(
 fn task_scope(label: &str, ids: &[String]) -> Option<String> {
     let mut ids = ids.to_vec(); ids.sort(); ids.dedup();
     Some(format!("{label}:{}", serde_json::to_string(&ids).expect("string list")))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::is_public_http_url;
-
-    #[test]
-    fn avatar_urls_must_be_public_http() {
-        let ok = |raw: &str| is_public_http_url(&reqwest::Url::parse(raw).unwrap());
-        assert!(ok("https://image.tmdb.org/t/p/w185/a.jpg"));
-        assert!(ok("http://lain.bgm.tv/pic/crt/l/a.jpg"));
-        for bad in ["file:///etc/passwd", "http://localhost:8080/x", "http://127.0.0.1/x", "http://10.0.0.5/x",
-            "http://192.168.1.2/x", "http://169.254.169.254/latest", "http://[::1]/x", "http://[fd00::1]/x",
-            "http://nas.local/x", "http://[::ffff:127.0.0.1]/x"] {
-            assert!(!ok(bad), "{bad}");
-        }
-    }
 }

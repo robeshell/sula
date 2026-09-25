@@ -290,3 +290,12 @@
 .sl-logs { flex: 1; min-height: 0; overflow: auto; }
 /* Windows draws its own caption buttons over the top-right corner. */
 :root[data-window-chrome="immersive"] .sl-toolbar { padding-right: calc(14px + var(--kg-caption-width)); }
+.sl-file { display: flex; width: 100%; align-items: center; gap: 9px; min-height: 38px; padding: 4px 8px; border-radius: 6px; text-align: left; }
+.sl-file:hover:not(:disabled) { background: var(--kg-subtle-fill); }
+.sl-file:disabled { cursor: default; }
+.sl-file > svg { width: 16px; height: 16px; flex: none; color: var(--kg-text-tertiary); }
+.sl-file > svg.dir { color: var(--kg-accent); }
+.sl-file > svg.go { width: 13px; height: 13px; }
+.sl-file .nm { display: grid; flex: 1; min-width: 0; }
+.sl-file .nm b { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 12.5px; font-weight: 500; color: var(--kg-text-primary); }
+.sl-file .nm small { font-size: 11px; color: var(--kg-text-secondary); font-variant-numeric: tabular-nums; }

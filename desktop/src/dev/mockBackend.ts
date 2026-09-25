@@ -154,7 +154,7 @@ const config = {
   renameTvShowFolderTemplate: "{title} ({year})", renameSeasonFolderTemplate: "Season {season:2}",
   renameEpisodeFileTemplate: "{title} - S{season:2}E{episode:2} - {episodeTitle}",
   appearance: "system", accent: "indigo", trayEnabled: true, keepRunningOnClose: true, uiLocale: "zh-Hans",
-  apiKeys: { tmdb: "", tvdb: "", omdb: "", bangumi: "" },
+  apiKeys: { tmdb: "mock-token", tvdb: "", omdb: "", bangumi: "" },
 };
 
 const now = () => new Date().toISOString();
@@ -206,7 +206,14 @@ export function installMockBackend() {
         { source: "tmdb", sourceId: "tmdb:2", title: "完美的日子", originalTitle: "Perfect Days", year: 2024, overview: null, posterUrl: null, confidence: 0.61, mediaType: "movie" },
       ];
       case "plan_show_merges": return [];
-      case "scan_media_residuals": return [];
+      case "scan_media_residuals": return (args.itemIds ?? []).slice(0, 1).flatMap((id: string) => {
+        const item = items.find((i) => i.id === id);
+        if (!item) return [];
+        return [
+          { path: `${item.folderPath}/${item.title}.2019.1080p.nfo`, itemId: id, itemTitle: item.title, reason: "orphanNfo", size: 4213 },
+          { path: `${item.folderPath}/poster (1).jpg`, itemId: id, itemTitle: item.title, reason: "duplicateArtwork", size: 845_120 },
+        ];
+      });
       case "renamer_snapshot_count": return 0;
       case "renamer_list_presets": return [];
       case "renamer_auto_load_pipeline": return null;
@@ -220,7 +227,12 @@ export function installMockBackend() {
         const newName = f.originalName.replace(/^\[[^\]]*\]\s*/, "").replace(/ \[[^\]]*\]/, "").replace("Sousou no Frieren", "葬送的芙莉莲");
         return { id: f.id, originalName: f.originalName, newName, path: f.path, hasConflict: i === 4, hasInvalidChars: false };
       });
-      case "list_directory": return [];
+      case "list_directory": return [
+        { name: "Season 01", path: `${args.path}/Season 01`, isDirectory: true, modifiedAt: now().slice(0, 10) },
+        { name: "extrafanart", path: `${args.path}/extrafanart`, isDirectory: true, modifiedAt: now().slice(0, 10) },
+        { name: "poster.jpg", path: `${args.path}/poster.jpg`, isDirectory: false, fileSize: 845_120, modifiedAt: now().slice(0, 10) },
+        { name: "tvshow.nfo", path: `${args.path}/tvshow.nfo`, isDirectory: false, fileSize: 6_210, modifiedAt: now().slice(0, 10) },
+      ];
       case "path_is_dir": return true;
       case "refresh_library": case "scrape_library": case "scrape_items": case "rescrape_items":
       case "refresh_media_items": case "apply_rename_templates": case "organize_season_folders": case "scrape_season": {

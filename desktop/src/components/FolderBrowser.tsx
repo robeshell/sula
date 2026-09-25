@@ -1,5 +1,6 @@
 import { Button } from "./ui/button";
 import { useEffect, useState } from "react";
+import { ChevronLeft, ChevronRight, File, Folder } from "lucide-react";
 import { useTranslation } from "react-i18next";
 import { invoke } from "@tauri-apps/api/core";
 
@@ -80,9 +81,9 @@ export function FolderBrowser({
   return (
     <div className="flex min-h-0 flex-1 flex-col overflow-hidden">
       <div className="flex shrink-0 items-center gap-2 border-b border-hairline px-3 py-2">
-        <Button variant="ghost" size="sm" type="button" className="shrink-0" onClick={onClose}>
-          ← {t("browser.back")}
-        </Button>
+        <button type="button" className="sl-iconbtn back shrink-0" aria-label={t("browser.back")} title={t("browser.back")} onClick={onClose}>
+          <ChevronLeft aria-hidden />
+        </button>
         <nav className="flex min-w-0 flex-1 items-center gap-1 overflow-x-auto kg-type-body-secondary">
           {segments.map((seg, i) => (
             <span key={seg.path} className="flex shrink-0 items-center gap-1">
@@ -111,35 +112,24 @@ export function FolderBrowser({
         ) : entries.length === 0 ? (
           <p className="px-2 py-8 text-center kg-type-body-secondary text-fg-muted">{t("browser.empty")}</p>
         ) : (
-          <ul className="space-y-0.5">
-            {entries.map((entry) => (
+          <ul>
+            {entries.map((entry) => {
+              const meta = [!entry.isDirectory && entry.fileSize != null ? formatBytes(entry.fileSize) : null, entry.modifiedAt]
+                .filter(Boolean)
+                .join(" · ");
+              return (
               <li key={entry.path}>
-                <Button variant="plain" size="none"
-                  type="button"
-                  className="flex w-full items-center gap-2 rounded-control px-2 py-1.5 text-left kg-type-body-secondary hover:bg-subtle"
-                  onClick={() => enter(entry)}
-                  onDoubleClick={() => {
-                    if (!entry.isDirectory) {
-                      /* files: no-op beyond reveal elsewhere */
-                    }
-                  }}
-                  disabled={!entry.isDirectory}
-                >
-                  <span className="w-5 shrink-0 text-fg-muted">
-                    {entry.isDirectory ? "▸" : "·"}
+                <button type="button" className="sl-file" disabled={!entry.isDirectory} onClick={() => enter(entry)} title={entry.path}>
+                  {entry.isDirectory ? <Folder aria-hidden className="dir" /> : <File aria-hidden />}
+                  <span className="nm">
+                    <b>{entry.name}</b>
+                    {meta ? <small>{meta}</small> : null}
                   </span>
-                  <span className="min-w-0 flex-1 truncate font-medium text-fg">{entry.name}</span>
-                  {!entry.isDirectory && entry.fileSize != null ? (
-                    <span className="shrink-0 kg-type-caption text-fg-muted">
-                      {formatBytes(entry.fileSize)}
-                    </span>
-                  ) : null}
-                  {entry.modifiedAt ? (
-                    <span className="shrink-0 kg-type-caption text-fg-muted">{entry.modifiedAt}</span>
-                  ) : null}
-                </Button>
+                  {entry.isDirectory ? <ChevronRight aria-hidden className="go" /> : null}
+                </button>
               </li>
-            ))}
+              );
+            })}
           </ul>
         )}
       </div>

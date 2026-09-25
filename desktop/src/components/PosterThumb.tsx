@@ -115,7 +115,7 @@ export function PosterThumb({
           className="h-full w-full object-cover"
         />
       ) : src === null ? (
-        <span className="flex h-full w-full items-center justify-center px-1 text-center kg-type-caption-small font-semibold leading-tight text-fg-muted">
+        <span className="flex h-full w-full items-center justify-center overflow-hidden px-2 text-center [overflow-wrap:anywhere] kg-type-caption-small font-semibold leading-tight text-fg-muted">
           {fallbackLabel || "—"}
         </span>
       ) : (

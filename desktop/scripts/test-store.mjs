@@ -1,14 +1,63 @@
 import assert from 'node:assert/strict';
-import { readFileSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import { createRequire } from 'node:module';
+import path from 'node:path';
 import { test } from 'node:test';
+import { fileURLToPath } from 'node:url';
 import ts from 'typescript';
 
 const require = createRequire(import.meta.url);
-const source = readFileSync(new URL('../src/store/appStore.ts', import.meta.url), 'utf8');
-const { outputText } = ts.transpileModule(source, {
-  compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2020 },
-});
+const srcDir = fileURLToPath(new URL('../src/', import.meta.url));
+const storeDir = path.join(srcDir, 'store');
+const entry = path.join(storeDir, 'appStore.ts');
+
+// Transpiled output is cached across tests; module *evaluation* is not (see loadStore).
+const transpiled = new Map();
+function transpile(file) {
+  if (!transpiled.has(file)) {
+    const { outputText } = ts.transpileModule(readFileSync(file, 'utf8'), {
+      compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2020 },
+      fileName: file,
+    });
+    transpiled.set(file, outputText);
+  }
+  return transpiled.get(file);
+}
+
+function resolveTs(base) {
+  for (const candidate of [`${base}.ts`, `${base}.tsx`, path.join(base, 'index.ts'), path.join(base, 'index.tsx')]) {
+    if (existsSync(candidate)) return candidate;
+  }
+  throw new Error(`cannot resolve ${base}`);
+}
+
+/**
+ * Load appStore.ts and its relative TS imports with a fresh module cache, so
+ * module-level state (request tokens, reload queue, toast timer) resets per test.
+ * Mocks are keyed like the specifiers written in src/store/appStore.ts; relative
+ * keys are resolved against src/store, so a slice importing '../../lib/notify'
+ * from src/store/slices gets the same mock as '../lib/notify'.
+ */
+function loadStore(mocks) {
+  const mockByPath = new Map();
+  for (const [id, mock] of Object.entries(mocks)) {
+    mockByPath.set(id.startsWith('.') ? path.resolve(storeDir, id) : id, mock);
+  }
+  const cache = new Map();
+  const load = (file) => {
+    if (cache.has(file)) return cache.get(file).exports;
+    const module = { exports: {} };
+    cache.set(file, module);
+    const localRequire = (id) => {
+      const key = id.startsWith('.') ? path.resolve(path.dirname(file), id) : id;
+      if (mockByPath.has(key)) return mockByPath.get(key);
+      return id.startsWith('.') ? load(resolveTs(key)) : require(id);
+    };
+    new Function('require', 'exports', 'module', transpile(file))(localRequire, module.exports, module);
+    return module.exports;
+  };
+  return load(entry);
+}
 
 function setup() {
   const pending = [];
@@ -32,11 +81,8 @@ function setup() {
       invalidatePosterFolders: (folders) => { const list = [...folders]; if (list.length) posterInvalidations.push(list.sort()); },
     },
   };
-  const exports = {};
-  new Function('require', 'exports', outputText)(
-    (id) => id in mocks ? mocks[id] : require(id), exports,
-  );
-  return { store: exports.useAppStore, pending, posterInvalidations };
+  const { useAppStore } = loadStore(mocks);
+  return { store: useAppStore, pending, posterInvalidations };
 }
 const page = (id) => ({ items: [{ id }], metadata: [], showStats: [] });
 

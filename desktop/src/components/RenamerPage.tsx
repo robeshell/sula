@@ -1,9 +1,10 @@
-import { Table, TableHeader, TableBody, TableRow, TableHead, TableCell } from "./ui/table";
 import { Checkbox } from "./ui/checkbox";
 import { NativeSelect } from "./ui/native-select";
-import { Button } from "./ui/button";
+import { Popover, PopoverContent, PopoverTrigger } from "./ui/popover";
+import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigger } from "./ui/dropdown-menu";
+import { ArrowRight, Bookmark, FilePlus, FolderPlus, ListX, Plus, Undo2, X } from "lucide-react";
 import { Input } from "./ui/input";
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useState, type ReactNode } from "react";
 import { useTranslation } from "react-i18next";
 import { invoke } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
@@ -108,7 +109,6 @@ export function RenamerPage() {
   const [busy, setBusy] = useState(false);
   const [message, setMessage] = useState<string | null>(null);
   const [snapshotCount, setSnapshotCount] = useState(0);
-  const [addType, setAddType] = useState<RuleType>("textReplace");
   const [presets, setPresets] = useState<string[]>([]);
   const [selectedPreset, setSelectedPreset] = useState("");
   const [presetName, setPresetName] = useState("");
@@ -320,226 +320,176 @@ export function RenamerPage() {
   }
 
   const immersive = isImmersiveWindow();
+  const rows: PreviewRow[] = useMemo(() => (previews.length > 0
+    ? previews.map((p) => ({ ...p, status: previewStatus(p), runs: diffRuns(p.originalName, p.newName) }))
+    : files.map((f) => ({ id: f.id, originalName: f.originalName, newName: f.originalName, path: f.path, hasConflict: false, hasInvalidChars: false, status: "same" as const, runs: [{ text: f.originalName, changed: false }] }))
+  ), [previews, files]);
+  const conflicts = rows.filter((r) => r.status === "clash" || r.status === "bad").length;
+  const unchanged = rows.filter((r) => r.status === "same").length;
+  const folder = commonFolder(files.map((f) => f.path));
 
   return (
-    <div className="kg-shell flex min-h-0 flex-1 flex-col overflow-hidden text-fg">
-      {immersive ? (
-        <div
-          className="kg-titlebar absolute inset-x-0 top-0 z-30 h-[var(--kg-titlebar-height)]"
-          aria-hidden
-        >
-          <div data-tauri-drag-region className="absolute inset-0" />
-          <WindowControls />
-        </div>
-      ) : null}
-      <header
-        data-tauri-drag-region={!immersive ? true : undefined}
-        className={
-          immersive
-            ? "flex shrink-0 items-center justify-between gap-3 border-b border-hairline px-5 pb-3 pt-[calc(var(--kg-titlebar-height)+0.5rem)] pr-[calc(1.25rem+var(--kg-caption-width))]"
-            : "flex shrink-0 items-center justify-between gap-3 border-b border-hairline px-5 pb-3 pt-4"
-        }
-      >
-        <div className="min-w-0">
-          <h1 className="kg-page-header-title">{t("renamer.title")}</h1>
-        </div>
-        <div className="flex shrink-0 flex-wrap items-center gap-2">
-          <Button variant="ghost" size="sm"
-            type="button"
-            disabled={busy || snapshotCount === 0}
-            onClick={() => void runUndo()}
-          >
-            {t("renamer.undo")} ({snapshotCount})
-          </Button>
-          <Button variant="default" size="sm"
-            type="button"
-            disabled={busy || !previewCurrent || executableCount === 0}
-            onClick={() => void runExecute()}
-          >
-            {t("renamer.execute")} ({executableCount})
-          </Button>
-        </div>
+    <div className="sl-rn">
+      {immersive ? <div className="absolute right-0 top-0 z-30 h-[var(--kg-titlebar-height)]"><WindowControls /></div> : null}
+      <header className="sl-toolbar sl-rn-tool">
+        <div data-tauri-drag-region />
+        <div className="sl-title"><b>{t("renamer.title")}</b>{folder ? <span title={folder}>{folder}</span> : null}</div>
+        <button type="button" className="sl-btn" disabled={busy} onClick={() => void addPaths(false)}><FilePlus aria-hidden />{t("renamer.addFiles")}</button>
+        <button type="button" className="sl-btn" disabled={busy} onClick={() => void addPaths(true)}><FolderPlus aria-hidden />{t("renamer.addFolder")}</button>
+        {files.length > 0 ? (
+          <button type="button" className="sl-iconbtn" aria-label={t("renamer.clearFiles")} title={t("renamer.clearFiles")} onClick={() => setFiles([])}><ListX aria-hidden /></button>
+        ) : null}
+        <Popover>
+          <PopoverTrigger asChild>
+            <button type="button" className="sl-iconbtn" aria-label={t("renamer.presets")} title={t("renamer.presets")}><Bookmark aria-hidden /></button>
+          </PopoverTrigger>
+          <PopoverContent align="end" sideOffset={6} className="sl-rn-presets">
+            <p className="kg-section-label">{t("renamer.presets")}</p>
+            <div className="flex gap-2">
+              <NativeSelect className="min-w-0 flex-1" value={selectedPreset} onChange={(e) => void loadPreset(e.target.value)}>
+                <option value="">{t("renamer.preset.pick")}</option>
+                {presets.map((name) => <option key={name} value={name}>{name}</option>)}
+              </NativeSelect>
+              <button type="button" className="sl-btn" disabled={!selectedPreset} onClick={() => void deletePreset()}>{t("common.remove")}</button>
+            </div>
+            <div className="flex gap-2">
+              <Input className="min-w-0 flex-1" placeholder={t("renamer.preset.namePlaceholder")} value={presetName} onChange={(e) => setPresetName(e.target.value)} />
+              <button type="button" className="sl-btn" onClick={() => void savePreset()}>{t("renamer.preset.save")}</button>
+            </div>
+          </PopoverContent>
+        </Popover>
       </header>
 
-      {message ? (
-        <p className="shrink-0 border-b border-hairline bg-elevated px-5 py-2 kg-type-body-secondary text-fg-secondary">
-          {message}
-        </p>
-      ) : null}
-
-      <div className="grid min-h-0 flex-1 grid-cols-1 gap-0 lg:grid-cols-[minmax(280px,360px)_minmax(0,1fr)]">
-        <aside className="flex min-h-0 flex-col border-b border-hairline bg-surface lg:border-b-0 lg:border-r">
-          <div className="flex shrink-0 items-center gap-2 px-4 py-3">
-            <Button variant="ghost" size="sm"
-              type="button"
-              disabled={busy}
-              onClick={() => void addPaths(false)}
-            >
-              {t("renamer.addFiles")}
-            </Button>
-            <Button variant="ghost" size="sm"
-              type="button"
-              disabled={busy}
-              onClick={() => void addPaths(true)}
-            >
-              {t("renamer.addFolder")}
-            </Button>
-            <Button variant="ghost" size="sm"
-              type="button"
-              disabled={files.length === 0}
-              onClick={() => setFiles([])}
-            >
-              {t("renamer.clearFiles")}
-            </Button>
-          </div>
-          <p className="kg-section-label px-4">{t("renamer.files", { count: files.length })}</p>
-          <ul className="min-h-0 flex-1 overflow-auto px-2 pb-4">
-            {files.length === 0 ? (
-              <li className="px-2 py-6 text-center kg-type-body-secondary text-fg-muted">
-                {t("renamer.filesEmpty")}
-              </li>
-            ) : (
-              files.map((f) => (
-                <li
-                  key={f.id}
-                  className="truncate rounded-control px-2 py-1.5 kg-type-body-secondary text-fg-secondary"
-                  title={f.path}
-                >
-                  {f.originalName}
-                </li>
-              ))
-            )}
-          </ul>
-
-          <div className="shrink-0 space-y-4 border-t border-hairline px-4 py-3">
-            <div>
-              <p className="kg-section-label">{t("renamer.presets")}</p>
-              <div className="mb-2 flex flex-wrap gap-2">
-                <NativeSelect
-                  className="min-w-0 flex-1"
-                  value={selectedPreset}
-                  onChange={(e) => void loadPreset(e.target.value)}
-                >
-                  <option value="">{t("renamer.preset.pick")}</option>
-                  {presets.map((name) => (
-                    <option key={name} value={name}>
-                      {name}
-                    </option>
-                  ))}
-                </NativeSelect>
-                <Button variant="ghost" size="sm"
-                  type="button"
-                  disabled={!selectedPreset}
-                  onClick={() => void deletePreset()}
-                >
-                  {t("common.remove")}
-                </Button>
-              </div>
-              <div className="flex gap-2">
-                <Input
-                  className="min-w-0 flex-1"
-                  placeholder={t("renamer.preset.namePlaceholder")}
-                  value={presetName}
-                  onChange={(e) => setPresetName(e.target.value)}
-                />
-                <Button variant="ghost" size="sm"
-                  type="button"
-                  onClick={() => void savePreset()}
-                >
-                  {t("renamer.preset.save")}
-                </Button>
-              </div>
-            </div>
-
-            <div>
-              <p className="kg-section-label">{t("renamer.rules")}</p>
-              <div className="mb-2 flex gap-2">
-                <NativeSelect
-                  className="min-w-0 flex-1"
-                  value={addType}
-                  onChange={(e) => setAddType(e.target.value as RuleType)}
-                >
-                  <option value="textReplace">{t("renamer.rule.textReplace")}</option>
-                  <option value="regexReplace">{t("renamer.rule.regexReplace")}</option>
-                  <option value="insertText">{t("renamer.rule.insertText")}</option>
-                  <option value="deleteRange">{t("renamer.rule.deleteRange")}</option>
-                  <option value="caseConversion">{t("renamer.rule.caseConversion")}</option>
-                  <option value="autoNumbering">{t("renamer.rule.autoNumbering")}</option>
-                  <option value="stripBrackets">{t("renamer.rule.stripBrackets")}</option>
-                </NativeSelect>
-                <Button variant="ghost" size="sm"
-                  type="button"
-                  onClick={() => setRules((prev) => [...prev, defaultRule(addType)])}
-                >
-                  {t("common.add")}
-                </Button>
-              </div>
-              <div className="max-h-[40vh] space-y-2 overflow-auto">
-                {rules.map((rule, index) => (
-                  <RuleEditor
-                    key={rule.id}
-                    index={index}
-                    rule={rule}
-                    onChange={(patch) => updateRule(rule.id, patch)}
-                    onRemove={() => setRules((prev) => prev.filter((r) => r.id !== rule.id))}
-                  />
+      <div className="sl-rn-body">
+        <aside className="sl-rn-rules">
+          <div className="sl-rn-rh">
+            <span>{t("renamer.rulesOrdered")}</span>
+            <DropdownMenu>
+              <DropdownMenuTrigger asChild>
+                <button type="button" className="sl-btn"><Plus aria-hidden />{t("renamer.addRule")}</button>
+              </DropdownMenuTrigger>
+              <DropdownMenuContent align="end" sideOffset={6}>
+                {RULE_TYPES.map((type) => (
+                  <DropdownMenuItem key={type} onSelect={() => setRules((prev) => [...prev, defaultRule(type)])}>{t(`renamer.rule.${type}`)}</DropdownMenuItem>
                 ))}
-              </div>
-            </div>
+              </DropdownMenuContent>
+            </DropdownMenu>
           </div>
+          {rules.length === 0 ? <p className="sl-rn-empty">{t("renamer.rulesEmpty")}</p> : null}
+          {rules.map((rule, index) => (
+            <RuleEditor key={rule.id} index={index} rule={rule}
+              onChange={(patch) => updateRule(rule.id, patch)}
+              onRemove={() => setRules((prev) => prev.filter((r) => r.id !== rule.id))} />
+          ))}
         </aside>
 
-        <main className="flex min-h-0 flex-col bg-surface">
-          <p className="kg-section-label px-4 pt-3">{t("renamer.preview")}</p>
-          <div className="min-h-0 flex-1 overflow-auto px-3 pb-4">
-            <div className="kg-settings-group overflow-hidden">
-              <Table className="w-full border-collapse text-left kg-type-body-secondary">
-                <TableHeader className="sticky top-0 bg-[var(--kg-group-fill)] text-fg-muted">
-                  <TableRow>
-                    <TableHead className="px-3.5 py-2.5 font-semibold">{t("renamer.col.original")}</TableHead>
-                    <TableHead className="px-3.5 py-2.5 font-semibold">{t("renamer.col.new")}</TableHead>
-                    <TableHead className="px-3.5 py-2.5 font-semibold">{t("renamer.col.status")}</TableHead>
-                  </TableRow>
-                </TableHeader>
-                <TableBody>
-                  {previews.length === 0 ? (
-                    <TableRow>
-                      <TableCell colSpan={3} className="px-3.5 py-8 text-center text-fg-muted">
-                        {t("renamer.previewEmpty")}
-                      </TableCell>
-                    </TableRow>
-                  ) : (
-                    previews.map((p) => {
-                      let status = t("renamer.status.ok");
-                      if (p.hasConflict) status = t("renamer.status.conflict");
-                      else if (p.hasInvalidChars) status = t("renamer.status.invalid");
-                      else if (p.originalName === p.newName) status = t("renamer.status.unchanged");
-                      const bad = p.hasConflict || p.hasInvalidChars;
-                      return (
-                        <TableRow key={p.id} className="border-t border-hairline">
-                          <TableCell className="max-w-[240px] truncate px-3.5 py-2 text-fg-secondary">
-                            {p.originalName}
-                          </TableCell>
-                          <TableCell className="max-w-[280px] truncate px-3.5 py-2 font-medium">{p.newName}</TableCell>
-                          <TableCell
-                            className={`whitespace-nowrap px-3.5 py-2 ${
-                              bad ? "text-error" : "text-fg-muted"
-                            }`}
-                          >
-                            {status}
-                          </TableCell>
-                        </TableRow>
-                      );
-                    })
-                  )}
-                </TableBody>
-              </Table>
+        <main className="sl-rn-prev">
+          {message ? <p className="sl-rn-msg" role="status">{message}</p> : null}
+          {rows.length === 0 ? (
+            <div className="sl-rn-empty grow">{t("renamer.filesEmpty")}</div>
+          ) : (
+            <div className="sl-rn-table" role="table" aria-label={t("renamer.preview")}>
+              <div className="sl-rr head" role="row">
+                <span>{t("renamer.col.original")}</span><span /><span>{t("renamer.col.new")}</span><span>{t("renamer.col.status")}</span>
+              </div>
+              {rows.map((r, i) => {
+                return (
+                  <div key={r.id} className="sl-rr" role="row" data-odd={i % 2 === 1 || undefined}>
+                    <span className="o" title={r.path}>{r.originalName}</span>
+                    <ArrowRight className="arr" aria-hidden />
+                    <span className="nw" title={r.newName}>
+                      {r.runs.map((run, k) => (run.changed ? <mark key={k}>{run.text}</mark> : run.text))}
+                    </span>
+                    <span className="st" data-status={r.status}><i aria-hidden />{t(STATUS_LABEL[r.status])}</span>
+                  </div>
+                );
+              })}
             </div>
-          </div>
+          )}
+          <footer className="sl-rn-foot">
+            <span>
+              {t("renamer.summary", { total: rows.length, count: executableCount })}
+              {conflicts > 0 ? <> · <span className="warn">{t("renamer.summaryConflicts", { count: conflicts })}</span></> : null}
+              {unchanged > 0 ? <> · {t("renamer.summaryUnchanged", { count: unchanged })}</> : null}
+            </span>
+            <span className="grow" />
+            <button type="button" className="sl-btn" disabled={busy || snapshotCount === 0} onClick={() => void runUndo()}>
+              <Undo2 aria-hidden />{t("renamer.undoLast")}
+            </button>
+            <button type="button" className="sl-btn acc" disabled={busy || !previewCurrent || executableCount === 0} onClick={() => void runExecute()}>
+              {t("renamer.executeN", { count: executableCount })}
+            </button>
+          </footer>
         </main>
       </div>
     </div>
   );
+}
+
+type RowStatus = "go" | "same" | "clash" | "bad";
+type PreviewRow = PreviewResult & { status: RowStatus; runs: { text: string; changed: boolean }[] };
+
+const RULE_TYPES: RuleType[] = ["textReplace", "regexReplace", "insertText", "deleteRange", "caseConversion", "autoNumbering", "stripBrackets"];
+
+const STATUS_LABEL: Record<RowStatus, string> = {
+  go: "renamer.status.ok",
+  same: "renamer.status.unchanged",
+  clash: "renamer.status.conflict",
+  bad: "renamer.status.invalid",
+};
+
+function previewStatus(p: PreviewResult): RowStatus {
+  if (p.hasConflict) return "clash";
+  if (p.hasInvalidChars) return "bad";
+  return p.originalName === p.newName ? "same" : "go";
+}
+
+/** Runs of `next`, flagged where they are not carried over from `prev` (character LCS). */
+function diffRuns(prev: string, next: string): { text: string; changed: boolean }[] {
+  if (prev === next) return [{ text: next, changed: false }];
+  const a = Array.from(prev);
+  const b = Array.from(next);
+  // Long names would make the table quadratic; mark the whole name instead.
+  if (a.length * b.length > 90_000) return [{ text: next, changed: true }];
+  const w = b.length + 1;
+  const lcs = new Uint16Array((a.length + 1) * w);
+  for (let i = a.length - 1; i >= 0; i--) {
+    for (let j = b.length - 1; j >= 0; j--) {
+      lcs[i * w + j] = a[i] === b[j] ? lcs[(i + 1) * w + j + 1] + 1 : Math.max(lcs[(i + 1) * w + j], lcs[i * w + j + 1]);
+    }
+  }
+  const runs: { text: string; changed: boolean }[] = [];
+  const push = (ch: string, changed: boolean) => {
+    const last = runs[runs.length - 1];
+    if (last && last.changed === changed) last.text += ch;
+    else runs.push({ text: ch, changed });
+  };
+  let i = 0;
+  let j = 0;
+  while (j < b.length) {
+    if (i < a.length && a[i] === b[j]) { push(b[j], false); i++; j++; }
+    else if (i < a.length && lcs[(i + 1) * w + j] >= lcs[i * w + j + 1]) i++;
+    else { push(b[j], true); j++; }
+  }
+  return runs;
+}
+
+function commonFolder(paths: string[]): string {
+  if (paths.length === 0) return "";
+  const split = paths.map((p) => p.split(/[/\\]/).slice(0, -1));
+  const first = split[0];
+  let n = first.length;
+  for (const parts of split.slice(1)) {
+    let i = 0;
+    while (i < n && i < parts.length && parts[i] === first[i]) i++;
+    n = i;
+  }
+  const sep = paths[0].includes("\\") && !paths[0].includes("/") ? "\\" : "/";
+  return first.slice(0, n).join(sep);
+}
+
+function Field({ label, children }: { label: string; children: ReactNode }) {
+  return <label className="sl-rf"><span>{label}</span>{children}</label>;
 }
 
 function RuleEditor({
@@ -554,135 +504,84 @@ function RuleEditor({
   onRemove: () => void;
 }) {
   const { t } = useTranslation();
+  const num = (value: string) => Number(value) || 0;
   return (
-    <div className="rounded-card border border-hairline bg-[var(--kg-group-fill)] px-3 py-2.5">
-      <div className="mb-2 flex items-center justify-between gap-2">
-        <span className="kg-type-body-secondary font-semibold text-fg-secondary">
-          #{index + 1} {t(`renamer.rule.${rule.type}`)}
-        </span>
-        <Button variant="ghost" size="sm" type="button" onClick={onRemove}>
-          {t("common.remove")}
-        </Button>
+    <div className="sl-rule">
+      <div className="sl-rule-top">
+        <span className="n">{index + 1}</span>
+        <b>{t(`renamer.rule.${rule.type}`)}</b>
+        <button type="button" className="x" aria-label={t("common.remove")} title={t("common.remove")} onClick={onRemove}><X aria-hidden /></button>
       </div>
       {(rule.type === "textReplace" || rule.type === "regexReplace") && (
-        <div className="grid gap-1.5">
-          <Input
-            placeholder={rule.type === "regexReplace" ? t("renamer.field.pattern") : t("renamer.field.find")}
-            value={rule.type === "regexReplace" ? (rule.pattern ?? "") : (rule.find ?? "")}
-            onChange={(e) =>
-              onChange(
-                rule.type === "regexReplace"
-                  ? { pattern: e.target.value }
-                  : { find: e.target.value },
-              )
-            }
-          />
-          <Input
-            placeholder={t("renamer.field.replacement")}
-            value={rule.replacement ?? ""}
-            onChange={(e) => onChange({ replacement: e.target.value })}
-          />
+        <div className="sl-rfs">
+          <Field label={rule.type === "regexReplace" ? t("renamer.field.pattern") : t("renamer.field.find")}>
+            <Input value={rule.type === "regexReplace" ? (rule.pattern ?? "") : (rule.find ?? "")}
+              onChange={(e) => onChange(rule.type === "regexReplace" ? { pattern: e.target.value } : { find: e.target.value })} />
+          </Field>
+          <Field label={t("renamer.field.replacement")}>
+            <Input placeholder={t("renamer.field.deletePlaceholder")} value={rule.replacement ?? ""} onChange={(e) => onChange({ replacement: e.target.value })} />
+          </Field>
         </div>
       )}
       {rule.type === "insertText" && (
-        <div className="grid gap-1.5">
-          <Input
-            placeholder={t("renamer.field.text")}
-            value={rule.text ?? ""}
-            onChange={(e) => onChange({ text: e.target.value })}
-          />
-          <label className="flex items-center gap-2 kg-type-caption text-fg-secondary">
-            {t("renamer.field.position")}
-            <Input
-              className="w-20"
-              type="number"
-              value={typeof rule.position === "number" ? rule.position : 0}
-              onChange={(e) => onChange({ position: Number(e.target.value) || 0 })}
-            />
-          </label>
+        <div className="sl-rfs">
+          <Field label={t("renamer.field.text")}>
+            <Input value={rule.text ?? ""} onChange={(e) => onChange({ text: e.target.value })} />
+          </Field>
+          <Field label={t("renamer.field.position")}>
+            <Input className="w-20" type="number" value={typeof rule.position === "number" ? rule.position : 0} onChange={(e) => onChange({ position: num(e.target.value) })} />
+          </Field>
         </div>
       )}
       {rule.type === "deleteRange" && (
-        <div className="flex gap-2">
-          <label className="flex flex-1 items-center gap-1 kg-type-caption text-fg-secondary">
-            {t("renamer.field.from")}
-            <Input
-              type="number"
-              value={rule.from ?? 0}
-              onChange={(e) => onChange({ from: Number(e.target.value) || 0 })}
-            />
-          </label>
-          <label className="flex flex-1 items-center gap-1 kg-type-caption text-fg-secondary">
-            {t("renamer.field.length")}
-            <Input
-              type="number"
-              value={rule.length ?? 1}
-              onChange={(e) => onChange({ length: Number(e.target.value) || 0 })}
-            />
-          </label>
+        <div className="sl-rfs">
+          <Field label={t("renamer.field.from")}>
+            <Input className="w-20" type="number" value={rule.from ?? 0} onChange={(e) => onChange({ from: num(e.target.value) })} />
+          </Field>
+          <Field label={t("renamer.field.length")}>
+            <Input className="w-20" type="number" value={rule.length ?? 1} onChange={(e) => onChange({ length: num(e.target.value) })} />
+          </Field>
         </div>
       )}
       {rule.type === "caseConversion" && (
-        <NativeSelect
-          className="w-full"
-          value={rule.mode ?? "title"}
-          onChange={(e) =>
-            onChange({ mode: e.target.value as "title" | "lower" | "upper" })
-          }
-        >
-          <option value="title">{t("renamer.case.title")}</option>
-          <option value="lower">{t("renamer.case.lower")}</option>
-          <option value="upper">{t("renamer.case.upper")}</option>
-        </NativeSelect>
+        <div className="sl-seg" role="radiogroup" aria-label={t("renamer.rule.caseConversion")}>
+          {(["title", "lower", "upper"] as const).map((mode) => (
+            <button key={mode} type="button" role="radio" aria-checked={(rule.mode ?? "title") === mode} onClick={() => onChange({ mode })}>{t(`renamer.case.${mode}`)}</button>
+          ))}
+        </div>
       )}
       {rule.type === "autoNumbering" && (
-        <div className="grid grid-cols-2 gap-1.5">
-          <label className="flex items-center gap-1 kg-type-caption text-fg-secondary">
-            {t("renamer.field.startAt")}
-            <Input
-              type="number"
-              value={rule.startAt ?? 1}
-              onChange={(e) => onChange({ startAt: Number(e.target.value) || 0 })}
-            />
-          </label>
-          <label className="flex items-center gap-1 kg-type-caption text-fg-secondary">
-            {t("renamer.field.padding")}
-            <Input
-              type="number"
-              value={rule.padding ?? 2}
-              onChange={(e) => onChange({ padding: Number(e.target.value) || 0 })}
-            />
-          </label>
-          <NativeSelect
-            value={rule.position === "suffix" ? "suffix" : "prefix"}
-            onChange={(e) => onChange({ position: e.target.value as "prefix" | "suffix" })}
-          >
-            <option value="prefix">{t("renamer.pos.prefix")}</option>
-            <option value="suffix">{t("renamer.pos.suffix")}</option>
-          </NativeSelect>
-          <Input
-            placeholder={t("renamer.field.separator")}
-            value={rule.separator ?? " "}
-            onChange={(e) => onChange({ separator: e.target.value })}
-          />
+        <div className="sl-rfs">
+          <Field label={t("renamer.field.startAt")}>
+            <Input className="w-20" type="number" value={rule.startAt ?? 1} onChange={(e) => onChange({ startAt: num(e.target.value) })} />
+          </Field>
+          <Field label={t("renamer.field.padding")}>
+            <Input className="w-20" type="number" value={rule.padding ?? 2} onChange={(e) => onChange({ padding: num(e.target.value) })} />
+          </Field>
+          <Field label={t("renamer.field.separator")}>
+            <Input className="w-20" value={rule.separator ?? " "} onChange={(e) => onChange({ separator: e.target.value })} />
+          </Field>
+          <Field label={t("renamer.field.position")}>
+            <div className="sl-seg" role="radiogroup" aria-label={t("renamer.field.position")}>
+              {(["prefix", "suffix"] as const).map((pos) => (
+                <button key={pos} type="button" role="radio" aria-checked={(rule.position === "suffix" ? "suffix" : "prefix") === pos} onClick={() => onChange({ position: pos })}>{t(`renamer.pos.${pos}`)}</button>
+              ))}
+            </div>
+          </Field>
         </div>
       )}
       {rule.type === "stripBrackets" && (
-        <div className="flex flex-wrap gap-3 kg-type-caption text-fg-secondary">
+        <div className="flex flex-wrap gap-3 text-[12px] text-fg-secondary">
           {(["square", "round", "curly"] as const).map((b) => {
             const checked = (rule.bracketTypes ?? []).includes(b);
             return (
               <label key={b} className="inline-flex items-center gap-1.5">
-                <Checkbox
-
-                  checked={checked}
-                  onCheckedChange={(e) => {
-                    const cur = new Set(rule.bracketTypes ?? []);
-                    if (e === true) cur.add(b);
-                    else cur.delete(b);
-                    onChange({ bracketTypes: Array.from(cur) });
-                  }}
-                />
+                <Checkbox checked={checked} onCheckedChange={(e) => {
+                  const cur = new Set(rule.bracketTypes ?? []);
+                  if (e === true) cur.add(b);
+                  else cur.delete(b);
+                  onChange({ bracketTypes: Array.from(cur) });
+                }} />
                 {t(`renamer.bracket.${b}`)}
               </label>
             );

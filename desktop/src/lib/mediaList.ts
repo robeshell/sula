@@ -11,6 +11,7 @@ export type MediaSortOption =
 
 export type MediaStatusFilter =
   | "all"
+  | "attention"
   | "unscraped"
   | "scraped"
   | "partial"
@@ -28,6 +29,7 @@ export const SORT_OPTIONS: { value: MediaSortOption; label: string }[] = [
 
 export const STATUS_FILTERS: { value: MediaStatusFilter; label: string }[] = [
   { value: "all", label: "All" },
+  { value: "attention", label: "Needs attention" },
   { value: "unscraped", label: "Unscraped" },
   { value: "scraped", label: "Scraped" },
   { value: "partial", label: "Incomplete" },
@@ -42,6 +44,11 @@ export type SortableMedia = {
   status: string;
   addedAt: string;
 };
+
+/** Anything the user still has to act on: not scraped, not matched, or incomplete. */
+export function needsAttention(status: string): boolean {
+  return status === "unscraped" || status === "unmatched" || status === "partial";
+}
 
 function statusRank(status: string): number {
   switch (status) {
@@ -142,7 +149,9 @@ export function filterAndSortMedia<T extends SortableMedia>(
         (item.originalTitle?.toLowerCase().includes(lowered) ?? false),
     );
   }
-  if (statusFilter !== "all") {
+  if (statusFilter === "attention") {
+    next = next.filter((item) => needsAttention(item.status));
+  } else if (statusFilter !== "all") {
     next = next.filter((item) => item.status === statusFilter);
   }
 

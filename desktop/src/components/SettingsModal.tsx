@@ -1,29 +1,33 @@
 import { confirmAction } from "../lib/confirmation";
-import { motion } from "motion/react";
 import { NativeSelect } from "./ui/native-select";
 import { Switch } from "./ui/switch";
-import { Tabs, TabsContent, TabsList, TabsTrigger } from "./ui/tabs";
 import { Button } from "./ui/button";
 import { Input } from "./ui/input";
 import { invalidatePosterCache } from "../lib/posterLoadQueue";
-import { useEffect, useRef, useState, type CSSProperties, type ReactNode } from "react";
+import { useEffect, useRef, useState, type ReactNode } from "react";
+import { Database, FolderTree, Library as LibraryIcon, SlidersHorizontal, Wrench } from "lucide-react";
 import { useTranslation } from "react-i18next";
 import { invoke } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
 
-import {
-  ACCENT_PRESETS,
-  migrateAccent,
-  migrateSkinPreference,
-  watchAppearance,
-  type AccentId,
-  type SkinPreference,
-} from "../lib/appearance";
+import { migrateSkinPreference, watchAppearance } from "../lib/appearance";
 import { useAppStore, type Library, type MediaType } from "../store/appStore";
 
 /** In-app settings page. */
+type PrefTab = "general" | "library" | "sources" | "rename" | "advanced";
+
+const PREF_TABS: { id: PrefTab; icon: typeof SlidersHorizontal; label: string }[] = [
+  { id: "general", icon: SlidersHorizontal, label: "settings.tab.general" },
+  { id: "library", icon: LibraryIcon, label: "settings.section.library" },
+  { id: "sources", icon: Database, label: "settings.tab.sources" },
+  { id: "rename", icon: FolderTree, label: "settings.tab.rename" },
+  { id: "advanced", icon: Wrench, label: "settings.tab.advanced" },
+];
+
+/** Preferences, laid out like a native settings window: icon tabs over grouped rows. */
 export function SettingsPage({ onClose }: { onClose: () => void }) {
   const { t } = useTranslation();
+  const [tab, setTab] = useState<PrefTab>("general");
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
@@ -33,56 +37,76 @@ export function SettingsPage({ onClose }: { onClose: () => void }) {
     return () => document.removeEventListener("keydown", onKey);
   }, [onClose]);
 
+  const current = PREF_TABS.find((p) => p.id === tab)!;
   return (
-    <motion.div initial={{ opacity: 0, y: 4 }} animate={{ opacity: 1, y: 0 }} className="kg-settings-page min-h-0 flex-1 overflow-auto">
-      <Tabs defaultValue="appearance" className="kg-page-shell w-full">
-        <header className="kg-page-header">
-          <div className="min-w-0 flex-1">
-            <h2 className="kg-page-header-title">{t("settings.title")}</h2>
-          </div>
-        </header>
-
-        <TabsList className="mb-6 h-auto flex-wrap justify-start">
-          {[["appearance", "appearanceLang"], ["library", "library"], ["scrape", "scrape"], ["rename", "rename"], ["system", "system"]].map(([value, label]) => <TabsTrigger key={value} value={value}>{t(`settings.section.${label}`)}</TabsTrigger>)}
-        </TabsList>
-
-        <TabsContent value="appearance" className="kg-settings-section mt-0">
-          <p className="kg-section-label">{t("settings.section.appearanceLang")}</p>
-          <div className="kg-settings-group">
-            <AppearanceBlock />
-            <LanguageRow />
-          </div>
-        </TabsContent>
-
-        <TabsContent value="library" className="kg-settings-section mt-0">
-          <p className="kg-section-label">{t("settings.section.library")}</p>
-          <LibrarySection />
-          <p className="kg-section-label mt-3">{t("settings.block.exclusions")}</p>
-          <ScrapeExclusionsSection />
-        </TabsContent>
-
-        <TabsContent value="scrape" className="kg-settings-section mt-0">
-          <p className="kg-section-label">{t("settings.section.scrape")}</p>
-          <ApiKeysSection />
-          <p className="kg-section-label mt-3">{t("settings.block.nfo")}</p>
-          <NfoSection />
-        </TabsContent>
-
-        <TabsContent value="rename" className="kg-settings-section mt-0">
-          <p className="kg-section-label">{t("settings.section.rename")}</p>
-          <RenameSection />
-        </TabsContent>
-
-        <TabsContent value="system" className="kg-settings-section mt-0">
-          <p className="kg-section-label">{t("settings.section.system")}</p>
-          <div className="kg-settings-group">
-            <KeepRunningOnCloseRow />
-            <TrayRow />
-            <CacheRow />
-          </div>
-        </TabsContent>
-      </Tabs>
-    </motion.div>
+    <div className="sl-prefs">
+      <header className="sl-prefs-top">
+        <div data-tauri-drag-region />
+        <div className="sl-prefs-title">{t(current.label)}</div>
+        <div className="sl-prefs-tabs" role="tablist" aria-label={t("settings.title")}>
+          {PREF_TABS.map(({ id, icon: Icon, label }) => (
+            <button key={id} type="button" role="tab" aria-selected={tab === id} className="sl-prefs-tab" onClick={() => setTab(id)}>
+              <Icon aria-hidden />
+              <span>{t(label)}</span>
+            </button>
+          ))}
+        </div>
+      </header>
+      <div className="sl-prefs-body" role="tabpanel">
+        {tab === "general" ? (
+          <>
+            <section className="kg-settings-section">
+              <p className="kg-section-label">{t("settings.section.appearance")}</p>
+              <div className="kg-settings-group">
+                <AppearanceBlock />
+                <LanguageRow />
+              </div>
+            </section>
+            <section className="kg-settings-section">
+              <p className="kg-section-label">{t("settings.section.windowBackground")}</p>
+              <div className="kg-settings-group">
+                <TrayRow />
+                <KeepRunningOnCloseRow />
+              </div>
+            </section>
+          </>
+        ) : tab === "library" ? (
+          <>
+            <section className="kg-settings-section">
+              <p className="kg-section-label">{t("settings.section.library")}</p>
+              <LibrarySection />
+            </section>
+            <section className="kg-settings-section">
+              <p className="kg-section-label">{t("settings.block.exclusions")}</p>
+              <ScrapeExclusionsSection />
+            </section>
+          </>
+        ) : tab === "sources" ? (
+          <>
+            <section className="kg-settings-section">
+              <p className="kg-section-label">{t("settings.section.api")}</p>
+              <ApiKeysSection />
+            </section>
+            <section className="kg-settings-section">
+              <p className="kg-section-label">{t("settings.block.nfo")}</p>
+              <NfoSection />
+            </section>
+          </>
+        ) : tab === "rename" ? (
+          <section className="kg-settings-section">
+            <p className="kg-section-label">{t("settings.section.rename")}</p>
+            <RenameSection />
+          </section>
+        ) : (
+          <section className="kg-settings-section">
+            <p className="kg-section-label">{t("settings.section.cache")}</p>
+            <div className="kg-settings-group">
+              <CacheRow />
+            </div>
+          </section>
+        )}
+      </div>
+    </div>
   );
 }
 
@@ -123,220 +147,63 @@ function SettingsRow({
   );
 }
 
+type ThemeChoice = "system" | "default" | "deep-night";
+
 function AppearanceBlock() {
   const { t } = useTranslation();
   const showToast = useAppStore((s) => s.showToast);
-  const [skin, setSkin] = useState<SkinPreference>("system");
-  const [accent, setAccent] = useState<AccentId>("indigo");
+  const [theme, setTheme] = useState<ThemeChoice>("system");
   const [saving, setSaving] = useState(false);
 
   useEffect(() => {
     void (async () => {
-      const config = await invoke<{ appearance?: string; accent?: string }>("get_config");
-      setSkin(migrateSkinPreference(config.appearance));
-      setAccent(migrateAccent(config.accent));
+      const config = await invoke<{ appearance?: string }>("get_config");
+      const pref = migrateSkinPreference(config.appearance);
+      setTheme(pref === "pure" ? "default" : pref);
     })();
   }, []);
 
-  const persist = async (nextSkin: SkinPreference, nextAccent: AccentId) => {
-    setSkin(nextSkin);
-    setAccent(nextAccent);
+  const persist = async (next: ThemeChoice) => {
+    const previous = theme;
+    setTheme(next);
     setSaving(true);
     try {
       const config = await invoke<Record<string, unknown>>("get_config");
-      await invoke("save_config", {
-        config: {
-          ...config,
-          appearance: nextSkin,
-          accent: nextAccent,
-        },
-      });
-      watchAppearance(nextSkin, nextAccent);
-      showToast(t("settings.appearance.saved"));
+      await invoke("save_config", { config: { ...config, appearance: next } });
+      watchAppearance(next);
     } catch (err) {
+      setTheme(previous);
       showToast(String(err));
     } finally {
       setSaving(false);
     }
   };
 
-  const skins: { id: SkinPreference; label: string }[] = [
+  const choices: { id: ThemeChoice; label: string }[] = [
     { id: "system", label: t("settings.appearance.system") },
-    { id: "default", label: t("settings.appearance.skinDefault") },
-    { id: "pure", label: t("settings.appearance.skinPure") },
-    { id: "deep-night", label: t("settings.appearance.skinNight") },
+    { id: "default", label: t("settings.appearance.light") },
+    { id: "deep-night", label: t("settings.appearance.dark") },
   ];
 
   return (
     <>
-      <div>
-        <p className="kg-settings-block-label">{t("settings.appearance.skin")}</p>
-        <div className="kg-skin-strip">
-          {skins.map((opt) => (
-            <SkinCard
-              key={opt.id}
-              id={opt.id}
-              label={opt.label}
-              selected={skin === opt.id}
-              disabled={saving}
-              onSelect={() => void persist(opt.id, accent)}
-            />
+      <div className="kg-settings-row">
+        <div className="sl-themes" role="radiogroup" aria-label={t("settings.appearance.mode")}>
+          {choices.map((opt) => (
+            <button key={opt.id} type="button" role="radio" aria-checked={theme === opt.id} className="sl-theme"
+              disabled={saving} onClick={() => void persist(opt.id)}>
+              <span className="sl-theme-tile" data-theme={opt.id} aria-hidden><i /><i /><i /></span>
+              {opt.label}
+            </button>
           ))}
         </div>
       </div>
-      <div>
-        <p className="kg-settings-block-label">{t("settings.appearance.accent")}</p>
-        <div className="kg-accent-strip" role="group" aria-label={t("settings.appearance.accent")}>
-          {ACCENT_PRESETS.map((opt) => (
-            <Button variant="plain" size="none"
-              key={opt.id}
-              type="button"
-              className="kg-accent-swatch"
-              style={{ ["--swatch" as string]: opt.color }}
-              data-selected={accent === opt.id}
-              aria-pressed={accent === opt.id}
-              disabled={saving}
-              aria-label={t(`settings.appearance.accent.${opt.id}`)}
-              title={t(`settings.appearance.accent.${opt.id}`)}
-              onClick={() => void persist(skin, opt.id)}
-            />
-          ))}
-        </div>
-      </div>
+      <SettingsRow
+        title={t("settings.appearance.accent")}
+        subtitle={t("settings.appearance.accentSystem")}
+        trailing={<span className="sl-accent-note"><i aria-hidden />{t("settings.appearance.followSystem")}</span>}
+      />
     </>
-  );
-}
-
-function SkinCard({
-  id,
-  label,
-  selected,
-  disabled,
-  onSelect,
-}: {
-  id: SkinPreference;
-  label: string;
-  selected: boolean;
-  disabled?: boolean;
-  onSelect: () => void;
-}) {
-  if (id === "system") {
-    return (
-      <Button variant="plain" size="none"
-        type="button"
-        className="kg-skin-card"
-        data-variant="system"
-        data-selected={selected}
-      aria-pressed={selected}
-        disabled={disabled}
-        onClick={onSelect}
-      >
-        <div className="kg-skin-card-preview">
-          <div
-            className="kg-skin-card-half"
-            style={
-              {
-                "--kg-skin-preview-canvas": "#f7f9fc",
-                "--kg-skin-preview-elevated": "#ffffff",
-                "--kg-skin-preview-border": "rgb(0 0 0 / 0.08)",
-                "--kg-skin-preview-glass-border": "rgb(0 0 0 / 0.07)",
-                "--kg-skin-preview-line": "rgb(28 28 34 / 0.22)",
-                "--kg-skin-preview-line-muted": "rgb(90 90 98 / 0.32)",
-                background: "#f7f9fc",
-              } as CSSProperties
-            }
-          >
-            <MiniChrome />
-          </div>
-          <div
-            className="kg-skin-card-half"
-            style={
-              {
-                "--kg-skin-preview-canvas": "#0d0d0f",
-                "--kg-skin-preview-elevated": "#202024",
-                "--kg-skin-preview-border": "rgb(255 255 255 / 0.1)",
-                "--kg-skin-preview-glass-border": "rgb(255 255 255 / 0.11)",
-                "--kg-skin-preview-line": "rgb(247 243 244 / 0.22)",
-                "--kg-skin-preview-line-muted": "rgb(255 255 255 / 0.32)",
-                background: "#0d0d0f",
-              } as CSSProperties
-            }
-          >
-            <MiniChrome />
-          </div>
-        </div>
-        <span className="kg-skin-card-label">{label}</span>
-      </Button>
-    );
-  }
-
-  const preview =
-    id === "pure"
-      ? {
-          canvas: "#f1f4f8",
-          elevated: "#ffffff",
-          border: "rgb(82 97 116 / 0.12)",
-          glassBorder: "rgb(82 97 116 / 0.12)",
-          line: "rgb(24 32 42 / 0.22)",
-          lineMuted: "rgb(83 97 113 / 0.32)",
-        }
-      : id === "deep-night"
-        ? {
-            canvas: "#0d0d0f",
-            elevated: "#202024",
-            border: "rgb(255 255 255 / 0.1)",
-            glassBorder: "rgb(255 255 255 / 0.11)",
-            line: "rgb(247 243 244 / 0.22)",
-            lineMuted: "rgb(255 255 255 / 0.32)",
-          }
-        : {
-            // Application light theme preview.
-            canvas: "#f7f9fc",
-            elevated: "#ffffff",
-            border: "rgb(0 0 0 / 0.08)",
-            glassBorder: "rgb(0 0 0 / 0.07)",
-            line: "rgb(28 28 34 / 0.22)",
-            lineMuted: "rgb(90 90 98 / 0.32)",
-          };
-
-  return (
-    <Button variant="plain" size="none"
-      type="button"
-      className="kg-skin-card"
-      data-selected={selected}
-      aria-pressed={selected}
-      disabled={disabled}
-      onClick={onSelect}
-    >
-      <div
-        className="kg-skin-card-preview"
-        style={
-          {
-            "--kg-skin-preview-canvas": preview.canvas,
-            "--kg-skin-preview-elevated": preview.elevated,
-            "--kg-skin-preview-border": preview.border,
-            "--kg-skin-preview-glass-border": preview.glassBorder,
-            "--kg-skin-preview-line": preview.line,
-            "--kg-skin-preview-line-muted": preview.lineMuted,
-            background: preview.canvas,
-            borderColor: preview.border,
-          } as CSSProperties
-        }
-      >
-        <MiniChrome />
-      </div>
-      <span className="kg-skin-card-label">{label}</span>
-    </Button>
-  );
-}
-
-function MiniChrome() {
-  return (
-    <div className="kg-skin-card-mini">
-      <span className="kg-skin-card-bar" />
-      <span className="kg-skin-card-line long" />
-      <span className="kg-skin-card-line short" />
-    </div>
   );
 }
 

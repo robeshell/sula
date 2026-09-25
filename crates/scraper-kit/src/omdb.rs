@@ -28,9 +28,11 @@ impl OmdbScraper {
         !self.api_key.trim().is_empty()
     }
 
+    /// `query_year` is the local item's year; it only biases relevance, never filters.
     pub async fn search(
         &self,
         query: &str,
+        query_year: Option<i32>,
         media_type: MediaType,
         _language: &str,
     ) -> Result<Vec<SearchResult>, String> {
@@ -67,7 +69,7 @@ impl OmdbScraper {
                     return None;
                 }
                 let confidence =
-                    relevance_score(query, None, &title, None, year, MediaType::Movie);
+                    relevance_score(query, query_year, &title, None, year, MediaType::Movie);
                 Some(SearchResult {
                     source_id: format!("omdb:{imdb}"),
                     title,

@@ -7,7 +7,7 @@ mod preview;
 mod rules;
 mod template;
 
-pub use execute::{execute, CompletedRename, ExecuteError, RenameSnapshot, RenameUndoManager};
+pub use execute::{execute, CompletedRename, ExecuteError, RenameSnapshot, RenameUndoManager, UndoReport};
 pub use media_rename::{
     consolidate_library_duplicate_shows, consolidate_show_item, merge_planned_show, organize_season_folders, plan_duplicate_show_merges,
     rename_after_scrape, rename_after_scrape_with_options, RenameError, RenameTemplates,

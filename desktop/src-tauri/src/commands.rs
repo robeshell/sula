@@ -254,6 +254,10 @@ pub async fn delete_library(state: State<'_, AppState>, id: String) -> Result<()
 
 #[tauri::command]
 pub async fn path_is_dir(path: String) -> Result<bool, String> {
+    blocking(move || path_is_dir_sync(path)).await
+}
+
+fn path_is_dir_sync(path: String) -> Result<bool, String> {
     Ok(std::path::Path::new(path.trim()).is_dir())
 }
 
@@ -292,8 +296,13 @@ pub async fn rebind_library(
 
 #[tauri::command]
 pub async fn clear_thumbnail_cache(state: State<'_, AppState>) -> Result<usize, String> {
-    let thumbs = state.thumbs.clear_all().map_err(err_string)?;
-    let avatars = state.avatars.clear().map_err(err_string)?;
+    let (thumbs, avatars) = (Arc::clone(&state.thumbs), Arc::clone(&state.avatars));
+    blocking(move || clear_thumbnail_cache_sync(&thumbs, &avatars)).await
+}
+
+fn clear_thumbnail_cache_sync(thumbs: &media_core::ThumbnailCache, avatars: &media_core::AvatarCache) -> Result<usize, String> {
+    let thumbs = thumbs.clear_all().map_err(err_string)?;
+    let avatars = avatars.clear().map_err(err_string)?;
     Ok(thumbs + avatars)
 }
 
@@ -372,7 +381,12 @@ pub async fn list_media_items(
     state: State<'_, AppState>,
     library_id: String,
 ) -> Result<Vec<MediaItem>, String> {
-    state.db.list_media_items(&library_id).map_err(err_string)
+    let db = Arc::clone(&state.db);
+    blocking(move || list_media_items_sync(&db, &library_id)).await
+}
+
+fn list_media_items_sync(db: &media_core::AppDatabase, library_id: &str) -> Result<Vec<MediaItem>, String> {
+    db.list_media_items(library_id).map_err(err_string)
 }
 
 #[derive(Debug, Serialize)]
@@ -388,12 +402,17 @@ pub struct MediaListPayload {
 pub async fn list_media_page(
     state: State<'_, AppState>, library_id: String, offset: Option<u32>, limit: Option<u32>,
 ) -> Result<MediaListPayload, String> {
+    let db = Arc::clone(&state.db);
+    blocking(move || list_media_page_sync(&db, &library_id, offset, limit)).await
+}
+
+fn list_media_page_sync(db: &media_core::AppDatabase, library_id: &str, offset: Option<u32>, limit: Option<u32>) -> Result<MediaListPayload, String> {
     let offset = offset.unwrap_or(0);
     let limit = limit.unwrap_or(256).clamp(1, 512);
-    let items = state.db.list_media_items_page(&library_id, offset, limit).map_err(err_string)?;
+    let items = db.list_media_items_page(library_id, offset, limit).map_err(err_string)?;
     let ids = serde_json::to_string(&items.iter().map(|i| &i.id).collect::<Vec<_>>()).map_err(err_string)?;
-    let metadata = state.db.list_metadata_summaries_for_ids(&ids).map_err(err_string)?;
-    let show_stats = state.db.list_show_stats_for_ids(&ids).map_err(err_string)?;
+    let metadata = db.list_metadata_summaries_for_ids(&ids).map_err(err_string)?;
+    let show_stats = db.list_show_stats_for_ids(&ids).map_err(err_string)?;
     let next_offset = if items.len() == limit as usize { offset.checked_add(limit) } else { None };
     Ok(MediaListPayload { items, metadata, show_stats, next_offset })
 }
@@ -495,20 +514,24 @@ pub async fn get_media_detail(
     state: State<'_, AppState>,
     id: String,
 ) -> Result<MediaDetailDto, String> {
-    let item = state
-        .db
+    let db = Arc::clone(&state.db);
+    blocking(move || get_media_detail_sync(&db, id)).await
+}
+
+fn get_media_detail_sync(db: &media_core::AppDatabase, id: String) -> Result<MediaDetailDto, String> {
+    let item = db
         .get_media_item(&id)
         .map_err(err_string)?
         .ok_or_else(|| format!("media item not found: {id}"))?;
-    let metadata = state.db.fetch_metadata(&id).map_err(err_string)?;
+    let metadata = db.fetch_metadata(&id).map_err(err_string)?;
     let (seasons, episodes) = if matches!(
         item.media_type,
         MediaType::TvShow | MediaType::Anime
     ) {
-        let seasons = state.db.fetch_seasons(&id).map_err(err_string)?;
+        let seasons = db.fetch_seasons(&id).map_err(err_string)?;
         let mut episodes = Vec::new();
         for season in &seasons {
-            episodes.extend(state.db.fetch_episodes(&season.id).map_err(err_string)?);
+            episodes.extend(db.fetch_episodes(&season.id).map_err(err_string)?);
         }
         (seasons, episodes)
     } else {
@@ -534,32 +557,32 @@ pub async fn resolve_poster_thumbnail(
     let width = width.unwrap_or(media_core::POSTER_THUMB_WIDTH);
     let height = height.unwrap_or(media_core::POSTER_THUMB_HEIGHT);
     let allow_fallbacks = allow_fallbacks.unwrap_or(true);
-    let Some(source) = media_core::ThumbnailCache::resolve_poster_source_with_fallbacks(
-        &folder_path,
-        &poster_path,
-        allow_fallbacks,
-    ) else {
-        return Ok(None);
-    };
-    // Thumbnails land in a webview-readable cache: only images inside a library.
-    let canonical = media_core::scanner::canonicalize_lossy(std::path::Path::new(&source));
-    let inside_library = state.db.list_libraries().map_err(err_string)?.iter().any(|library| {
-        let root = media_core::scanner::canonicalize_lossy(std::path::Path::new(&library.root_path));
-        media_core::db::path_rooted_under(&canonical, &root)
-    });
-    if !inside_library {
-        return Ok(None);
-    }
-    let thumbs = Arc::clone(&state.thumbs);
-    let result = tokio::task::spawn_blocking(move || thumbs.ensure(&source, width, height))
-        .await
-        .map_err(|e| e.to_string())?;
-    match result {
-        // Return cache file path; frontend uses convertFileSrc (faster than base64 IPC).
-        Ok(path) => Ok(Some(path.display().to_string())),
-        Err(media_core::ThumbnailError::Missing(_)) => Ok(None),
-        Err(err) => Err(err.to_string()),
-    }
+    let (db, thumbs) = (Arc::clone(&state.db), Arc::clone(&state.thumbs));
+    blocking(move || {
+        let Some(source) = media_core::ThumbnailCache::resolve_poster_source_with_fallbacks(
+            &folder_path,
+            &poster_path,
+            allow_fallbacks,
+        ) else {
+            return Ok(None);
+        };
+        // Thumbnails land in a webview-readable cache: only images inside a library.
+        let canonical = media_core::scanner::canonicalize_lossy(std::path::Path::new(&source));
+        let inside_library = db.list_libraries().map_err(err_string)?.iter().any(|library| {
+            let root = media_core::scanner::canonicalize_lossy(std::path::Path::new(&library.root_path));
+            media_core::db::path_rooted_under(&canonical, &root)
+        });
+        if !inside_library {
+            return Ok(None);
+        }
+        match thumbs.ensure(&source, width, height) {
+            // Return cache file path; frontend uses convertFileSrc (faster than base64 IPC).
+            Ok(path) => Ok(Some(path.display().to_string())),
+            Err(media_core::ThumbnailError::Missing(_)) => Ok(None),
+            Err(err) => Err(err.to_string()),
+        }
+    })
+    .await
 }
 
 #[tauri::command]
@@ -1484,33 +1507,39 @@ pub async fn delete_media_items(
         return Err("no items selected".into());
     }
 
-    // Preflight the entire request before touching either files or records.
-    let mut targets = Vec::new();
-    if also_trash {
-        for id in &item_ids {
-            if let Some(item) = state.db.get_media_item(id).map_err(err_string)? {
-                let target = media_core::media_files::deletion_target(&state.db, &item)
-                    .map_err(err_string)?;
-                targets.push((id.clone(), target));
+    let db = Arc::clone(&state.db);
+    let result = blocking(move || {
+        let _mutation_guard = _mutation_guard;
+        // Preflight the entire request before touching either files or records.
+        let mut targets = Vec::new();
+        if also_trash {
+            for id in &item_ids {
+                if let Some(item) = db.get_media_item(id).map_err(err_string)? {
+                    let target = media_core::media_files::deletion_target(&db, &item)
+                        .map_err(err_string)?;
+                    targets.push((id.clone(), target));
+                }
             }
         }
-    }
-    let deleted = if also_trash {
-        let fs = media_core::FilesystemService::new();
-        let mut deleted = 0;
-        for (id, path) in targets {
-            // Keep the record if trash fails; do not turn a trash request into
-            // permanent deletion on platforms without recycle-bin support.
-            fs.trash_item(&path).map_err(err_string)?;
-            deleted += state.db.delete_media_items(&[id]).map_err(err_string)?;
+        if also_trash {
+            let fs = media_core::FilesystemService::new();
+            let mut deleted = 0;
+            for (id, path) in targets {
+                // Keep the record if trash fails; do not turn a trash request into
+                // permanent deletion on platforms without recycle-bin support.
+                fs.trash_item(&path).map_err(err_string)?;
+                deleted += db.delete_media_items(&[id]).map_err(err_string)?;
+            }
+            Ok(deleted)
+        } else {
+            db.delete_media_items(&item_ids).map_err(err_string)
         }
-        deleted
-    } else {
-        state.db.delete_media_items(&item_ids).map_err(err_string)?
-    };
+    })
+    .await;
 
+    // Items trashed before a later failure are gone too; refresh either way.
     let _ = app.emit("library-updated", ());
-    Ok(deleted)
+    result
 }
 
 #[tauri::command]
@@ -1807,6 +1836,10 @@ pub async fn open_renamer_window(app: AppHandle, state: State<'_, AppState>) -> 
 
 #[tauri::command]
 pub async fn renamer_collect_files(paths: Vec<String>) -> Result<Vec<renamer::FileEntry>, String> {
+    blocking(move || renamer_collect_files_sync(paths)).await
+}
+
+fn renamer_collect_files_sync(paths: Vec<String>) -> Result<Vec<renamer::FileEntry>, String> {
     let mut out = Vec::new();
     for raw in paths {
         let path = std::path::PathBuf::from(&raw);
@@ -1835,6 +1868,8 @@ pub struct RenamerOutcome {
     /// Library index rows that could not follow a moved file; the next refresh
     /// would otherwise treat those files as deleted.
     pub index_sync_failures: usize,
+    /// Undo only: entries whose renamed file no longer exists and was left alone.
+    pub skipped: usize,
 }
 
 /// The index stores canonical paths. After a rename only the parent directory of
@@ -1870,25 +1905,36 @@ pub async fn renamer_execute(
     files: Vec<renamer::FileEntry>,
     pipeline: renamer::RulePipeline,
 ) -> Result<RenamerOutcome, String> {
-    let _mutation_guard = state.tasks.lock_mutations().await?;
-    let previews = renamer::preview(&files, &pipeline);
-    let mut outcome = RenamerOutcome { renames: Vec::new(), error: None, index_sync_failures: 0 };
-    let result = renamer::execute(&previews, &state.rename_undo, |done| {
-        outcome.renames.push(done.clone());
-        sync_renamed_entry(&state.db, done, &mut outcome.index_sync_failures);
-    });
-    finish_renamer_batch(&app, outcome, result.map(|_| ()))
+    let mutation_guard = state.tasks.lock_mutations().await?;
+    let (db, undo) = (Arc::clone(&state.db), Arc::clone(&state.rename_undo));
+    blocking(move || {
+        let _mutation_guard = mutation_guard;
+        let previews = renamer::preview(&files, &pipeline);
+        let mut outcome = RenamerOutcome { renames: Vec::new(), error: None, index_sync_failures: 0, skipped: 0 };
+        let result = renamer::execute(&previews, &undo, |done| {
+            outcome.renames.push(done.clone());
+            sync_renamed_entry(&db, done, &mut outcome.index_sync_failures);
+        });
+        finish_renamer_batch(&app, outcome, result.map(|_| ()))
+    })
+    .await
 }
 
 #[tauri::command]
 pub async fn renamer_undo_last(app: AppHandle, state: State<'_, AppState>) -> Result<RenamerOutcome, String> {
-    let _mutation_guard = state.tasks.lock_mutations().await?;
-    let mut outcome = RenamerOutcome { renames: Vec::new(), error: None, index_sync_failures: 0 };
-    let result = state.rename_undo.undo_last_with(|done| {
-        outcome.renames.push(done.clone());
-        sync_renamed_entry(&state.db, done, &mut outcome.index_sync_failures);
-    });
-    finish_renamer_batch(&app, outcome, result.map(|_| ()))
+    let mutation_guard = state.tasks.lock_mutations().await?;
+    let (db, undo) = (Arc::clone(&state.db), Arc::clone(&state.rename_undo));
+    blocking(move || {
+        let _mutation_guard = mutation_guard;
+        let mut outcome = RenamerOutcome { renames: Vec::new(), error: None, index_sync_failures: 0, skipped: 0 };
+        let result = undo.undo_last_report(|done| {
+            outcome.renames.push(done.clone());
+            sync_renamed_entry(&db, done, &mut outcome.index_sync_failures);
+        });
+        if let Ok(report) = &result { outcome.skipped = report.skipped; }
+        finish_renamer_batch(&app, outcome, result.map(|_| ()))
+    })
+    .await
 }
 
 /// A failure before anything moved is a plain error; after that the caller must
@@ -1984,6 +2030,10 @@ pub struct DirectoryEntryDto {
 
 #[tauri::command]
 pub async fn list_directory(path: String) -> Result<Vec<DirectoryEntryDto>, String> {
+    blocking(move || list_directory_sync(path)).await
+}
+
+fn list_directory_sync(path: String) -> Result<Vec<DirectoryEntryDto>, String> {
     let root = std::path::PathBuf::from(&path);
     if !root.is_dir() {
         return Err("path is not a directory".into());
@@ -2093,6 +2143,12 @@ fn collect_paths_into(
         }
     }
     Ok(())
+}
+
+/// Run filesystem or SQLite work on the blocking pool so slow disks (NAS) and a
+/// busy database connection never stall the async command workers.
+async fn blocking<T: Send + 'static>(work: impl FnOnce() -> Result<T, String> + Send + 'static) -> Result<T, String> {
+    tokio::task::spawn_blocking(work).await.map_err(|e| e.to_string())?
 }
 
 fn err_string(err: impl ToString) -> String {

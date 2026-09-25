@@ -55,9 +55,11 @@ impl TvdbScraper {
         !self.api_key.trim().is_empty()
     }
 
+    /// `query_year` is the local item's year; it only biases relevance, never filters.
     pub async fn search(
         &self,
         query: &str,
+        query_year: Option<i32>,
         media_type: MediaType,
         language: &str,
     ) -> Result<Vec<SearchResult>, String> {
@@ -89,7 +91,7 @@ impl TvdbScraper {
                 });
                 let confidence = relevance_score(
                     query,
-                    None,
+                    query_year,
                     &title,
                     eng_translation(hit.translations.clone()).as_deref(),
                     year,
@@ -153,7 +155,8 @@ impl TvdbScraper {
                 .filter_map(|g| g.name)
                 .collect(),
             tags: Vec::new(),
-            rating: series.score,
+            // TVDB v4 `score` is a popularity metric, never a 0–10 rating.
+            rating: None,
             rating_votes: None,
             content_rating: series
                 .content_ratings
@@ -457,7 +460,6 @@ struct SeriesExtended {
     first_aired: Option<String>,
     #[serde(alias = "lastAired")]
     last_aired: Option<String>,
-    score: Option<f64>,
     image: Option<String>,
     #[serde(alias = "averageRuntime")]
     average_runtime: Option<f64>,

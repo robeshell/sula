@@ -136,6 +136,14 @@ fn execute_with(
     Ok(snapshot.renames)
 }
 
+/// Outcome of undoing one snapshot. `skipped` counts entries whose renamed file was
+/// gone (deleted or moved elsewhere), so there was nothing to put back.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct UndoReport {
+    pub undone: usize,
+    pub skipped: usize,
+}
+
 pub struct RenameUndoManager {
     storage_dir: PathBuf,
     max_snapshots: usize,
@@ -223,19 +231,30 @@ impl RenameUndoManager {
 
     /// Like [`undo_last`], reporting each reverse move (`original_path` is where the
     /// entry was, `new_path` where it is restored) right after it happens.
-    pub fn undo_last_with(&self, mut on_moved: impl FnMut(&CompletedRename)) -> Result<usize, ExecuteError> {
+    pub fn undo_last_with(&self, on_moved: impl FnMut(&CompletedRename)) -> Result<usize, ExecuteError> {
+        self.undo_last_report(on_moved).map(|report| report.undone)
+    }
+
+    /// Like [`undo_last_with`], also counting entries skipped because the renamed
+    /// file no longer exists. A skip never blocks the rest of the snapshot or older
+    /// snapshots; an occupied original path is still a conflict.
+    pub fn undo_last_report(&self, mut on_moved: impl FnMut(&CompletedRename)) -> Result<UndoReport, ExecuteError> {
         let _guard = self.mutation.lock().map_err(|_| ExecuteError::Poisoned)?;
         self.recover_pending()?;
         let mut all = self.load_all()?;
         all.sort_by(|a, b| b.date.cmp(&a.date));
         let Some(mut latest) = all.into_iter().next() else { return Err(ExecuteError::NoSnapshots); };
         let fs = FilesystemService::new();
-        let mut n = 0;
+        let mut report = UndoReport::default();
         while let Some(rename) = latest.renames.last().cloned() {
             let new_path = Path::new(&rename.new_path);
             let original = Path::new(&rename.original_path);
             if !new_path.try_exists()? {
-                return Err(ExecuteError::RecoveryConflict(format!("missing undo source: {}", new_path.display())));
+                // Persist the skip so a later conflict does not revisit this entry.
+                latest.renames.pop();
+                self.write_snapshot(&latest)?;
+                report.skipped += 1;
+                continue;
             }
             if original.try_exists()? && !is_case_only_rename(new_path, original)? {
                 return Err(ExecuteError::RecoveryConflict(format!("undo destination exists: {}", original.display())));
@@ -250,10 +269,10 @@ impl RenameUndoManager {
             let reverse = latest.pending.take().unwrap().rename;
             self.write_snapshot(&latest)?;
             on_moved(&reverse);
-            n += 1;
+            report.undone += 1;
         }
         std::fs::remove_file(self.storage_dir.join(format!("{}.json", latest.id)))?;
-        Ok(n)
+        Ok(report)
     }
 
     fn load_all(&self) -> Result<Vec<RenameSnapshot>, ExecuteError> {
@@ -386,6 +405,51 @@ mod tests {
         assert!(dir.path().join("old_a.mkv").is_file());
         assert!(dir.path().join("old_b.mkv").is_file());
         assert!(!dir.path().join("new_a.mkv").exists());
+    }
+
+    fn rename_all(dir: &Path, undo: &RenameUndoManager, names: &[&str]) -> Vec<CompletedRename> {
+        let files: Vec<_> = names.iter().map(|name| {
+            let path = dir.join(name);
+            fs::write(&path, name).unwrap();
+            FileEntry::new(path)
+        }).collect();
+        let previews = preview(&files, &RulePipeline::new(vec![AnyRenameRule::TextReplace(TextReplace::new("old", "new"))]));
+        execute(&previews, undo, |_| {}).unwrap()
+    }
+
+    #[test]
+    fn undo_skips_missing_files_and_reaches_older_snapshots() {
+        let dir = tempdir().unwrap();
+        let undo = RenameUndoManager::open(dir.path().join("snaps")).unwrap();
+        rename_all(dir.path(), &undo, &["old_a.mkv"]);
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        rename_all(dir.path(), &undo, &["old_b.mkv", "old_c.mkv"]);
+        fs::remove_file(dir.path().join("new_c.mkv")).unwrap(); // user deleted one renamed file
+        let mut reversed = Vec::new();
+        assert_eq!(undo.undo_last_report(|r| reversed.push(r.clone())).unwrap(), UndoReport { undone: 1, skipped: 1 });
+        assert_eq!(reversed.len(), 1);
+        assert!(dir.path().join("old_b.mkv").is_file());
+        assert!(!dir.path().join("old_c.mkv").exists());
+        assert_eq!(undo.undo_last().unwrap(), 1, "the older snapshot is reachable again");
+        assert!(dir.path().join("old_a.mkv").is_file());
+        assert!(matches!(undo.undo_last(), Err(ExecuteError::NoSnapshots)));
+    }
+
+    #[test]
+    fn undo_refuses_occupied_original_after_persisting_skips() {
+        let dir = tempdir().unwrap();
+        let undo = RenameUndoManager::open(dir.path().join("snaps")).unwrap();
+        rename_all(dir.path(), &undo, &["old_a.mkv", "old_b.mkv"]);
+        fs::write(dir.path().join("old_a.mkv"), b"unrelated").unwrap();
+        fs::remove_file(dir.path().join("new_b.mkv")).unwrap();
+        assert!(matches!(undo.undo_last(), Err(ExecuteError::RecoveryConflict(_))));
+        assert_eq!(fs::read(dir.path().join("old_a.mkv")).unwrap(), b"unrelated");
+        assert_eq!(fs::read(dir.path().join("new_a.mkv")).unwrap(), b"old_a.mkv");
+        assert_eq!(undo.snapshots().unwrap()[0].renames.len(), 1, "the skipped entry is not retried");
+        fs::remove_file(dir.path().join("old_a.mkv")).unwrap();
+        assert_eq!(undo.undo_last_report(|_| {}).unwrap(), UndoReport { undone: 1, skipped: 0 });
+        assert_eq!(fs::read(dir.path().join("old_a.mkv")).unwrap(), b"old_a.mkv");
+        assert!(undo.snapshots().unwrap().is_empty());
     }
 
     #[test]

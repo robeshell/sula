@@ -49,6 +49,7 @@ type RenamerOutcome = {
   renames: CompletedRename[];
   error: string | null;
   indexSyncFailures: number;
+  skipped: number;
 };
 
 type PreviewResult = {
@@ -217,6 +218,7 @@ export function RenamerPage() {
     if (outcome.indexSyncFailures > 0) {
       lines.push(t("renamer.indexSyncFailed", { count: outcome.indexSyncFailures }));
     }
+    if (outcome.skipped > 0) lines.push(t("renamer.undoSkipped", { count: outcome.skipped }));
     if (outcome.error) lines.push(outcome.error);
     setMessage(lines.join(" "));
     setSnapshotCount(await invoke<number>("renamer_snapshot_count"));

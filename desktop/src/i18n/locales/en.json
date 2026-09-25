@@ -206,6 +206,7 @@
   "renamer.undo": "Undo",
   "renamer.executed": "Renamed {{count}} file(s)",
   "renamer.undone": "Undid {{count}} file(s)",
+  "renamer.undoSkipped": "Skipped {{count}} file(s) no longer at their renamed location.",
   "renamer.indexSyncFailed": "{{count}} library record(s) could not follow the new path. Undo this rename before refreshing the library, or those entries will be treated as deleted.",
   "renamer.col.original": "Original",
   "renamer.col.new": "New name",

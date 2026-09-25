@@ -17,9 +17,7 @@ pub fn owns_folder(db: &AppDatabase, item: &MediaItem) -> anyhow::Result<bool> {
         return Ok(false);
     }
     for library in db.list_libraries()? {
-        let root = Path::new(&library.root_path)
-            .canonicalize()
-            .unwrap_or_else(|_| PathBuf::from(&library.root_path));
+        let root = canonical_cached(&library.root_path);
         if root.starts_with(&folder) {
             return Ok(false);
         }
@@ -27,9 +25,7 @@ pub fn owns_folder(db: &AppDatabase, item: &MediaItem) -> anyhow::Result<bool> {
             if other.id == item.id {
                 continue;
             }
-            let other_folder = Path::new(&other.folder_path)
-                .canonicalize()
-                .unwrap_or_else(|_| PathBuf::from(&other.folder_path));
+            let other_folder = canonical_cached(&other.folder_path);
             if other_folder.starts_with(&folder)
                 || (other.media_type != MediaType::Movie && folder.starts_with(&other_folder))
             {
@@ -68,6 +64,34 @@ pub fn owns_folder(db: &AppDatabase, item: &MediaItem) -> anyhow::Result<bool> {
         }
     }
     Ok(true)
+}
+
+/// `owns_folder` runs once per item in batch operations (import, cleanup, scrape,
+/// delete) and compares against every other item. Resolving every other folder
+/// again each time was O(n²) syscalls — painful on network shares. Other items'
+/// folders are memoized briefly; the item's own folder and its files are always
+/// resolved fresh, and a path that no longer resolves falls back to its raw form
+/// exactly as before.
+fn canonical_cached(raw: &str) -> PathBuf {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+    use std::time::{Duration, Instant};
+    const TTL: Duration = Duration::from_secs(60);
+    static CACHE: OnceLock<Mutex<HashMap<String, (PathBuf, Instant)>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(Default::default);
+    let now = Instant::now();
+    if let Some((path, at)) = cache.lock().unwrap_or_else(|e| e.into_inner()).get(raw) {
+        if now.duration_since(*at) < TTL {
+            return path.clone();
+        }
+    }
+    let resolved = Path::new(raw).canonicalize().unwrap_or_else(|_| PathBuf::from(raw));
+    let mut cache = cache.lock().unwrap_or_else(|e| e.into_inner());
+    if cache.len() > 200_000 {
+        cache.retain(|_, (_, at)| now.duration_since(*at) < TTL);
+    }
+    cache.insert(raw.to_string(), (resolved.clone(), now));
+    resolved
 }
 
 /// Shared folders are never deleted. For a loose movie only its video is a

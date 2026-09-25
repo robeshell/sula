@@ -206,6 +206,7 @@
   "renamer.undo": "撤销",
   "renamer.executed": "已改名 {{count}} 个文件",
   "renamer.undone": "已撤销 {{count}} 个文件",
+  "renamer.undoSkipped": "{{count}} 个文件已不在改名后的位置，已跳过。",
   "renamer.indexSyncFailed": "有 {{count}} 条资料库记录未能同步新路径。刷新资料库前请先撤销本次改名，以免这些条目被当作已删除。",
   "renamer.col.original": "原名",
   "renamer.col.new": "新名",

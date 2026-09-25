@@ -30,9 +30,11 @@ impl TmdbScraper {
         !self.api_key.trim().is_empty()
     }
 
+    /// `query_year` is the local item's year; it only biases relevance, never filters.
     pub async fn search(
         &self,
         query: &str,
+        query_year: Option<i32>,
         media_type: MediaType,
         language: &str,
     ) -> Result<Vec<SearchResult>, String> {
@@ -57,7 +59,7 @@ impl TmdbScraper {
                     let year = extract_year(item.first_air_date.as_deref());
                     let confidence = relevance_score(
                         query,
-                        None,
+                        query_year,
                         &item.name,
                         item.original_name.as_deref(),
                         year,
@@ -85,7 +87,7 @@ impl TmdbScraper {
                     let year = extract_year(item.release_date.as_deref());
                     let confidence = relevance_score(
                         query,
-                        None,
+                        query_year,
                         &item.title,
                         item.original_title.as_deref(),
                         year,

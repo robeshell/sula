@@ -15,6 +15,8 @@ pub struct MediaMetaSummary {
     pub overview: Option<String>,
     pub rating: Option<f64>,
     pub genres: Vec<String>,
+    /// Changes on every (re)scrape, even when an artwork file is overwritten in place.
+    pub scraped_at: String,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -33,7 +35,7 @@ impl AppDatabase {
     ) -> Result<Vec<MediaMetaSummary>, DatabaseError> {
         self.with_conn(|conn| {
             let mut stmt = conn.prepare(
-                "SELECT m.mediaItemId, m.posterPath, m.fanartPath, m.overview, m.rating, m.genres
+                "SELECT m.mediaItemId, m.posterPath, m.fanartPath, m.overview, m.rating, m.genres, m.scrapedAt
                  FROM media_metadata m
                  INNER JOIN media_items i ON i.id = m.mediaItemId
                  WHERE i.libraryId = ?1",
@@ -47,6 +49,7 @@ impl AppDatabase {
                     overview: row.get(3)?,
                     rating: row.get(4)?,
                     genres: serde_json::from_str(&genres_json).unwrap_or_default(),
+                    scraped_at: row.get(6)?,
                 })
             })?;
             let mut out = Vec::new();
@@ -94,7 +97,7 @@ impl AppDatabase {
     ) -> Result<Vec<MediaMetaSummary>, DatabaseError> {
         self.with_conn(|conn| {
             let mut stmt = conn.prepare(
-                "SELECT m.mediaItemId, m.posterPath, m.fanartPath, m.overview, m.rating, m.genres
+                "SELECT m.mediaItemId, m.posterPath, m.fanartPath, m.overview, m.rating, m.genres, m.scrapedAt
                  FROM media_metadata m
                  INNER JOIN media_items i ON i.id = m.mediaItemId
                  WHERE i.id IN (SELECT value FROM json_each(?1))",
@@ -108,6 +111,7 @@ impl AppDatabase {
                     overview: row.get(3)?,
                     rating: row.get(4)?,
                     genres: serde_json::from_str(&genres_json).unwrap_or_default(),
+                    scraped_at: row.get(6)?,
                 })
             })?;
             let mut out = Vec::new();

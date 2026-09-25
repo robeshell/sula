@@ -161,6 +161,7 @@ export type MediaMetaSummary = {
   overview?: string | null;
   rating?: number | null;
   genres: string[];
+  scrapedAt?: string;
 };
 
 export type ShowListStats = {
@@ -273,7 +274,8 @@ type AppStore = {
   /**
    * Background refresh of the current library (task finished, library-updated).
    * Keeps the list, selection and detail; coalesces bursts into one reload.
-   * `posters: "all"` re-resolves every poster (e.g. after a rescrape).
+   * `posters: "all"` re-resolves every poster; rescrapes need not use it because
+   * metadata fingerprints include `scrapedAt`.
    */
   reloadLibraryItems: (
     libraryId: string,
@@ -1164,7 +1166,8 @@ export const useAppStore = create<AppStore>((set, get) => ({
           void notifyTaskDone(label);
         }
         const libraryId = get().selectedLibraryId;
-        if (libraryId) void get().reloadLibraryItems(libraryId, { posters: "all" });
+        // Metadata fingerprints include scrapedAt, so only rescraped posters reload.
+        if (libraryId) void get().reloadLibraryItems(libraryId);
       } else if (task.kind === "rename") {
         const detail = task.progress?.current?.trim();
         get().showToast(

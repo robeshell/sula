@@ -37,9 +37,11 @@ impl BangumiScraper {
         self
     }
 
+    /// `query_year` is the local item's year; it only biases relevance, never filters.
     pub async fn search(
         &self,
         query: &str,
+        query_year: Option<i32>,
         media_type: MediaType,
         _language: &str,
     ) -> Result<Vec<SearchResult>, String> {
@@ -89,7 +91,7 @@ impl BangumiScraper {
                 .map(str::to_string);
             let confidence = relevance_score(
                 query,
-                None,
+                query_year,
                 &title,
                 Some(&name),
                 year,

@@ -188,6 +188,7 @@
   "renamer.undo": "元に戻す",
   "renamer.executed": "{{count}} 件をリネームしました",
   "renamer.undone": "{{count}} 件を元に戻しました",
+  "renamer.undoSkipped": "リネーム後の場所に存在しない {{count}} 件をスキップしました。",
   "renamer.indexSyncFailed": "{{count}} 件のライブラリ記録を新しいパスに更新できませんでした。ライブラリを更新する前にこのリネームを元に戻してください。そのままでは削除済みとして扱われます。",
   "renamer.col.original": "元の名前",
   "renamer.col.new": "新しい名前",

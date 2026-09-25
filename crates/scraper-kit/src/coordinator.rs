@@ -63,7 +63,8 @@ impl ScraperCoordinator {
         let mut all = Vec::new();
         let mut last_error: Option<String> = None;
         for scraper in sources {
-            match self.search_one(scraper, q, media_type, language).await {
+            // A free-text manual query carries no year; ranking is title-only.
+            match self.search_one(scraper, q, None, media_type, language).await {
                 Ok(mut rows) => all.append(&mut rows),
                 // Includes `rateLimited`: an all-rate-limited search must not look like "no results".
                 Err(err) => {
@@ -97,7 +98,7 @@ impl ScraperCoordinator {
         for query in queries {
             for scraper in &sources {
                 let results = match self
-                    .search_one(*scraper, &query, item.media_type, language)
+                    .search_one(*scraper, &query, item.year, item.media_type, language)
                     .await
                 {
                     Ok(rows) => rows,
@@ -110,7 +111,7 @@ impl ScraperCoordinator {
                 if results.is_empty() {
                     continue;
                 }
-                best_candidates = results.clone();
+                merge_candidates(&mut best_candidates, results.clone());
                 if let Some(accepted) =
                     auto_accepted_result(&query, item.year, item.media_type, &results)
                 {
@@ -197,14 +198,15 @@ impl ScraperCoordinator {
         &self,
         scraper: Source,
         query: &str,
+        year: Option<i32>,
         media_type: MediaType,
         language: &str,
     ) -> Result<Vec<SearchResult>, String> {
         match scraper {
-            Source::Bangumi => self.bangumi.search(query, media_type, language).await,
-            Source::Tmdb => self.tmdb.search(query, media_type, language).await,
-            Source::Omdb => self.omdb.search(query, media_type, language).await,
-            Source::Tvdb => self.tvdb.search(query, media_type, language).await,
+            Source::Bangumi => self.bangumi.search(query, year, media_type, language).await,
+            Source::Tmdb => self.tmdb.search(query, year, media_type, language).await,
+            Source::Omdb => self.omdb.search(query, year, media_type, language).await,
+            Source::Tvdb => self.tvdb.search(query, year, media_type, language).await,
         }
     }
 
@@ -241,6 +243,31 @@ enum Source {
     Tvdb,
 }
 
+/// Upper bound on candidates offered to the user after an unmatched auto-scrape.
+const MAX_CANDIDATES: usize = 20;
+
+/// Folds one query/source result set into the running candidate list:
+/// dedupes by `source_id` (keeping the higher confidence), sorts best-first
+/// and caps the list, so the user sees the strongest hits across all queries.
+fn merge_candidates(into: &mut Vec<SearchResult>, rows: Vec<SearchResult>) {
+    for row in rows {
+        match into.iter_mut().find(|c| c.source_id == row.source_id) {
+            Some(existing) => {
+                if row.confidence > existing.confidence {
+                    *existing = row;
+                }
+            }
+            None => into.push(row),
+        }
+    }
+    into.sort_by(|a, b| {
+        b.confidence
+            .partial_cmp(&a.confidence)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    into.truncate(MAX_CANDIDATES);
+}
+
 fn build_queries(item: &MediaItem) -> Vec<String> {
     let mut queries = Vec::new();
     let cleaned = media_core::FileNameParser::clean_title_for_match(&item.title);
@@ -260,4 +287,57 @@ fn build_queries(item: &MediaItem) -> Vec<String> {
         }
     }
     queries
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn row(source_id: &str, confidence: f64) -> SearchResult {
+        SearchResult {
+            source_id: source_id.into(),
+            title: source_id.into(),
+            original_title: None,
+            year: None,
+            overview: None,
+            poster_url: None,
+            confidence,
+            media_type: MediaType::Movie,
+        }
+    }
+
+    fn ids(rows: &[SearchResult]) -> Vec<&str> {
+        rows.iter().map(|r| r.source_id.as_str()).collect()
+    }
+
+    #[test]
+    fn later_weaker_result_set_does_not_replace_better_candidates() {
+        let mut best = Vec::new();
+        merge_candidates(&mut best, vec![row("tmdb:1", 0.95), row("tmdb:2", 0.4)]);
+        merge_candidates(&mut best, vec![row("omdb:tt9", 0.3)]);
+        assert_eq!(ids(&best), ["tmdb:1", "tmdb:2", "omdb:tt9"]);
+    }
+
+    #[test]
+    fn duplicates_keep_highest_confidence() {
+        let mut best = vec![];
+        merge_candidates(&mut best, vec![row("tmdb:1", 0.5), row("tvdb:1", 0.6)]);
+        merge_candidates(&mut best, vec![row("tmdb:1", 0.9)]);
+        assert_eq!(ids(&best), ["tmdb:1", "tvdb:1"]);
+        assert_eq!(best[0].confidence, 0.9);
+        merge_candidates(&mut best, vec![row("tmdb:1", 0.1)]);
+        assert_eq!(best.len(), 2);
+        assert_eq!(best[0].confidence, 0.9);
+    }
+
+    #[test]
+    fn candidates_are_capped() {
+        let mut best = Vec::new();
+        let rows = (0..MAX_CANDIDATES + 5)
+            .map(|i| row(&format!("tmdb:{i}"), i as f64 / 100.0))
+            .collect();
+        merge_candidates(&mut best, rows);
+        assert_eq!(best.len(), MAX_CANDIDATES);
+        assert_eq!(best[0].source_id, format!("tmdb:{}", MAX_CANDIDATES + 4));
+    }
 }

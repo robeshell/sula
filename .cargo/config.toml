@@ -1,0 +1,4 @@
+# macOS: sign the dev app with a stable identity before it runs, so the keychain
+# remembers "Always Allow" across rebuilds. Details in scripts/dev-sign-run.sh.
+[target.'cfg(target_os = "macos")']
+runner = "scripts/dev-sign-run.sh"

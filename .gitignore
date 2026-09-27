@@ -21,3 +21,6 @@ pnpm-debug.log*
 .idea/
 .vscode/*
 !.vscode/extensions.json
+
+# Local code-signing identity for dev builds (scripts/dev-sign-run.sh)
+.cargo/sula-dev-identity

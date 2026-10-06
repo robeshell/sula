@@ -35,7 +35,7 @@ Sula 是一款本地优先的桌面影视资料库整理工具。它扫描电影
 git clone https://github.com/robeshell/sula.git
 cd sula
 pnpm --dir desktop install --frozen-lockfile
-pnpm --dir desktop tauri dev
+pnpm --dir desktop dev:app
 ```
 
 请通过 Tauri 启动完整应用。单独运行 Vite 只能提供前端页面，不能调用扫描、数据库、系统窗口和文件操作等原生能力。

@@ -19,7 +19,7 @@ Linux 运行时需要可用的 Secret Service，例如 GNOME Keyring 或提供�
 
 ```bash
 pnpm --dir desktop install --frozen-lockfile
-pnpm --dir desktop tauri dev
+pnpm --dir desktop dev:app
 ```
 
 Tauri 会启动 Vite 并运行原生应用。开发页面地址为 `http://localhost:1420`，但在普通浏览器直接打开不具备原生 IPC。浏览器组件检查应使用明确隔离的模拟数据入口。
@@ -66,7 +66,7 @@ cargo test -p sula --lib config:: --locked
 
 `src-tauri/src/lib.rs` 注册命令与事件；`commands.rs` 负责 UI 调用边界，`state.rs` 初始化数据库与共享状态，`task_queue.rs` 管理后台任务。系统凭据由 `credentials.rs` 访问。
 
-运行标识为 `com.sula.app`，Rust 包为 `sula`，库为 `sula_lib`。具体数据位置见[数据与迁移](../docs/data.md)。
+运行标识为 `app.wenworks.sula`，开发版（`dev:app`）为 `app.wenworks.sula.dev`，Rust 包为 `sula`，库为 `sula_lib`。具体数据位置见[数据与迁移](../docs/data.md)。
 
 ## 构建
 

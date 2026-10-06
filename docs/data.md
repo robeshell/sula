@@ -2,7 +2,7 @@
 
 ## 存储位置
 
-应用标识为 `com.sula.app`。Rust 使用系统应用数据目录下的 `sula` 保存业务状态，实际位置由 `dirs::data_dir()` 决定。
+应用标识为 `app.wenworks.sula`，开发版为 `app.wenworks.sula.dev`（`src-tauri/tauri.dev.conf.json`）。业务数据目录不随标识变化，两者共用。Rust 使用系统应用数据目录下的 `sula` 保存业务状态，实际位置由 `dirs::data_dir()` 决定。
 
 | 平台 | 典型业务数据目录 |
 | --- | --- |

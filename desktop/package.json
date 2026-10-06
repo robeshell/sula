@@ -9,6 +9,7 @@
     "preview": "vite preview",
     "tauri": "node ../scripts/trim-build-cache.mjs && tauri",
     "clean:rust": "node ../scripts/trim-build-cache.mjs --all",
+    "dev:app": "pnpm tauri dev --config src-tauri/tauri.dev.conf.json",
     "build:app": "tauri build",
     "test:store": "node --test scripts/test-store.mjs",
     "test:poster-cache": "node --test scripts/test-poster-cache.mjs",

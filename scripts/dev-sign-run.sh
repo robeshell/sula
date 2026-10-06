@@ -22,7 +22,7 @@ if [ "$(basename "$bin")" = "sula" ]; then
     cp -p "$bin" "$signed"
     # macOS kills and deletes a binary signed by a revoked certificate, so check
     # the signature before it replaces the build.
-    if output="$(codesign --force --sign "$identity" --identifier com.sula.app "$signed" 2>&1)" \
+    if output="$(codesign --force --sign "$identity" --identifier app.wenworks.sula.dev "$signed" 2>&1)" \
       && ! output="$(spctl --assess --type execute "$signed" 2>&1 | grep -i revoked)"; then
       mv -f "$signed" "$bin"
     else

@@ -13,7 +13,7 @@
 | 海报请求和缓存失效 | `pnpm --dir desktop test:poster-cache` |
 | 异步确认流程 | `pnpm --dir desktop test:confirmation` |
 | Rust 应用编译边界 | `cargo check -p sula --lib --locked` |
-| 配置与凭据逻辑 | `cargo test -p sula --lib config:: --locked` |
+| 配置与凭据逻辑 | `cargo test -p sula-core --lib config:: --locked` |
 | 扫描增量退出 | `cargo test -p media-core --lib bootstrap_then_early_exit_on_unchanged --locked` |
 | 中等目录数量的空刷新 | `cargo test -p media-core --lib empty_refresh_many_dirs --locked` |
 

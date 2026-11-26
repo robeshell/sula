@@ -54,8 +54,9 @@ pnpm --dir desktop dev:app
 crates/media-core/       媒体模型、扫描、数据库、文件归属与缓存
 crates/scraper-kit/      数据源接入、匹配、元数据与图片写入
 crates/renamer/          命名模板、批量规则、执行与恢复
+crates/sula-core/        应用核心：资料库、任务队列、刮削与整理流程、配置、凭据与日志，不依赖 Tauri
 desktop/src/            React 界面、状态与本地样式
-desktop/src-tauri/      原生命令、任务队列、配置、凭据与窗口
+desktop/src-tauri/      Tauri 外壳：命令与事件边界、窗口、菜单与托盘
 docs/                   使用、开发和验证说明
 ```
 

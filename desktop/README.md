@@ -37,11 +37,14 @@ pnpm --dir desktop test:store
 pnpm --dir desktop test:poster-cache
 pnpm --dir desktop test:confirmation
 
-# Rust 应用边界
+# Tauri 外壳
 cargo check -p sula --lib --locked
 
+# 应用核心
+cargo check -p sula-core --locked
+
 # 配置和凭据存储逻辑；测试使用内存凭据替身
-cargo test -p sula --lib config:: --locked
+cargo test -p sula-core --lib config:: --locked
 ```
 
 扫描、整理及刮削修改应运行对应 crate 和测试过滤器。真实文件、原生窗口、外部 API 和安装包验证需单独记录，参见[验证指南](../docs/perf.md)。
@@ -64,7 +67,9 @@ cargo test -p sula --lib config:: --locked
 
 ## 原生入口与存储
 
-`src-tauri/src/lib.rs` 注册命令与事件；`commands.rs` 负责 UI 调用边界，`state.rs` 初始化数据库与共享状态，`task_queue.rs` 管理后台任务。系统凭据由 `credentials.rs` 访问。
+`src-tauri/src/lib.rs` 注册命令与事件并启动应用核心；`commands.rs` 负责 UI 调用边界，`tray.rs`、`app_menu.rs`、`accent.rs` 处理托盘、macOS 菜单和系统强调色。
+
+业务实现位于 `../crates/sula-core/src/`：`state.rs` 初始化数据库与共享状态，`task_queue.rs` 管理后台任务，`config.rs` 管理配置，系统凭据由 `credentials.rs` 访问。
 
 运行标识为 `app.wenworks.sula`，开发版（`dev:app`）为 `app.wenworks.sula.dev`，Rust 包为 `sula`，库为 `sula_lib`。具体数据位置见[数据与迁移](../docs/data.md)。
 

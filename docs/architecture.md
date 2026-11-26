@@ -7,7 +7,8 @@ Sula 是单机桌面应用：React 展示资料库和任务状态，Tauri 提供
 | 模块 | 负责 | 不负责 |
 | --- | --- | --- |
 | `desktop/src` | 页面、选择与筛选、交互反馈、国际化 | 原生文件操作与密钥持久化 |
-| `desktop/src-tauri` | commands/events、窗口、托盘、配置、共享状态、任务队列；`src/app` 应用服务层 | 在界面层复制媒体领域规则 |
+| `desktop/src-tauri` | Tauri 外壳：commands/events、窗口、菜单、托盘、系统强调色 | 业务流程、任务调度、配置与凭据的实现 |
+| `sula-core` | 应用核心：共享状态、任务队列、配置、凭据、日志；`src/app` 应用服务层 | 依赖 Tauri 或其他具体界面外壳；在此复制媒体领域规则 |
 | `media-core` | 媒体模型、扫描、文件归属、SQLite、NFO、图片缓存 | 外部数据源搜索与 UI 状态 |
 | `scraper-kit` | 数据源请求、候选匹配、返回元数据与图片字节 | 数据库、NFO 与图片写入；系统窗口与页面布局 |
 | `renamer` | 命名模板、批量规则、预览、执行、撤销与媒体变更恢复 | 用户界面和数据源账号管理 |
@@ -15,8 +16,8 @@ Sula 是单机桌面应用：React 展示资料库和任务状态，Tauri 提供
 ## 主要调用路径
 
 ```text
-React 组件 → Zustand 操作 → Tauri command → Rust 应用状态 → 领域模块
-                                     ↑              ↓
+React 组件 → Zustand 操作 → Tauri command → sula-core 应用状态 → 领域模块
+                                     ↑                ↓
                               任务事件 / 查询结果 ← 任务队列与数据库
 ```
 
@@ -38,16 +39,17 @@ React 组件 → Zustand 操作 → Tauri command → Rust 应用状态 → 领�
 
 ## 应用服务层
 
-`desktop/src-tauri/src/app` 承载命令背后的业务流程，不依赖 Tauri 类型，可用临时目录、内存数据库和假实现直接测试。`commands.rs` 只负责解析参数、选择锁范围、入队任务、调用服务和映射结果；IPC 命令、参数、返回结构和事件保持不变。
+`crates/sula-core/src/app` 承载命令背后的业务流程。整个 `sula-core` 不依赖 Tauri，可用临时目录、内存数据库和假实现直接测试，错误统一为 `CoreError`。`desktop/src-tauri/src/commands.rs` 只负责解析参数、调用核心和映射结果；需要排队的工作由 `sula-core` 的 `jobs.rs` 入队。IPC 命令、参数、返回结构和事件保持不变。
 
 | 模块 | 内容 |
 | --- | --- |
-| `app/mod.rs` | `TaskProgress`；`Progress` trait（进度、刮削计数、取消标志），由任务队列的 `TaskHandle` 实现；`Events` trait（`library_updated`），由 `AppHandle` 实现 |
+| `app/mod.rs` | `TaskProgress`；`Progress` trait（进度、刮削计数、取消标志），由任务队列的 `TaskHandle` 实现；`Events` trait，由外壳实现（Tauri 端为 `commands.rs` 的 `UiEvents`），核心通过它向界面推送变更 |
 | `app/scrape.rs` | `ScrapeService`：资料库刮削、条目刮削与重刮、单季刷新、手动匹配，以及其后的自动重命名或合并；`MetadataSource` trait 抽象网络端，正式实现为 `scraper_kit::ScrapeClient` |
 | `app/scrape_persist.rs` | 刮削结果落盘：元数据与季集入库、NFO、海报与剧照文件、`owns_folder` 检查、问题汇总为 `Partial` 状态并脱敏 |
 | `app/library.rs` | `RefreshService`：资料库与条目刷新、刷新后合并重复剧集 |
 | `app/organize.rs` | 按模板重命名、季文件夹整理、重复剧集合并计划与执行、刮削后自动重命名 |
 | `app/cleanup.rs` | 残留文件清理与条目删除；删除只进入废纸篓，废纸篓步骤通过 `Trash` trait 注入，失败时保留记录 |
+| `app/posters.rs` | 任务改变资料库内容后预热海报缩略图 |
 | `app/locks.rs` | 文件变更锁（见下节） |
 
 刮削分两阶段。网络阶段（匹配、详情、图片字节）不持有任何文件变更锁；写入阶段取得条目所在资料库的锁，在锁内重新读取条目，因此网络阶段期间发生的重命名或删除不会让结果写到旧目录。两阶段都检查取消：取消后已下载但未写入的结果直接丢弃。
